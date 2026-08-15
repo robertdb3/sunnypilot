@@ -19,7 +19,7 @@ fi
 BASE=$("$PYTHON_BIN" -c 'import json,sys; print(json.load(open(sys.argv[1]))["upstream"]["commit"])' "$MANIFEST")
 git -C "$CANDIDATE" cat-file -e "$BASE^{commit}"
 
-"$PYTHON_BIN" "$ASSETS/automation/verify_candidate.py" "$CANDIDATE" "$BASE"
+"$PYTHON_BIN" "$ASSETS/automation/verify_candidate.py" "$CANDIDATE" "$BASE" "$ASSETS"
 
 link="$ASSETS/sunnypilot"
 if [ -e "$link" ] || [ -L "$link" ]; then

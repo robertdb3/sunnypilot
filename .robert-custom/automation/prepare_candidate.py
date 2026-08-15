@@ -30,7 +30,10 @@ def customization_digest(assets: Path) -> str:
   digest = hashlib.sha256()
   roots = (assets / "patches", assets / "ports", assets / "tests", assets / "automation")
   for root in roots:
-    for path in sorted(p for p in root.rglob("*") if p.is_file()):
+    for path in sorted(p for p in root.rglob("*") if p.is_file()
+                       and "__pycache__" not in p.parts
+                       and p.suffix != ".pyc"
+                       and p.name != ".DS_Store"):
       relative = path.relative_to(assets).as_posix().encode()
       digest.update(len(relative).to_bytes(4, "big"))
       digest.update(relative)
