@@ -61,7 +61,11 @@ jobs:
           raise SystemExit(0 if all(old.get(k) == new.get(k) for k in keys) else 1)
           PY
             then
-              unchanged=true
+              stable_sha=$(git rev-parse --verify origin/custompilot-stable 2>/dev/null || true)
+              candidate_parent=$(git rev-parse --verify origin/custompilot-staging^ 2>/dev/null || true)
+              if [ -n "$stable_sha" ] && [ "$candidate_parent" = "$stable_sha" ]; then
+                unchanged=true
+              fi
             fi
           fi
           echo "unchanged=$unchanged" >> "$GITHUB_OUTPUT"
@@ -74,9 +78,13 @@ jobs:
           git diff --name-only -z | xargs -0 -r git add --
           git ls-files --others --exclude-standard -z | xargs -0 -r git add --
           upstream_sha=$(python3 -c 'import json; print(json.load(open("CUSTOM_FORK_MANIFEST.json"))["upstream"]["commit"])')
-          git commit -m "Build Outback candidate from sunnypilot ${upstream_sha:0:12}" \
+          stable_sha=$(git rev-parse --verify origin/custompilot-stable)
+          tree_sha=$(git write-tree)
+          candidate_sha=$(git commit-tree "$tree_sha" -p "$stable_sha" \
+            -m "Build Outback candidate from sunnypilot ${upstream_sha:0:12}" \
             -m "Assisted-by: Claude" \
-            -m "Assisted-by: OpenAI Codex"
+            -m "Assisted-by: OpenAI Codex")
+          git reset --hard "$candidate_sha"
 
       - name: Publish candidate branch
         if: steps.candidate_state.outputs.unchanged != 'true'

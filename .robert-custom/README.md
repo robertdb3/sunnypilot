@@ -6,7 +6,8 @@ Preglobal on comma 3X.
 ## Branches
 
 - `master` contains upstream sunnypilot plus this private-to-the-project maintenance machinery.
-- `custompilot-staging` is generated from the latest installable upstream `staging` snapshot.
+- `custompilot-staging` is generated from the latest installable upstream `staging` snapshot, then
+  committed as a child of the current `custompilot-stable` tip so its promotion PR is mergeable.
 - `custompilot-stable` is the only branch intended for installation on the comma.
 
 The installation URL is:
@@ -32,8 +33,10 @@ pull request, and merge it deliberately.
    AGNOS, upstream license files, or stock cereal schemas.
 6. Runs the focused regression suite and compiles every changed Python file.
 7. Records the exact upstream commit and customization digest in `CUSTOM_FORK_MANIFEST.json`.
-8. Publishes `custompilot-staging` and supplies a manual PR comparison link only when the upstream
-   commit or customization stack actually changed.
+8. Commits the validated candidate tree on top of the current stable tip; the manifest still
+   records the exact upstream base used for construction and validation.
+9. Publishes `custompilot-staging` and supplies a manual PR comparison link only when the upstream
+   commit, customization stack, or candidate lineage actually changed.
 
 Textual conflict freedom is not treated as proof of runtime compatibility. The runbook documents
 real staging failures that merged cleanly but used incompatible cereal services, Cap'n Proto

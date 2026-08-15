@@ -1,0 +1,32 @@
+name: Validate custom fork
+
+on:
+  pull_request:
+    branches: [custompilot-stable]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out candidate
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          path: candidate
+
+      - name: Check out maintenance assets
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          path: controller
+
+      - name: Install test dependencies
+        run: python3 -m pip install --disable-pip-version-check numpy pycapnp raylib
+
+      - name: Validate candidate
+        run: bash controller/.robert-custom/automation/validate_candidate.sh candidate controller/.robert-custom
