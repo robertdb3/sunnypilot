@@ -16,8 +16,8 @@ https://install.sunnypilot.ai/fork/robertdb3/custompilot-stable
 ```
 
 `custompilot-stable` is never updated by the scheduled workflow. A passing candidate produces a
-draft pull request. Promotion requires a human to review the upstream diff, mark the pull request
-ready, and merge it deliberately.
+one-click GitHub comparison link. Promotion requires a human to review the upstream diff, open the
+pull request, and merge it deliberately.
 
 ## Automated update sequence
 
@@ -32,8 +32,8 @@ ready, and merge it deliberately.
    AGNOS, upstream license files, or stock cereal schemas.
 6. Runs the focused regression suite and compiles every changed Python file.
 7. Records the exact upstream commit and customization digest in `CUSTOM_FORK_MANIFEST.json`.
-8. Publishes `custompilot-staging` and opens a draft PR to `custompilot-stable` only when the
-   upstream commit or customization stack actually changed.
+8. Publishes `custompilot-staging` and supplies a manual PR comparison link only when the upstream
+   commit or customization stack actually changed.
 
 Textual conflict freedom is not treated as proof of runtime compatibility. The runbook documents
 real staging failures that merged cleanly but used incompatible cereal services, Cap'n Proto

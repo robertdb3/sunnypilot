@@ -12,7 +12,6 @@ on:
 
 permissions:
   contents: write
-  pull-requests: write
 
 concurrency:
   group: custompilot-staging-candidate
@@ -36,7 +35,8 @@ jobs:
         run: |
           git remote add upstream https://github.com/sunnypilot/sunnypilot.git 2>/dev/null || true
           git fetch --no-tags upstream staging
-          git fetch --no-tags origin custompilot-staging custompilot-stable 2>/dev/null || true
+          git fetch --no-tags origin refs/heads/custompilot-staging:refs/remotes/origin/custompilot-staging 2>/dev/null || true
+          git fetch --no-tags origin refs/heads/custompilot-stable:refs/remotes/origin/custompilot-stable 2>/dev/null || true
 
       - name: Preserve maintenance assets
         run: cp -R .robert-custom "$RUNNER_TEMP/robert-custom"
@@ -80,8 +80,6 @@ jobs:
 
       - name: Publish candidate branch
         if: steps.candidate_state.outputs.unchanged != 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           old_sha=$(git rev-parse --verify origin/custompilot-staging 2>/dev/null || true)
           if [ -n "$old_sha" ]; then
@@ -90,12 +88,6 @@ jobs:
             git push origin HEAD:custompilot-staging
           fi
 
-          if git rev-parse --verify origin/custompilot-stable >/dev/null 2>&1; then
-            if ! gh pr view custompilot-staging --json number >/dev/null 2>&1; then
-              upstream_sha=$(python3 -c 'import json; print(json.load(open("CUSTOM_FORK_MANIFEST.json"))["upstream"]["commit"])')
-              gh pr create --base custompilot-stable --head custompilot-staging \
-                --draft \
-                --title "Review sunnypilot staging ${upstream_sha:0:12}" \
-                --body "Automated candidate only. Review the upstream and custom diffs, require all checks to pass, then test deliberately before manual promotion to custompilot-stable."
-            fi
-          fi
+          echo "## Candidate published" >> "$GITHUB_STEP_SUMMARY"
+          echo "Review the source and manifest, then open the manual promotion comparison:" >> "$GITHUB_STEP_SUMMARY"
+          echo "https://github.com/${GITHUB_REPOSITORY}/compare/custompilot-stable...custompilot-staging?expand=1" >> "$GITHUB_STEP_SUMMARY"

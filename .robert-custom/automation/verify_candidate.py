@@ -34,13 +34,26 @@ def fail(message: str) -> None:
 
 
 def main() -> int:
-  if len(sys.argv) != 3:
-    print(f"usage: {sys.argv[0]} <candidate-checkout> <upstream-commit>", file=sys.stderr)
+  if len(sys.argv) != 4:
+    print(f"usage: {sys.argv[0]} <candidate-checkout> <upstream-commit> <customization-assets>",
+          file=sys.stderr)
     return 2
 
   checkout = Path(sys.argv[1]).resolve()
   base = sys.argv[2]
+  assets = Path(sys.argv[3]).resolve()
   changed = set(filter(None, git(checkout, "diff", "--name-only", base).splitlines()))
+  changed.update(filter(None, git(checkout, "ls-files", "--others", "--exclude-standard").splitlines()))
+
+  expected = set()
+  for patch_root in (assets / "patches", assets / "ports"):
+    for patch in patch_root.rglob("*.patch"):
+      for line in patch.read_text(encoding="utf-8").splitlines():
+        if line.startswith("diff --git a/"):
+          expected.add(line.split()[2].removeprefix("a/"))
+  missing = sorted(expected - changed)
+  if missing:
+    fail("manifest base hides or omits patch-stack changes:\n  " + "\n  ".join(missing))
 
   protected = sorted(
     path for path in changed
@@ -81,7 +94,8 @@ def main() -> int:
   if not changed:
     fail("candidate contains no customization changes")
 
-  print(f"verified {len(changed)} customized files against upstream {base[:12]}")
+  print(f"verified {len(expected)} patch-stack files and {len(changed)} total customized files "
+        f"against upstream {base[:12]}")
   return 0
 
 
