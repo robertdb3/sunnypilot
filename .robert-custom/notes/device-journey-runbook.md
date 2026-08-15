@@ -415,6 +415,13 @@ different times to communication rate and driving-model lag—two different prob
 13. **Do not guess wheel-speed calibration.** Measure GPS versus `vEgo` during a suitable drive.
 14. **Do not cross into panda safety casually.** Safety changes require the full safety test and
     coverage obligation and are a different risk tier.
+15. **Do not publish a promotion candidate as a sibling of stable.** Building from the upstream
+    commit and committing with that commit as the parent makes GitHub compare from the merge base,
+    can display the entire customization stack, and can make an otherwise source-identical
+    promotion conflict. Build and validate the tree against the manifest's exact upstream commit,
+    but create the published candidate commit with the current `custompilot-stable` tip as its
+    parent. Also keep the stable-validation workflow on the repository's default branch so GitHub
+    registers and runs the required `validate` check on promotion PRs.
 
 ## What remains deliberately unresolved
 
