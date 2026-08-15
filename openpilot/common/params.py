@@ -104,6 +104,7 @@ CPP_2_PYTHON = {
 # keys; only type/default metadata and Python-side validation need to be supplied here.
 # Keep this list narrow so misspelled parameter names still fail loudly.
 CUSTOM_PARAM_SPECS = {
+  b"IcbmFineAdjustments": (ParamKeyType.BOOL, b"0", ParamKeyFlag.PERSISTENT | ParamKeyFlag.BACKUP),
   b"MapPanel": (ParamKeyType.BOOL, b"0", ParamKeyFlag.PERSISTENT | ParamKeyFlag.BACKUP),
   b"Scene3D": (ParamKeyType.BOOL, b"0", ParamKeyFlag.PERSISTENT | ParamKeyFlag.BACKUP),
   b"RecklessWatch": (ParamKeyType.BOOL, b"0", ParamKeyFlag.PERSISTENT | ParamKeyFlag.BACKUP),

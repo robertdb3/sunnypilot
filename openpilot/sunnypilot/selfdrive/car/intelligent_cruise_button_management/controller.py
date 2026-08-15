@@ -10,6 +10,7 @@ from openpilot.cereal import custom
 from opendbc.car.structs import car
 from opendbc.car import structs, apply_hysteresis
 from openpilot.common.constants import CV
+from openpilot.common.params import Params
 from openpilot.common.realtime import DT_CTRL
 from openpilot.sunnypilot.selfdrive.car.intelligent_cruise_button_management.helpers import get_minimum_set_speed
 from openpilot.sunnypilot.selfdrive.car.cruise_ext import CRUISE_BUTTON_TIMER, update_manual_button_timers
@@ -41,6 +42,7 @@ class IntelligentCruiseButtonManagement:
     self.cruise_button = SendButtonState.none
     self.state = State.inactive
     self.pre_active_timer = 0
+    self.fine_step_enabled = Params().get_bool("IcbmFineAdjustments")
 
     self.is_ready = False
     self.is_ready_prev = False
