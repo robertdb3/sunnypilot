@@ -1,6 +1,6 @@
 {
-  "customization_sha256": "75398f4a3f611c9cf00b24a523ec51ac325a9d475c9c0adf700c3b225c383203",
-  "generated_at": "2026-08-15T15:28:51+00:00",
+  "customization_sha256": "60ed2d498855d6e05f934cb1ba63519c488c558afee0c9139c2e9c1cd18e91cc",
+  "generated_at": "2026-08-15T17:49:42+00:00",
   "release_policy": "manual promotion from custompilot-staging to custompilot-stable",
   "schema": 1,
   "upstream": {
