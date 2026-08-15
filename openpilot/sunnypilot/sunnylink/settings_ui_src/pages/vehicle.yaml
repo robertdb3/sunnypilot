@@ -82,6 +82,12 @@ sections:
   title: Toyota / Lexus Settings
   description: ''
   items:
+  - key: ToyotaEnhancedBsm
+    widget: toggle
+    needs_onroad_cycle: true
+    title: 'Toyota: Prius TSS2 BSM and some tssp'
+    enablement:
+    - $ref: '#/macros/not_engaged'
   - key: ToyotaTSS2Long
     widget: toggle
     needs_onroad_cycle: true

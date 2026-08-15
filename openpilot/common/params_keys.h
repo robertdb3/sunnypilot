@@ -189,6 +189,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"TrueVEgoUI", {PERSISTENT | BACKUP, BOOL, "0"}},
 
     // toyota specific params
+    {"ToyotaEnhancedBsm", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"ToyotaTSS2Long", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"ToyotaDriveMode", {PERSISTENT | BACKUP, BOOL, "0"}},
 
