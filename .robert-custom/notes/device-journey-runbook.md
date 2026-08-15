@@ -287,6 +287,21 @@ Expected behavior: it changes the stock set speed only while the system is enabl
 does nothing on an invalid/missing limit or during driver button input. SCC-V/SCC-M tags do not
 become stock button targets.
 
+The 2015 preglobal Subaru does not emit separate deep-button codes for a normal long press.
+Raw-CAN measurements showed quick and held SET/RES both use shallow codes `2`/`4`; duration is
+the only distinction. Six on-road trials produced exactly one mph after `0.806-0.856 s`. Fine
+ICBM therefore repeats the shallow code for at most 19 uninterrupted 50 ms slots (through 0.90
+s) and releases sooner when the set speed moves. It abandons a partial hold on driver input,
+ACC disengagement, a missed output slot, invalid/crossed target, or direction change. Never
+replace this with a one-frame deep-code (`3`/`5`) assumption.
+
+The dedicated **ICBM Fine 1-mph Adjustments** offroad toggle selects the behavior. Leave it off
+for coarse-only 5-mph snapping. Turn it on to let ICBM use the measured long hold when a 1-mph
+step gets closer to its target. This is intentionally separate from sunnypilot's generic Custom
+ACC Speed Increments setting because the physical Subaru semantics are short press = 5-mph snap
+and long press = 1 mph. With a 14% speed-limit offset, fine mode targets the rounded percentage
+(55 -> 63, 45 -> 51); coarse-only mode preserves the observed 55 -> 65 and 45 -> 50 behavior.
+
 ### Torque Self-Tune
 
 - Enforce Torque Lateral Control: on.
@@ -327,7 +342,7 @@ Then record:
 Use the device's bundled Python environment for diagnostics:
 
 ```bash
-PYTHONPATH=/data/openpilot /usr/local/venv/bin/python <script.py>
+PYTHONPATH=/data/openpilot:/data/openpilot/openpilot /usr/local/venv/bin/python <script.py>
 ```
 
 Plain `python3` may not find `openpilot`, `capnp`, or other bundled dependencies even when normal
