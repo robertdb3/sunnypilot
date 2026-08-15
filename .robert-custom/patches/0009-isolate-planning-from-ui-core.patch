@@ -1,0 +1,28 @@
+diff --git a/openpilot/selfdrive/controls/plannerd.py b/openpilot/selfdrive/controls/plannerd.py
+--- a/openpilot/selfdrive/controls/plannerd.py
++++ b/openpilot/selfdrive/controls/plannerd.py
+@@ -11,7 +11,9 @@ from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPl
+ 
+ 
+ def main():
+-  config_realtime_process(5, Priority.CTRL_LOW)
++  # Stay with radar fusion on the otherwise-idle core 6 so UI load on core 5 cannot delay the
++  # model-synchronous planning chain and trip communication-rate safety checks.
++  config_realtime_process(6, Priority.CTRL_LOW)
+ 
+   cloudlog.info("plannerd is waiting for CarParams")
+   params = Params()
+diff --git a/openpilot/selfdrive/controls/radard.py b/openpilot/selfdrive/controls/radard.py
+--- a/openpilot/selfdrive/controls/radard.py
++++ b/openpilot/selfdrive/controls/radard.py
+@@ -275,7 +275,9 @@ class RadarD:
+ 
+ # fuses camera and radar data for best lead detection
+ def main() -> None:
+-  config_realtime_process(5, Priority.CTRL_LOW)
++  # The custom onroad UI can saturate core 5, where radard normally runs below UI priority.
++  # Core 6 is otherwise idle on comma 3X; keep radar fusion realtime and isolated from rendering.
++  config_realtime_process(6, Priority.CTRL_LOW)
+ 
+   # wait for stats about the car to come in from controls
+   cloudlog.info("radard is waiting for CarParams")

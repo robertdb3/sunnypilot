@@ -1,0 +1,262 @@
+diff --git a/opendbc_repo/opendbc/car/structs.py b/opendbc_repo/opendbc/car/structs.py
+index 6165704..2909670 100644
+--- a/opendbc_repo/opendbc/car/structs.py
++++ b/opendbc_repo/opendbc/car/structs.py
+@@ -102,6 +102,7 @@ class IntelligentCruiseButtonManagement:
+     default_factory=lambda: IntelligentCruiseButtonManagement.SendButtonState.none
+   )
+   vTarget: float = auto_field()
++  vCruiseCluster: float = auto_field()
+ 
+   class IntelligentCruiseButtonManagementState(StrEnum):
+     inactive = auto()
+diff --git a/opendbc_repo/opendbc/car/subaru/carcontroller.py b/opendbc_repo/opendbc/car/subaru/carcontroller.py
+index 812d816..40da9c6 100644
+--- a/opendbc_repo/opendbc/car/subaru/carcontroller.py
++++ b/opendbc_repo/opendbc/car/subaru/carcontroller.py
+@@ -6,6 +6,7 @@ from opendbc.car.interfaces import CarControllerBase
+ from opendbc.car.subaru import subarucan
+ from opendbc.car.subaru.values import DBC, GLOBAL_ES_ADDR, CanBus, CarControllerParams, SubaruFlags
+ 
++from opendbc.sunnypilot.car.subaru.icbm import IntelligentCruiseButtonManagementInterface
+ from opendbc.sunnypilot.car.subaru.main_cruise import PreglobalMainCruise
+ from opendbc.sunnypilot.car.subaru.stop_and_go import SnGCarController
+ 
+@@ -15,10 +16,11 @@ MAX_STEER_RATE = 25  # deg/s
+ MAX_STEER_RATE_FRAMES = 7  # tx control frames needed before torque can be cut
+ 
+ 
+-class CarController(CarControllerBase, SnGCarController):
++class CarController(CarControllerBase, SnGCarController, IntelligentCruiseButtonManagementInterface):
+   def __init__(self, dbc_names, CP, CP_SP):
+     CarControllerBase.__init__(self, dbc_names, CP, CP_SP)
+     SnGCarController.__init__(self, CP, CP_SP)
++    IntelligentCruiseButtonManagementInterface.__init__(self, CP, CP_SP)
+     self.apply_torque_last = 0
+ 
+     self.cruise_button_prev = 0
+@@ -85,6 +87,13 @@ class CarController(CarControllerBase, SnGCarController):
+       if self.frame % 5 == 0:
+         mocked_main_press = False
+         # 1 = main, 2 = set shallow, 3 = set deep, 4 = resume shallow, 5 = resume deep
++        #
++        # ES_Distance carries exactly one button, so everything that wants to press something
++        # shares this slot. Priority, highest first: cancel, restoring main, ICBM set-speed
++        # nudges, then relaying the driver's own press untouched.
++        #
++        # button_for() records the press as a side effect, so it is only called once the higher
++        # priorities have declined — otherwise ICBM burns its press slot without sending anything.
+         # disengage ACC when OP is disengaged
+         if pcm_cancel_cmd:
+           cruise_button = 1
+@@ -95,6 +104,9 @@ class CarController(CarControllerBase, SnGCarController):
+         elif self.main_cruise.should_restore(CS.out.cruiseState.available, CS.ready):
+           cruise_button = 1
+           mocked_main_press = True
++        # match the stock ACC set speed to the speed limit by tapping SET / RES
++        elif icbm_button := IntelligentCruiseButtonManagementInterface.button_for(self, CC_SP, CS, self.frame):
++          cruise_button = icbm_button
+         else:
+           cruise_button = CS.cruise_button
+ 
+diff --git a/opendbc_repo/opendbc/car/subaru/interface.py b/opendbc_repo/opendbc/car/subaru/interface.py
+index 9d9b018..a9f1f26 100644
+--- a/opendbc_repo/opendbc/car/subaru/interface.py
++++ b/opendbc_repo/opendbc/car/subaru/interface.py
+@@ -107,6 +107,14 @@ class CarInterface(CarInterfaceBase):
+     if not stock_cp.flags & (SubaruFlags.GLOBAL_GEN2 | SubaruFlags.HYBRID):
+       stock_cp.autoResumeSng = True
+ 
++    # ICBM taps SET/RES through ES_Distance->Cruise_Button to walk the stock ACC set speed toward
++    # the speed limit. Preglobal only: subaru_preglobal_tx_hook checks nothing but ES_LKAS, so the
++    # button is already permitted, whereas subaru_tx_hook rejects any ES_Distance that is not a
++    # cancel when openpilot is not controlling longitudinal. Enabling this for global would need a
++    # panda safety change and the test coverage that comes with it.
++    if stock_cp.flags & SubaruFlags.PREGLOBAL:
++      ret.intelligentCruiseButtonManagementAvailable = True
++
+     return ret
+ 
+   @staticmethod
+diff --git a/opendbc_repo/opendbc/sunnypilot/car/subaru/icbm.py b/opendbc_repo/opendbc/sunnypilot/car/subaru/icbm.py
+new file mode 100644
+index 0000000..3b31737
+--- /dev/null
++++ b/opendbc_repo/opendbc/sunnypilot/car/subaru/icbm.py
+@@ -0,0 +1,137 @@
++"""
++Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
++
++This file is part of sunnypilot and is licensed under the MIT License.
++See the LICENSE.md file in the root directory for more details.
++"""
++
++import math
++
++from opendbc.car import structs, DT_CTRL
++from opendbc.sunnypilot.car.intelligent_cruise_button_management_interface_base import \
++  IntelligentCruiseButtonManagementInterfaceBase
++
++SendButtonState = structs.IntelligentCruiseButtonManagement.SendButtonState
++
++# ES_Distance->Cruise_Button, per the preglobal DBC:
++#   1 = main, 2 = set shallow, 3 = set deep, 4 = resume shallow, 5 = resume deep
++# On Subaru ACC, RES raises the set speed and SET lowers it.
++#
++# On this platform the SHORT tap is the COARSE action and the long hold is the fine one -- the
++# opposite of what the "shallow / deep" naming suggests. A short tap does not add 5 either: it
++# SNAPS to the next multiple of 5, so from 63 a tap down lands on 60, not 58.
++BUTTON_NONE = 0
++BUTTON_SET_COARSE = 2    # short tap down -> snap to next lower multiple of 5
++BUTTON_SET_FINE = 3      # long hold down -> -1
++BUTTON_RES_COARSE = 4    # short tap up   -> snap to next higher multiple of 5
++BUTTON_RES_FINE = 5      # long hold up   -> +1
++
++COARSE_SNAP = 5          # mph the coarse tap snaps to
++
++# Both vTarget and vCruiseCluster arrive in the cluster's DISPLAY units already, rounded to whole
++# numbers by the shared controller -- NOT in m/s. That is why nothing here converts: comparing a
++# display-unit target against a m/s cluster speed would be off by the conversion factor. It also
++# keeps this correct for a metric car, where both sides are simply kph instead.
++
++# ES_Distance goes out every 5 frames (20 Hz), so a press occupies one 50 ms slot.
++PRESS_CONFIRM_TIMEOUT = 1.2    # s to wait for the set speed to move before assuming the tap was lost
++DRIVER_COOLDOWN = 1.0          # s to stay out of the way after the driver touches a button
++
++# Whether a single frame of the fine code actually produces the 1 mph action, or whether the ECU
++# decodes "long hold" from a sustained assertion, is unverified on the car. Coarse-only is a
++# perfectly good shipping state: US limits are multiples of 5 and the coarse tap snaps to
++# multiples of 5, so it lands exactly on the limit for any offset that is 0 or a multiple of 5.
++# Flip this on once tools/probe_cruise_button.py shows the fine code working from a tap.
++FINE_STEP_ENABLED = False
++
++
++def coarse_down(v: int) -> int:
++  return int(math.floor(v / COARSE_SNAP) * COARSE_SNAP) if v % COARSE_SNAP else v - COARSE_SNAP
++
++
++def coarse_up(v: int) -> int:
++  return int(math.ceil(v / COARSE_SNAP) * COARSE_SNAP) if v % COARSE_SNAP else v + COARSE_SNAP
++
++
++class IntelligentCruiseButtonManagementInterface(IntelligentCruiseButtonManagementInterfaceBase):
++  """ICBM for preglobal Subaru.
++
++  Differs in shape from the Mazda/Chrysler/Hyundai ports: those append a dedicated button message
++  to can_sends, but preglobal Subaru carries the button inside ES_Distance, which the
++  carcontroller is already transmitting every 5 frames. So this returns a button code for the
++  caller to inject into that message rather than a list of CanData.
++
++  It also decides for itself whether to press at all. The shared controller stops on *crossing*
++  rather than proximity (controller.py:91,96) and compares set speeds for exact equality, which
++  with a coarse step oscillates forever: target 55 from 43 climbs 48-53-58, sees it overshot,
++  drops to 53, sees it undershot, and repeats. So rather than obeying the requested direction
++  blindly, only press when the press strictly reduces the error. That is self-limiting, needs no
++  deadband, and settles on the closest reachable set speed.
++  """
++
++  def __init__(self, CP, CP_SP):
++    super().__init__(CP, CP_SP)
++    self.driver_active_frame = -10_000
++    self.pending_since_frame: int | None = None
++    self.cluster_at_press = 0
++
++  def _candidates(self, v: int, increase: bool) -> list[tuple[int, int]]:
++    """(predicted set speed, button) in preference order: coarse to close, fine to land."""
++    out = [(coarse_up(v) if increase else coarse_down(v),
++            BUTTON_RES_COARSE if increase else BUTTON_SET_COARSE)]
++    if FINE_STEP_ENABLED:
++      out.append((v + 1 if increase else v - 1,
++                  BUTTON_RES_FINE if increase else BUTTON_SET_FINE))
++    return out
++
++  def button_for(self, CC_SP, CS, frame: int) -> int:
++    """Return the Cruise_Button value to send this cycle, or BUTTON_NONE."""
++    icbm = getattr(CC_SP, "intelligentCruiseButtonManagement", None)
++    if icbm is None or icbm.sendButton == SendButtonState.none:
++      return BUTTON_NONE
++
++    # Only ever nudge a cruise system that is actually engaged.
++    if not CS.out.cruiseState.enabled:
++      return BUTTON_NONE
++
++    # Preglobal Subaru publishes no cruise buttonEvents, so the shared controller's
++    # "driver is pressing" check (controller.py:113) can never fire on this platform. Watch the
++    # raw relayed button instead and yield the bus while the driver is adjusting.
++    if CS.cruise_button != BUTTON_NONE:
++      self.driver_active_frame = frame
++      self.pending_since_frame = None
++      return BUTTON_NONE
++
++    if (frame - self.driver_active_frame) * DT_CTRL < DRIVER_COOLDOWN:
++      return BUTTON_NONE
++
++    cluster = round(getattr(icbm, "vCruiseCluster", 0.0))
++
++    # Wait for the previous tap to land before sending another. Gating on observed movement
++    # instead of a fixed interval makes overshoot structurally impossible rather than tuned away,
++    # and it does not care how big the step turns out to be.
++    if self.pending_since_frame is not None:
++      moved = cluster != self.cluster_at_press
++      timed_out = (frame - self.pending_since_frame) * DT_CTRL > PRESS_CONFIRM_TIMEOUT
++      if not (moved or timed_out):
++        return BUTTON_NONE
++      self.pending_since_frame = None
++
++    target = round(getattr(icbm, "vTarget", 0.0))
++    if target <= 0 or cluster <= 0:
++      return BUTTON_NONE
++
++    increase = icbm.sendButton == SendButtonState.increase
++    error = abs(target - cluster)
++
++    for predicted, button in self._candidates(cluster, increase):
++      if abs(target - predicted) < error:
++        self.pending_since_frame = frame
++        self.cluster_at_press = cluster
++        self.button_frame += 1
++        return button
++
++    # Nothing available gets us closer -- we are as near as this car's steps allow. The shared
++    # state machine will keep flapping increasing/decreasing underneath, which is harmless
++    # because we simply do not act on it.
++    return BUTTON_NONE
+diff --git a/openpilot/cereal/custom.capnp b/openpilot/cereal/custom.capnp
+index c20bf92..a10db6f 100644
+--- a/openpilot/cereal/custom.capnp
++++ b/openpilot/cereal/custom.capnp
+@@ -29,6 +29,10 @@ struct IntelligentCruiseButtonManagement {
+   state @0 :IntelligentCruiseButtonManagementState;
+   sendButton @1 :SendButtonState;
+   vTarget @2 :Float32;
++  # Both speeds are in the cluster's DISPLAY units (mph or kph per IsMetric), not m/s. The car
++  # port needs the cluster value in the same units as vTarget to reason about set-speed steps,
++  # and opendbc has no access to IsMetric.
++  vCruiseCluster @3 :Float32;
+ 
+   enum IntelligentCruiseButtonManagementState {
+     inactive @0;      # No button press or default state
+diff --git a/openpilot/selfdrive/selfdrived/selfdrived.py b/openpilot/selfdrive/selfdrived/selfdrived.py
+index 672fee9..ae6929b 100755
+--- a/openpilot/selfdrive/selfdrived/selfdrived.py
++++ b/openpilot/selfdrive/selfdrived/selfdrived.py
+@@ -629,6 +629,7 @@ class SelfdriveD(CruiseHelper):
+     icbm.state = self.icbm.state
+     icbm.sendButton = self.icbm.cruise_button
+     icbm.vTarget = self.icbm.v_target
++    icbm.vCruiseCluster = self.icbm.v_cruise_cluster
+ 
+     self.button_state_tracker.publish(ss_sp)
+ 
+diff --git a/openpilot/sunnypilot/selfdrive/controls/controlsd_ext.py b/openpilot/sunnypilot/selfdrive/controls/controlsd_ext.py
+index 344ae52..8903507 100644
+--- a/openpilot/sunnypilot/selfdrive/controls/controlsd_ext.py
++++ b/openpilot/sunnypilot/selfdrive/controls/controlsd_ext.py
+@@ -103,6 +103,7 @@ class ControlsExt(ModelStateBase):
+     CC_SP.intelligentCruiseButtonManagement.state = icbm_src.state
+     CC_SP.intelligentCruiseButtonManagement.sendButton = icbm_src.sendButton
+     CC_SP.intelligentCruiseButtonManagement.vTarget = icbm_src.vTarget
++    CC_SP.intelligentCruiseButtonManagement.vCruiseCluster = icbm_src.vCruiseCluster
+ 
+     return CC_SP
+ 

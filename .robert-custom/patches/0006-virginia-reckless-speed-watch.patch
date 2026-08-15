@@ -1,0 +1,864 @@
+diff --git a/openpilot/cereal/custom.capnp b/openpilot/cereal/custom.capnp
+index a10db6f..086d1f3 100644
+--- a/openpilot/cereal/custom.capnp
++++ b/openpilot/cereal/custom.capnp
+@@ -70,11 +70,27 @@ struct LeadData {
+   aLeadDEPRECATED @5 :Float32;
+ }
+ 
++struct RecklessWatch {
++  # Virginia Code 46.2-862 watch. thresholdMph is whichever limit was actually breached, in the
++  # cluster's display units, so the UI does not have to re-derive it.
++  inVirginia @0 :Bool;
++  over @1 :Bool;
++  reason @2 :Reason;
++  thresholdMph @3 :Float32;
++
++  enum Reason {
++    none @0;
++    absolute @1;
++    overLimit @2;
++  }
++}
++
+ struct SelfdriveStateSP @0x81c2f05a394cf4af {
+   mads @0 :ModularAssistiveDrivingSystem;
+   intelligentCruiseButtonManagement @1 :IntelligentCruiseButtonManagement;
+   buttonsPressed @2 :UInt16;
+   buttonsReleaseToggle @3 :UInt16;
++  recklessWatch @4 :RecklessWatch;
+ 
+   enum AudibleAlert {
+     none @0;
+@@ -356,6 +372,8 @@ struct OnroadEventSP @0xda96579883444c35 {
+     speedLimitPending @22;
+     e2eChime @23;
+     laneChangeRoadEdge @24;
++    enteredVirginia @25;
++    recklessSpeed @26;
+   }
+ }
+ 
+diff --git a/openpilot/common/params_keys.h b/openpilot/common/params_keys.h
+index aca2b9b..deaf117 100644
+--- a/openpilot/common/params_keys.h
++++ b/openpilot/common/params_keys.h
+@@ -186,6 +186,8 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
+     {"ShowTurnSignals", {PERSISTENT | BACKUP, BOOL, "0"}},
+     {"MapPanel", {PERSISTENT | BACKUP, BOOL, "0"}},
+     {"Scene3D", {PERSISTENT | BACKUP, BOOL, "0"}},
++    {"RecklessWatch", {PERSISTENT | BACKUP, BOOL, "0"}},
++    {"RecklessWatchThresholdMph", {PERSISTENT | BACKUP, INT, "82"}},
+     {"MapPanelZoom", {PERSISTENT | BACKUP, INT, "1"}},
+     {"StandstillTimer", {PERSISTENT | BACKUP, BOOL, "0"}},
+     {"TrueVEgoUI", {PERSISTENT | BACKUP, BOOL, "0"}},
+diff --git a/openpilot/selfdrive/selfdrived/selfdrived.py b/openpilot/selfdrive/selfdrived/selfdrived.py
+index ae6929b..b9f6a6f 100755
+--- a/openpilot/selfdrive/selfdrived/selfdrived.py
++++ b/openpilot/selfdrive/selfdrived/selfdrived.py
+@@ -30,6 +30,7 @@ from openpilot.sunnypilot.mads.mads import ModularAssistiveDrivingSystem
+ from openpilot.sunnypilot import get_sanitize_int_param
+ from openpilot.sunnypilot.selfdrive.car.car_specific import CarSpecificEventsSP
+ from openpilot.sunnypilot.selfdrive.car.cruise_helpers import CruiseHelper
++from openpilot.sunnypilot.selfdrive.reckless_watch.watcher import RecklessWatch, DEFAULT_THRESHOLD_MPH
+ from openpilot.sunnypilot.selfdrive.car.intelligent_cruise_button_management.controller import IntelligentCruiseButtonManagement
+ from openpilot.sunnypilot.selfdrive.selfdrived.button_state_tracker import ButtonStateTracker
+ from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
+@@ -174,6 +175,11 @@ class SelfdriveD(CruiseHelper):
+     elif self.CP.passive:
+       self.events.add(EventName.dashcamMode, static=True)
+ 
++    self.reckless_watch_enabled = self.params.get_bool("RecklessWatch")
++    self.reckless_watch = RecklessWatch(
++      float(self.params.get("RecklessWatchThresholdMph", return_default=True) or DEFAULT_THRESHOLD_MPH))
++    self.reckless_state = None
++
+     self.events_sp = EventsSP()
+     self.events_sp_prev = []
+ 
+@@ -508,6 +514,8 @@ class SelfdriveD(CruiseHelper):
+     if CS.gearShifter == car.CarState.GearShifter.park and self.mads.enabled:
+       self.events.remove(EventName.canBusMissing)
+ 
++    self.update_reckless_watch(CS)
++
+     CruiseHelper.update(self, CS, self.events_sp, self.experimental_mode)
+ 
+     # decrement personality on distance button press
+@@ -585,6 +593,33 @@ class SelfdriveD(CruiseHelper):
+     self.AM.add_many(self.sm.frame, alerts + alerts_sp)
+     self.AM.process_alerts(self.sm.frame, clear_event_types)
+ 
++  def update_reckless_watch(self, CS):
++    """Virginia reckless-speed watch.
++
++    Raises the two alerts on their rising edges only -- "does not keep annoying me" was the
++    requirement, so the sticky over/under state goes out on selfdriveStateSP and the UI paints a
++    pulsing border instead of repeating the sound.
++    """
++    if not self.reckless_watch_enabled:
++      self.reckless_state = None
++      return
++
++    if not self.sm.valid[self.gps_location_service]:
++      return
++    gps = self.sm[self.gps_location_service]
++
++    # resolved limit, 0 when unknown -- the 20-over rule stays silent rather than guessing
++    speed_limit = self.sm['longitudinalPlanSP'].speedLimit.resolver.speedLimit
++
++    st = self.reckless_watch.update(gps.latitude, gps.longitude, gps.horizontalAccuracy,
++                                    CS.vEgo, speed_limit)
++    self.reckless_state = st
++
++    if st.entered_virginia:
++      self.events_sp.add(custom.OnroadEventSP.EventName.enteredVirginia)
++    if st.started_speeding:
++      self.events_sp.add(custom.OnroadEventSP.EventName.recklessSpeed)
++
+   def publish_selfdriveState(self, CS):
+     # selfdriveState
+     ss_msg = messaging.new_message('selfdriveState')
+@@ -631,6 +666,13 @@ class SelfdriveD(CruiseHelper):
+     icbm.vTarget = self.icbm.v_target
+     icbm.vCruiseCluster = self.icbm.v_cruise_cluster
+ 
++    rw = ss_sp.recklessWatch
++    if self.reckless_state is not None:
++      rw.inVirginia = self.reckless_state.in_virginia
++      rw.over = self.reckless_state.over
++      rw.reason = ['none', 'absolute', 'overLimit'][int(self.reckless_state.reason)]
++      rw.thresholdMph = float(self.reckless_state.threshold_mph)
++
+     self.button_state_tracker.publish(ss_sp)
+ 
+     self.pm.send('selfdriveStateSP', ss_sp_msg)
+diff --git a/openpilot/selfdrive/ui/sunnypilot/layouts/settings/visuals.py b/openpilot/selfdrive/ui/sunnypilot/layouts/settings/visuals.py
+index ae2a1d9..a1254f6 100644
+--- a/openpilot/selfdrive/ui/sunnypilot/layouts/settings/visuals.py
++++ b/openpilot/selfdrive/ui/sunnypilot/layouts/settings/visuals.py
+@@ -7,6 +7,6 @@ See the LICENSE.md file in the root directory for more details.
+ from openpilot.common.params import Params
+ from openpilot.selfdrive.ui.ui_state import ui_state
+ from openpilot.system.ui.lib.multilang import tr, tr_noop
+-from openpilot.system.ui.sunnypilot.widgets.list_view import toggle_item_sp, multiple_button_item_sp
++from openpilot.system.ui.sunnypilot.widgets.list_view import toggle_item_sp, multiple_button_item_sp, option_item_sp
+ from openpilot.system.ui.widgets.scroller_tici import Scroller
+ from openpilot.system.ui.widgets import Widget
+@@ -93,6 +93,15 @@ class VisualsLayout(Widget):
+            "This displays what the car is currently doing, not what the planner is requesting."),
+         None,
+       ),
++      "RecklessWatch": (
++        lambda: tr("Virginia Reckless Speed Watch"),
++        tr("Virginia treats 20 mph over the limit, or any speed above 85 mph, as reckless driving "
++           "\u2014 a criminal offence rather than a ticket. Notifies you on entering the state, "
++           "sounds once when you cross the threshold below, then shows a pulsing red border while "
++           "you stay above it. The 20-over check stays quiet where no speed limit data exists. "
++           "A driver aid, not legal advice: your car's speed will differ from an officer's radar."),
++        None,
++      ),
+       "Scene3D": (
+         lambda: tr("3D Driving Scene"),
+         tr("Replace the camera view with a rendered 3D scene: your car, the road, lane lines, "
+@@ -136,6 +145,17 @@ class VisualsLayout(Widget):
+       inline=False
+     )
+ 
++    self._reckless_threshold = option_item_sp(
++      title=lambda: tr("Reckless Watch Alert Speed"),
++      param="RecklessWatchThresholdMph",
++      description=lambda: tr("Sound the alert at this speed. Virginia's statute is above 85 mph; "
++                             "the default of 82 leaves room to react and absorbs speedometer error."),
++      min_value=60,
++      max_value=90,
++      value_change_step=1,
++      label_callback=lambda x: f"{x} mph",
++    )
++
+     self._map_panel_zoom = multiple_button_item_sp(
+       title=lambda: tr("Map Panel Zoom"),
+       description=lambda: tr("How much ground the map panel covers."),
+@@ -146,6 +166,7 @@ class VisualsLayout(Widget):
+     )
+ 
+     items = list(self._toggles.values()) + [
++      self._reckless_threshold,
+       self._chevron_info,
+       self._dev_ui_info,
+       self._map_panel_zoom,
+diff --git a/openpilot/selfdrive/ui/sunnypilot/onroad/hud_renderer.py b/openpilot/selfdrive/ui/sunnypilot/onroad/hud_renderer.py
+index 09518e2..1a34b02 100644
+--- a/openpilot/selfdrive/ui/sunnypilot/onroad/hud_renderer.py
++++ b/openpilot/selfdrive/ui/sunnypilot/onroad/hud_renderer.py
+@@ -10,6 +10,7 @@ from openpilot.common.constants import CV
+ from openpilot.selfdrive.ui.mici.onroad.torque_bar import TorqueBar
+ from openpilot.selfdrive.ui.sunnypilot.onroad.developer_ui import DeveloperUiRenderer, DeveloperUiState, get_bottom_dev_ui_offset
+ from openpilot.selfdrive.ui.sunnypilot.onroad.map_panel import MapPanelRenderer
++from openpilot.selfdrive.ui.sunnypilot.onroad.reckless_border import RecklessBorderRenderer
+ from openpilot.selfdrive.ui.sunnypilot.onroad.road_name import RoadNameRenderer
+ from openpilot.selfdrive.ui.sunnypilot.onroad.rocket_fuel import RocketFuel
+ from openpilot.selfdrive.ui.sunnypilot.onroad.speed_limit import SpeedLimitRenderer
+@@ -32,6 +33,7 @@ class HudRendererSP(HudRenderer):
+     self.developer_ui = DeveloperUiRenderer()
+     self.map_panel_renderer = MapPanelRenderer()
+     self.road_name_renderer = RoadNameRenderer()
++    self.reckless_border = RecklessBorderRenderer()
+     self.rocket_fuel = RocketFuel()
+     self.speed_limit_renderer = SpeedLimitRenderer()
+     self.smart_cruise_control_renderer = SmartCruiseControlRenderer()
+@@ -58,6 +60,7 @@ class HudRendererSP(HudRenderer):
+     super()._update_state()
+     self.map_panel_renderer.update()
+     self.road_name_renderer.update()
++    self.reckless_border.update()
+     self.speed_limit_renderer.update()
+     self.smart_cruise_control_renderer.update()
+     self.turn_signal_controller.update()
+@@ -148,3 +151,4 @@ class HudRendererSP(HudRenderer):
+     self.turn_signal_controller.render(rect)
+     self.circular_alerts_renderer.render(rect)
+     self.rocket_fuel.render(rect, ui_state.sm)
++    self.reckless_border.render(rect)
+diff --git a/openpilot/selfdrive/ui/sunnypilot/onroad/reckless_border.py b/openpilot/selfdrive/ui/sunnypilot/onroad/reckless_border.py
+new file mode 100644
+index 0000000..2a51ff5
+--- /dev/null
++++ b/openpilot/selfdrive/ui/sunnypilot/onroad/reckless_border.py
+@@ -0,0 +1,64 @@
++"""
++Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
++
++This file is part of sunnypilot and is licensed under the MIT License.
++See the LICENSE.md file in the root directory for more details.
++"""
++
++import math
++
++import pyray as rl
++
++from openpilot.selfdrive.ui import UI_BORDER_SIZE
++from openpilot.selfdrive.ui.ui_state import ui_state
++from openpilot.system.ui.widgets import Widget
++
++# The onroad border is a flat colour keyed off UIStatus (onroad/augmented_road_view.py:29), so this
++# paints a separate pulsing band over it rather than trying to add a state to that mapping. Red
++# with a slow pulse, deliberately unlike any engagement colour.
++PULSE_HZ = 0.8
++ALPHA_MIN, ALPHA_MAX = 70, 235
++COLOR = (220, 38, 38)
++
++FADE_RATE = 3.0   # how fast it appears and clears, in alpha-fraction per second
++
++
++class RecklessBorderRenderer(Widget):
++  """Persistent, silent reminder that the car is above the Virginia threshold.
++
++  The audible alert fires once on the rising edge; this is what keeps it visible afterwards
++  without nagging.
++  """
++
++  def __init__(self):
++    super().__init__()
++    self._phase = 0.0
++    self._level = 0.0     # eased 0..1 so it does not snap on and off
++
++  def update(self, dt: float = 0.05) -> None:
++    active = bool(getattr(ui_state, "reckless_over", False))
++    target = 1.0 if active else 0.0
++    step = FADE_RATE * dt
++    self._level = min(self._level + step, target) if target > self._level \
++        else max(self._level - step, target)
++
++    if self._level > 0.0:
++      self._phase = (self._phase + 2.0 * math.pi * PULSE_HZ * dt) % (2.0 * math.pi)
++    else:
++      self._phase = 0.0
++
++  def _render(self, rect: rl.Rectangle) -> None:
++    if self._level <= 0.01:
++      return
++
++    pulse = 0.5 * (1.0 + math.sin(self._phase))
++    alpha = int((ALPHA_MIN + (ALPHA_MAX - ALPHA_MIN) * pulse) * self._level)
++    color = rl.Color(*COLOR, alpha)
++
++    b = UI_BORDER_SIZE
++    x, y, w, h = int(rect.x), int(rect.y), int(rect.width), int(rect.height)
++    # four bands rather than a filled rect, so the camera or 3D scene stays visible
++    rl.draw_rectangle(x, y, w, b, color)
++    rl.draw_rectangle(x, y + h - b, w, b, color)
++    rl.draw_rectangle(x, y + b, b, h - 2 * b, color)
++    rl.draw_rectangle(x + w - b, y + b, b, h - 2 * b, color)
+diff --git a/openpilot/selfdrive/ui/sunnypilot/ui_state.py b/openpilot/selfdrive/ui/sunnypilot/ui_state.py
+index 6880472..0129de5 100644
+--- a/openpilot/selfdrive/ui/sunnypilot/ui_state.py
++++ b/openpilot/selfdrive/ui/sunnypilot/ui_state.py
+@@ -55,6 +55,7 @@ class UIStateSP:
+     self.onroad_brightness_timer_param: int = 0
+     self.rainbow_path: bool = False
+     self.scene_3d: bool = False
++    self.reckless_over: bool = False
+     self.road_name_toggle: bool = False
+     self.rocket_fuel: bool = False
+     self.speed_limit_mode = None
+@@ -151,6 +152,8 @@ class UIStateSP:
+     if CP_SP_bytes is not None:
+       self.CP_SP = messaging.log_from_bytes(CP_SP_bytes, custom.CarParamsSP)
+       self.has_icbm = self.CP_SP.intelligentCruiseButtonManagementAvailable and self.params.get_bool("IntelligentCruiseButtonManagement")
++    if self.sm.updated.get('selfdriveStateSP'):
++      self.reckless_over = bool(self.sm['selfdriveStateSP'].recklessWatch.over)
+ 
+     self._enforce_constraints()
+     self.active_bundle = self.params.get("ModelManager_ActiveBundle")
+diff --git a/openpilot/sunnypilot/selfdrive/reckless_watch/__init__.py b/openpilot/sunnypilot/selfdrive/reckless_watch/__init__.py
+new file mode 100644
+index 0000000..2b444e0
+--- /dev/null
++++ b/openpilot/sunnypilot/selfdrive/reckless_watch/__init__.py
+@@ -0,0 +1,6 @@
++"""
++Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
++
++This file is part of sunnypilot and is licensed under the MIT License.
++See the LICENSE.md file in the root directory for more details.
++"""
+diff --git a/openpilot/sunnypilot/selfdrive/reckless_watch/geofence.py b/openpilot/sunnypilot/selfdrive/reckless_watch/geofence.py
+new file mode 100644
+index 0000000..d4c8081
+--- /dev/null
++++ b/openpilot/sunnypilot/selfdrive/reckless_watch/geofence.py
+@@ -0,0 +1,83 @@
++"""
++Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
++
++This file is part of sunnypilot and is licensed under the MIT License.
++See the LICENSE.md file in the root directory for more details.
++"""
++
++from openpilot.sunnypilot.selfdrive.reckless_watch.va_outline import BBOX, RINGS
++
++# A GPS fix can wobble tens of metres, and border roads run right along the line. Require several
++# consecutive fixes on the new side before believing a crossing, or the alert chatters.
++CROSSING_CONFIRM_FIXES = 5
++
++# Beyond this the fix is too uncertain to make a claim about which state we are in.
++MAX_HORIZONTAL_ACCURACY = 50.0  # metres
++
++
++def _in_ring(lon: float, lat: float, ring) -> bool:
++  """Standard ray casting. Ring points are (lon, lat)."""
++  inside = False
++  n = len(ring)
++  j = n - 1
++  for i in range(n):
++    xi, yi = ring[i]
++    xj, yj = ring[j]
++    if ((yi > lat) != (yj > lat)) and (lon < (xj - xi) * (lat - yi) / (yj - yi) + xi):
++      inside = not inside
++    j = i
++  return inside
++
++
++def in_virginia(lat: float, lon: float) -> bool:
++  """Point in the Virginia outline, including the Eastern Shore and the bay islands."""
++  min_lon, min_lat, max_lon, max_lat = BBOX
++  # cheap rejection first; the great majority of calls are nowhere near the state
++  if not (min_lat <= lat <= max_lat and min_lon <= lon <= max_lon):
++    return False
++
++  return any(_in_ring(lon, lat, ring) for ring in RINGS)
++
++
++class StateTracker:
++  """Debounced 'are we in Virginia' with edge detection.
++
++  Holds its last confident answer while a fix is poor or absent rather than flapping to False,
++  so driving through a tunnel does not read as leaving the state.
++  """
++
++  def __init__(self, confirm_fixes: int = CROSSING_CONFIRM_FIXES):
++    self.confirm_fixes = confirm_fixes
++    self.inside: bool | None = None      # None until the first confident fix
++    self._pending: bool | None = None
++    self._count = 0
++
++  def update(self, lat: float, lon: float, horizontal_accuracy: float = 0.0) -> bool:
++    """Feed a GPS fix. Returns True on the transition INTO Virginia, once."""
++    if horizontal_accuracy > MAX_HORIZONTAL_ACCURACY:
++      return False
++
++    observed = in_virginia(lat, lon)
++
++    if observed == self.inside:
++      self._pending = None
++      self._count = 0
++      return False
++
++    if observed != self._pending:
++      self._pending = observed
++      self._count = 1
++      return False
++
++    self._count += 1
++    if self._count < self.confirm_fixes:
++      return False
++
++    first_fix = self.inside is None
++    self.inside = observed
++    self._pending = None
++    self._count = 0
++
++    # Announce only an actual crossing in. The first fix of a drive already inside the state is
++    # not a crossing -- waking up in Richmond should not announce anything.
++    return observed and not first_fix
+diff --git a/openpilot/sunnypilot/selfdrive/reckless_watch/va_outline.py b/openpilot/sunnypilot/selfdrive/reckless_watch/va_outline.py
+new file mode 100644
+index 0000000..4faa704
+--- /dev/null
++++ b/openpilot/sunnypilot/selfdrive/reckless_watch/va_outline.py
+@@ -0,0 +1,306 @@
++"""
++Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
++
++This file is part of sunnypilot and is licensed under the MIT License.
++See the LICENSE.md file in the root directory for more details.
++"""
++
++# Virginia state outline, (lon, lat) in GeoJSON order, rounded to 5 dp (~1 m).
++#
++# US state boundaries are factual government data and not subject to copyright. This outline
++# derives from US Census cartographic boundary data by way of a public GeoJSON mirror.
++#
++# 4 rings, 1268 points total. The mainland is the first; the rest are the
++# Eastern Shore (disjoint from the mainland, across the Chesapeake) and two small bay islands.
++# A coarser 65-point outline was rejected: it disagreed with this one near real borders, and the
++# whole point of the feature is knowing which side of a border you are on.
++#
++# Validated against the Bristol VA/TN line, where State Street IS the border: this outline
++# transitions to Virginia at lat 36.596, which is State Street.
++
++BBOX = (-83.67541, 36.54074, -75.24227, 39.46601)  # (min_lon, min_lat, max_lon, max_lat)
++
++RINGS: tuple[tuple[tuple[float, float], ...], ...] = (
++  (
++    (-78.86928,38.76299), (-78.83519,38.8115), (-78.80818,38.85618), (-78.78803,38.88512), (-78.7792,38.8923),
++    (-78.75728,38.9032), (-78.71981,38.92264), (-78.71976,38.92213), (-78.71696,38.91627), (-78.71413,38.91118),
++    (-78.71095,38.91018), (-78.60165,38.9646), (-78.55765,39.01319), (-78.55422,39.01967), (-78.56584,39.0263),
++    (-78.5719,39.032), (-78.54411,39.05668), (-78.50813,39.08863), (-78.45987,39.11335), (-78.43943,39.13215),
++    (-78.41838,39.15666), (-78.41074,39.17198), (-78.42672,39.1889), (-78.43865,39.19805), (-78.43705,39.19977),
++    (-78.43213,39.20472), (-78.43117,39.20574), (-78.4298,39.20701), (-78.42791,39.20861), (-78.42397,39.21205),
++    (-78.39967,39.24387), (-78.39978,39.24413), (-78.36003,39.31777), (-78.35894,39.31948),
++    (-78.34048,39.35349), (-78.36227,39.35778), (-78.34709,39.46601), (-78.22877,39.39123),
++    (-78.03319,39.26463), (-78.03318,39.26462), (-78.03284,39.2644), (-77.82816,39.13233), (-77.82218,39.13999),
++    (-77.77142,39.23678), (-77.76728,39.24938), (-77.76899,39.25642), (-77.768,39.25766), (-77.76177,39.26303),
++    (-77.76122,39.26372), (-77.75873,39.26811), (-77.75841,39.2692), (-77.7557,39.27457), (-77.75519,39.27519),
++    (-77.75311,39.27734), (-77.75306,39.27797), (-77.75336,39.28033), (-77.75027,39.28928),
++    (-77.71903,39.32113), (-77.6775,39.3187), (-77.66775,39.31813), (-77.59274,39.30129), (-77.56085,39.28615),
++    (-77.54585,39.27154), (-77.54323,39.26694), (-77.53446,39.26236), (-77.51122,39.2535), (-77.48461,39.24594),
++    (-77.46021,39.22836), (-77.45768,39.22502), (-77.45878,39.22028), (-77.45888,39.21983), (-77.4786,39.18917),
++    (-77.48597,39.18567), (-77.50516,39.18205), (-77.51063,39.17848), (-77.51643,39.17089),
++    (-77.52728,39.14624), (-77.52456,39.12782), (-77.51993,39.12092), (-77.4582,39.07372), (-77.42318,39.06688),
++    (-77.37508,39.0613), (-77.34029,39.06299), (-77.328,39.05855), (-77.29161,39.04541), (-77.2614,39.03101),
++    (-77.2518,39.01141), (-77.2557,39.00241), (-77.2498,38.98591), (-77.2354,38.97661), (-77.2215,38.97131),
++    (-77.1975,38.96681), (-77.1669,38.96811), (-77.14818,38.965), (-77.1377,38.95531), (-77.1199,38.93431),
++    (-77.11986,38.93427), (-77.1012,38.91111), (-77.0902,38.90421), (-77.0682,38.89981), (-77.0406,38.87121),
++    (-77.0317,38.85051), (-77.03299,38.8395), (-77.0386,38.79151), (-77.03924,38.7852), (-77.0414,38.76391),
++    (-77.05991,38.73442), (-77.0746,38.71102), (-77.08611,38.70579), (-77.1059,38.69682), (-77.1211,38.68662),
++    (-77.1325,38.67382), (-77.1359,38.64982), (-77.1302,38.63502), (-77.1575,38.63642), (-77.1749,38.62422),
++    (-77.202,38.61722), (-77.2043,38.61782), (-77.2051,38.62392), (-77.2163,38.63782), (-77.22235,38.63809),
++    (-77.2406,38.63892), (-77.2467,38.63522), (-77.2489,38.62862), (-77.2451,38.62072), (-77.24644,38.59953),
++    (-77.247,38.59062), (-77.26443,38.58284), (-77.2653,38.58032), (-77.26083,38.56533), (-77.2766,38.54712),
++    (-77.2763,38.53962), (-77.2835,38.52522), (-77.2911,38.51572), (-77.29582,38.51146), (-77.29884,38.50872),
++    (-77.30078,38.50698), (-77.30246,38.50468), (-77.31033,38.49393), (-77.32262,38.46713),
++    (-77.32544,38.44885), (-77.31904,38.4178), (-77.31072,38.39767), (-77.3122,38.39096), (-77.31485,38.38958),
++    (-77.31729,38.38358), (-77.29608,38.3698), (-77.28815,38.35948), (-77.28835,38.35129), (-77.2862,38.34703),
++    (-77.2862,38.34702), (-77.27963,38.33944), (-77.26529,38.33317), (-77.24007,38.3316), (-77.19943,38.34089),
++    (-77.17934,38.34192), (-77.16269,38.34599), (-77.15519,38.35105), (-77.13822,38.36792),
++    (-77.10472,38.36966), (-77.09467,38.36771), (-77.08481,38.3683), (-77.06996,38.3779), (-77.05603,38.3962),
++    (-77.05144,38.39908), (-77.04353,38.40055), (-77.02487,38.38679), (-77.01183,38.37455), (-77.01693,38.3417),
++    (-77.02095,38.32927), (-77.03068,38.31162), (-77.0263,38.30268), (-76.99767,38.27805), (-76.99026,38.27394),
++    (-76.98137,38.27421), (-76.96215,38.25649), (-76.9578,38.24318), (-76.95742,38.23634), (-76.96237,38.23009),
++    (-76.96655,38.22954), (-76.96734,38.22718), (-76.96231,38.21408), (-76.93713,38.20238),
++    (-76.91692,38.19975), (-76.91083,38.19707), (-76.87527,38.17221), (-76.8388,38.16348), (-76.82427,38.16364),
++    (-76.80297,38.16799), (-76.78844,38.1692), (-76.76024,38.16658), (-76.74968,38.16211), (-76.74306,38.15699),
++    (-76.74028,38.15282), (-76.73894,38.14651), (-76.72172,38.13764), (-76.70405,38.14926), (-76.7013,38.15572),
++    (-76.68489,38.1565), (-76.66513,38.14764), (-76.64345,38.14825), (-76.63898,38.15148), (-76.62948,38.15305),
++    (-76.61394,38.14859), (-76.60413,38.12877), (-76.60094,38.11008), (-76.5795,38.09487), (-76.54315,38.07697),
++    (-76.53592,38.06953), (-76.52235,38.04259), (-76.51954,38.03481), (-76.51655,38.02657), (-76.492,38.01722),
++    (-76.46934,38.01354), (-76.46529,38.01023), (-76.46254,37.99857), (-76.42749,37.97704), (-76.4163,37.96683),
++    (-76.39144,37.95874), (-76.36021,37.95233), (-76.34385,37.94734), (-76.266,37.91138), (-76.23673,37.88917),
++    (-76.24507,37.86192), (-76.25136,37.83307), (-76.26606,37.8174), (-76.27518,37.81266), (-76.28054,37.8126),
++    (-76.28259,37.81411), (-76.28199,37.81807), (-76.2849,37.82231), (-76.29353,37.82272), (-76.30748,37.81235),
++    (-76.31031,37.79485), (-76.30649,37.78865), (-76.31211,37.75052), (-76.30492,37.72991),
++    (-76.31286,37.72034), (-76.3028,37.70447), (-76.30007,37.69536), (-76.30254,37.689), (-76.31208,37.68465),
++    (-76.31516,37.68472), (-76.32022,37.68067), (-76.32481,37.67698), (-76.33989,37.65597),
++    (-76.33256,37.64582), (-76.30646,37.642), (-76.29253,37.6361), (-76.28796,37.63177), (-76.27945,37.61823),
++    (-76.28037,37.61371), (-76.30917,37.62189), (-76.36232,37.61037), (-76.38111,37.627), (-76.39005,37.63033),
++    (-76.39924,37.62864), (-76.44325,37.65235), (-76.47239,37.66577), (-76.48958,37.6662), (-76.4918,37.66361),
++    (-76.49756,37.64706), (-76.50152,37.64376), (-76.51019,37.64232), (-76.53655,37.66357), (-76.5377,37.66893),
++    (-76.5353,37.68752), (-76.53723,37.69889), (-76.54005,37.70443), (-76.56048,37.72783), (-76.57639,37.75749),
++    (-76.58429,37.76889), (-76.59383,37.77285), (-76.59594,37.77168), (-76.60202,37.77273),
++    (-76.61535,37.78076), (-76.64228,37.79232), (-76.65141,37.79624), (-76.6583,37.80682), (-76.6802,37.82565),
++    (-76.69275,37.82277), (-76.70161,37.82268), (-76.72216,37.83668), (-76.72718,37.84226),
++    (-76.73305,37.85201), (-76.73839,37.86537), (-76.74755,37.87586), (-76.76571,37.87927),
++    (-76.77539,37.87431), (-76.78462,37.86957), (-76.78283,37.86318), (-76.76633,37.84044), (-76.7512,37.82414),
++    (-76.73431,37.79866), (-76.72386,37.7885), (-76.7155,37.78587), (-76.68977,37.78519), (-76.68377,37.78139),
++    (-76.6819,37.77812), (-76.68334,37.77578), (-76.68336,37.77026), (-76.68337,37.76551), (-76.68092,37.75965),
++    (-76.677,37.7561), (-76.66389,37.75189), (-76.63996,37.75094), (-76.61971,37.7448), (-76.61737,37.74235),
++    (-76.62143,37.73797), (-76.61997,37.73127), (-76.60647,37.72482), (-76.59721,37.71727),
++    (-76.59594,37.71299), (-76.59807,37.70912), (-76.59787,37.70292), (-76.57959,37.67151),
++    (-76.58314,37.66199), (-76.57405,37.64678), (-76.54267,37.61686), (-76.53378,37.61253),
++    (-76.52719,37.61131), (-76.43547,37.61281), (-76.42025,37.59869), (-76.41078,37.58181),
++    (-76.38319,37.57306), (-76.35783,37.5737), (-76.33264,37.57004), (-76.30014,37.56173), (-76.29796,37.55764),
++    (-76.30276,37.5513), (-76.3306,37.53639), (-76.33999,37.53833), (-76.34899,37.53655), (-76.35508,37.52736),
++    (-76.36047,37.51924), (-76.35938,37.51343), (-76.35268,37.50491), (-76.32947,37.49492),
++    (-76.30695,37.49749), (-76.29774,37.50686), (-76.29645,37.51123), (-76.29846,37.51268),
++    (-76.29765,37.51542), (-76.2936,37.5165), (-76.28817,37.51412), (-76.28104,37.50782), (-76.26506,37.48136),
++    (-76.25241,37.44727), (-76.25045,37.42189), (-76.24662,37.40412), (-76.24528,37.38684),
++    (-76.24846,37.37514), (-76.25828,37.36202), (-76.26241,37.36079), (-76.26485,37.3574), (-76.27289,37.33517),
++    (-76.272,37.32219), (-76.27555,37.30996), (-76.28256,37.31911), (-76.29132,37.32415), (-76.30858,37.32937),
++    (-76.31205,37.33809), (-76.33748,37.36401), (-76.36675,37.3745), (-76.38711,37.38506), (-76.39144,37.39028),
++    (-76.39396,37.39594), (-76.39312,37.39807), (-76.40476,37.40021), (-76.41517,37.40213), (-76.41872,37.3978),
++    (-76.41818,37.38506), (-76.4225,37.38135), (-76.43752,37.37975), (-76.44533,37.36646), (-76.43497,37.35452),
++    (-76.40639,37.33292), (-76.38777,37.30767), (-76.3856,37.29411), (-76.38107,37.28534), (-76.36903,37.27931),
++    (-76.35256,37.27833), (-76.34949,37.27396), (-76.36229,37.27023), (-76.39279,37.26497),
++    (-76.41717,37.26395), (-76.42176,37.2552), (-76.42914,37.25331), (-76.47593,37.25054), (-76.48284,37.25483),
++    (-76.4933,37.24947), (-76.4989,37.24101), (-76.50364,37.23386), (-76.49401,37.22541), (-76.4718,37.21602),
++    (-76.39413,37.22515), (-76.38979,37.22298), (-76.3936,37.21405), (-76.39605,37.20109), (-76.38928,37.1935),
++    (-76.39125,37.17989), (-76.39788,37.16441), (-76.39966,37.16027), (-76.39476,37.15757),
++    (-76.38138,37.15571), (-76.37525,37.16084), (-76.35969,37.16858), (-76.34866,37.17065),
++    (-76.34323,37.16621), (-76.3449,37.16448), (-76.34405,37.16037), (-76.34013,37.15182), (-76.33402,37.14422),
++    (-76.33048,37.14173), (-76.32435,37.1429), (-76.31109,37.13849), (-76.29234,37.12662), (-76.28724,37.11745),
++    (-76.27446,37.09454), (-76.27126,37.08454), (-76.29286,37.03514), (-76.30035,37.00885),
++    (-76.30427,37.00138), (-76.31205,37.00037), (-76.31501,37.00168), (-76.31462,37.00933),
++    (-76.31807,37.01385), (-76.32953,37.01456), (-76.34011,37.01521), (-76.34067,37.01525),
++    (-76.34807,37.00675), (-76.35637,37.00295), (-76.37357,36.99835), (-76.38337,36.99335),
++    (-76.38771,36.98967), (-76.39637,36.98235), (-76.40857,36.96915), (-76.41177,36.96285),
++    (-76.41897,36.96405), (-76.42887,36.96995), (-76.45212,36.99816), (-76.45246,37.0046), (-76.44989,37.00487),
++    (-76.44823,37.00771), (-76.46447,37.02755), (-76.46949,37.03041), (-76.50761,37.05219),
++    (-76.50934,37.05317), (-76.51229,37.05486), (-76.51824,37.05535), (-76.52627,37.06295),
++    (-76.52797,37.06825), (-76.52657,37.07005), (-76.5262,37.07777), (-76.529,37.07939), (-76.53687,37.08394),
++    (-76.55507,37.07586), (-76.56422,37.07751), (-76.56793,37.08047), (-76.5795,37.09663), (-76.61825,37.11935),
++    (-76.62478,37.12709), (-76.62225,37.14215), (-76.61708,37.1445), (-76.60448,37.16003), (-76.60668,37.16667),
++    (-76.61097,37.16699), (-76.61102,37.1671), (-76.61252,37.17049), (-76.6136,37.17293), (-76.61422,37.17433),
++    (-76.61627,37.17896), (-76.6168,37.18126), (-76.61754,37.18441), (-76.61801,37.18643), (-76.61934,37.19215),
++    (-76.61996,37.19318), (-76.62111,37.1951), (-76.62329,37.19874), (-76.62987,37.20674), (-76.63961,37.21478),
++    (-76.64109,37.216), (-76.64987,37.22091), (-76.68917,37.22287), (-76.69337,37.22123), (-76.69894,37.21906),
++    (-76.73095,37.21381), (-76.73432,37.20421), (-76.74,37.19538), (-76.74304,37.19261), (-76.75047,37.1901),
++    (-76.75777,37.19166), (-76.77375,37.20606), (-76.78053,37.20934), (-76.79156,37.20756),
++    (-76.80102,37.20604), (-76.8032,37.20151), (-76.80251,37.19831), (-76.7969,37.1894), (-76.7569,37.16158),
++    (-76.74763,37.15055), (-76.73728,37.14616), (-76.73032,37.1454), (-76.71529,37.14804), (-76.69674,37.1744),
++    (-76.69293,37.18615), (-76.69192,37.19573), (-76.68561,37.19885), (-76.66989,37.18357),
++    (-76.66377,37.17388), (-76.66427,37.17103), (-76.66867,37.16677), (-76.67147,37.15874),
++    (-76.67159,37.14206), (-76.6696,37.14053), (-76.66654,37.13818), (-76.66583,37.1361), (-76.66564,37.13553),
++    (-76.66375,37.12998), (-76.65689,37.10984), (-76.6571,37.10762), (-76.6577,37.10116), (-76.65811,37.09679),
++    (-76.65939,37.09402), (-76.66555,37.08075), (-76.66653,37.07864), (-76.66722,37.07715),
++    (-76.66765,37.07623), (-76.6683,37.07266), (-76.66912,37.06813), (-76.66982,37.06426), (-76.66835,37.05506),
++    (-76.66256,37.04575), (-76.654,37.03917), (-76.64601,37.03623), (-76.61212,37.0356), (-76.58649,37.02874),
++    (-76.58448,37.02735), (-76.57939,37.02383), (-76.57924,37.02373), (-76.57816,37.02298),
++    (-76.57753,37.02255), (-76.57662,37.02137), (-76.5658,37.00749), (-76.56292,37.0038), (-76.55125,36.99895),
++    (-76.52485,36.98383), (-76.52297,36.98109), (-76.52414,36.97832), (-76.52101,36.97319),
++    (-76.51336,36.96806), (-76.50035,36.96521), (-76.48756,36.95237), (-76.48411,36.92892),
++    (-76.48241,36.91736), (-76.48213,36.90111), (-76.48337,36.89624), (-76.46991,36.8829), (-76.45469,36.88408),
++    (-76.45329,36.88703), (-76.45394,36.89274), (-76.44741,36.90322), (-76.4416,36.90612), (-76.43122,36.90453),
++    (-76.40751,36.89744), (-76.40691,36.89751), (-76.38757,36.89955), (-76.38587,36.92325),
++    (-76.35376,36.92275), (-76.34557,36.92453), (-76.34466,36.91931), (-76.33316,36.91729),
++    (-76.32886,36.91845), (-76.33076,36.93865), (-76.32737,36.95945), (-76.32276,36.95915),
++    (-76.31587,36.95535), (-76.29936,36.96555), (-76.29766,36.96815), (-76.28506,36.96875),
++    (-76.26796,36.96455), (-76.23496,36.94515), (-76.22166,36.93955), (-76.18996,36.93145),
++    (-76.17702,36.92929), (-76.13956,36.92305), (-76.09551,36.90882), (-76.08795,36.90865),
++    (-76.05815,36.91695), (-76.04305,36.92755), (-76.03345,36.93195), (-76.01375,36.93075),
++    (-76.00755,36.92905), (-75.99625,36.92205), (-75.99155,36.91085), (-75.97215,36.84227),
++    (-75.96545,36.81245), (-75.94955,36.76115), (-75.92175,36.69205), (-75.89095,36.63075),
++    (-75.87414,36.58385), (-75.86704,36.55075), (-75.87974,36.55075), (-75.88064,36.55075),
++    (-75.88595,36.55075), (-75.88654,36.55075), (-75.89195,36.55075), (-75.89324,36.55065),
++    (-75.89414,36.55075), (-75.90345,36.55065), (-75.90475,36.55065), (-75.90905,36.55065),
++    (-75.91145,36.55065), (-75.92205,36.55065), (-75.95285,36.55055), (-75.95345,36.55055),
++    (-75.95575,36.55055), (-75.95765,36.55055), (-76.02675,36.55055), (-76.03475,36.55065),
++    (-76.12236,36.55062), (-76.3132,36.55055), (-76.31321,36.55055), (-76.4915,36.55036), (-76.54139,36.55031),
++    (-76.54169,36.55031), (-76.7813,36.55066), (-76.80708,36.55061), (-76.91538,36.54386), (-76.916,36.54382),
++    (-76.91605,36.54382), (-77.1645,36.54633), (-77.24969,36.54474), (-77.29688,36.54475), (-77.76712,36.54475),
++    (-77.87528,36.54475), (-77.88236,36.54474), (-77.89977,36.54466), (-78.03894,36.54417), (-78.03942,36.5442),
++    (-78.0462,36.54417), (-78.13291,36.54381), (-78.13332,36.54385), (-78.24546,36.54441), (-78.24668,36.54434),
++    (-78.32391,36.54381), (-78.43633,36.54267), (-78.4412,36.54269), (-78.45697,36.54247), (-78.47079,36.54232),
++    (-78.47102,36.54231), (-78.52972,36.54098), (-78.53301,36.541), (-78.66332,36.54201), (-78.67005,36.54203),
++    (-78.73412,36.5419), (-78.75839,36.54185), (-78.76543,36.54173), (-78.7963,36.54171), (-78.91454,36.54197),
++    (-78.91542,36.54197), (-78.94201,36.54211), (-78.94225,36.54208), (-78.97058,36.54215),
++    (-78.97181,36.54212), (-79.12474,36.54157), (-79.12608,36.54153), (-79.13794,36.54174),
++    (-79.20869,36.54157), (-79.20948,36.54159), (-79.21864,36.54158), (-79.3427,36.54138), (-79.44569,36.54122),
++    (-79.44596,36.5412), (-79.47005,36.54102), (-79.51065,36.54074), (-79.51096,36.54074), (-79.66683,36.54177),
++    (-79.66731,36.54177), (-79.71486,36.54188), (-79.92024,36.54236), (-79.96698,36.54248), (-79.96751,36.5425),
++    (-80.02727,36.5425), (-80.05345,36.54262), (-80.16953,36.54319), (-80.17164,36.54322), (-80.22541,36.54375),
++    (-80.22826,36.54387), (-80.43161,36.55022), (-80.43263,36.5503), (-80.4401,36.55063), (-80.61216,36.55813),
++    (-80.68754,36.56141), (-80.7441,36.56169), (-80.83709,36.55915), (-80.83764,36.55912), (-80.83795,36.55913),
++    (-80.90173,36.56175), (-80.90184,36.56175), (-80.94434,36.56306), (-80.94599,36.5632), (-81.05884,36.56698),
++    (-81.06187,36.56702), (-81.30751,36.57502), (-81.35317,36.57472), (-81.35332,36.57472),
++    (-81.52103,36.58052), (-81.60697,36.58709), (-81.67754,36.58812), (-81.6469,36.61192), (-81.82674,36.61422),
++    (-81.92264,36.61621), (-81.93414,36.59421), (-82.14607,36.59471), (-82.14857,36.59472),
++    (-82.15073,36.59467), (-82.17398,36.59461), (-82.17725,36.59477), (-82.18074,36.59493),
++    (-82.18849,36.59518), (-82.2105,36.59577), (-82.21101,36.59586), (-82.22171,36.59581), (-82.22344,36.59572),
++    (-82.22572,36.59574), (-82.22665,36.59574), (-82.24327,36.5957), (-82.29381,36.59557), (-82.55429,36.59488),
++    (-82.55977,36.5948), (-82.56107,36.5948), (-82.60918,36.5941), (-82.67988,36.5937), (-82.69578,36.5937),
++    (-82.83043,36.59376), (-82.98509,36.59383), (-83.02725,36.59385), (-83.02836,36.59389),
++    (-83.24893,36.59383), (-83.2499,36.5939), (-83.2503,36.59394), (-83.2763,36.59819), (-83.47211,36.59728),
++    (-83.67013,36.60076), (-83.67014,36.6008), (-83.67541,36.60081), (-83.64951,36.61668), (-83.52721,36.66598),
++    (-83.49801,36.67048), (-83.46101,36.66492), (-83.46081,36.66488), (-83.35461,36.69615), (-83.35361,36.6967),
++    (-83.3428,36.70129), (-83.1997,36.73749), (-83.1674,36.73919), (-83.13639,36.74309), (-83.12783,36.75083),
++    (-83.12573,36.76128), (-83.12565,36.76141), (-83.13125,36.76711), (-83.13169,36.78149),
++    (-83.09979,36.82489), (-83.07259,36.85459), (-82.97339,36.8591), (-82.91182,36.87424), (-82.91169,36.87425),
++    (-82.88562,36.90042), (-82.87378,36.9123), (-82.87214,36.91346), (-82.86347,36.92231), (-82.86194,36.92424),
++    (-82.85846,36.93272), (-82.85878,36.93306), (-82.86054,36.93744), (-82.86168,36.93932),
++    (-82.86128,36.94485), (-82.86063,36.94584), (-82.8561,36.95247), (-82.85571,36.95381), (-82.85844,36.95404),
++    (-82.86053,36.95602), (-82.86287,36.95777), (-82.86421,36.95798), (-82.8654,36.95808), (-82.86736,36.96318),
++    (-82.87023,36.9655), (-82.87027,36.96599), (-82.86918,36.97418), (-82.86918,36.97418), (-82.86845,36.97648),
++    (-82.86754,36.97752), (-82.86669,36.97805), (-82.86602,36.97827), (-82.86491,36.97901),
++    (-82.86293,36.97998), (-82.85261,36.98496), (-82.8514,36.9845), (-82.84005,36.98711), (-82.83855,36.98703),
++    (-82.83601,36.98884), (-82.83384,36.99197), (-82.8308,36.99345), (-82.82913,36.99754), (-82.83059,37.00095),
++    (-82.81801,37.00616), (-82.81575,37.0072), (-82.80053,37.00794), (-82.79089,37.00676), (-82.79046,37.00726),
++    (-82.78909,37.008), (-82.7889,37.00816), (-82.77737,37.01528), (-82.77179,37.01572), (-82.72247,37.0451),
++    (-82.7206,37.08183), (-82.72194,37.10569), (-82.62488,37.16293), (-82.56538,37.19609), (-82.56533,37.19612),
++    (-82.55355,37.20087), (-82.51083,37.21809), (-82.35095,37.26708), (-82.31079,37.29739), (-82.30587,37.3011),
++    (-82.29191,37.31164), (-81.9683,37.5378), (-81.92787,37.51212), (-81.94264,37.50884), (-81.99292,37.48297),
++    (-81.99658,37.47671), (-81.99227,37.46092), (-81.98701,37.45488), (-81.9688,37.4515), (-81.94937,37.44569),
++    (-81.93562,37.4384), (-81.92749,37.41325), (-81.9339,37.37275), (-81.93019,37.36673), (-81.92991,37.36659),
++    (-81.92659,37.35894), (-81.92564,37.35732), (-81.92157,37.35642), (-81.92071,37.35542),
++    (-81.91149,37.34884), (-81.91088,37.34873), (-81.90789,37.34378), (-81.90732,37.34312),
++    (-81.90637,37.34276), (-81.90595,37.34278), (-81.9038,37.34305), (-81.90299,37.34234), (-81.8995,37.3411),
++    (-81.89946,37.34028), (-81.896,37.33197), (-81.89549,37.33202), (-81.8948,37.33201), (-81.89477,37.33138),
++    (-81.89377,37.33011), (-81.89288,37.33013), (-81.88772,37.33116), (-81.88695,37.33073),
++    (-81.88508,37.33067), (-81.88089,37.33115), (-81.8796,37.33207), (-81.87871,37.33175), (-81.87834,37.32884),
++    (-81.87321,37.32507), (-81.86522,37.30884), (-81.86476,37.3084), (-81.85398,37.30042), (-81.85447,37.29994),
++    (-81.85349,37.29476), (-81.85406,37.29135), (-81.84317,37.28559), (-81.84231,37.28556),
++    (-81.81056,37.28298), (-81.80918,37.283), (-81.79364,37.28219), (-81.79342,37.28167), (-81.77475,37.27485),
++    (-81.77468,37.27481), (-81.76784,37.27422), (-81.7652,37.2751), (-81.76384,37.27522), (-81.76278,37.27539),
++    (-81.76175,37.27571), (-81.76022,37.27525), (-81.75763,37.274), (-81.75773,37.27193), (-81.75771,37.27112),
++    (-81.75753,37.27001), (-81.75501,37.26772), (-81.75291,37.26661), (-81.75212,37.26557),
++    (-81.75129,37.26513), (-81.74766,37.26433), (-81.7435,37.2476), (-81.74342,37.24586), (-81.74429,37.24418),
++    (-81.73838,37.24092), (-81.73332,37.23813), (-81.72819,37.23982), (-81.68354,37.21145), (-81.6786,37.20247),
++    (-81.56063,37.20666), (-81.55835,37.20815), (-81.55732,37.2077), (-81.50732,37.2338), (-81.50488,37.2477),
++    (-81.50417,37.25012), (-81.40973,37.28484), (-81.4092,37.28607), (-81.38813,37.3199), (-81.38673,37.32047),
++    (-81.38581,37.32008), (-81.38491,37.31883), (-81.38413,37.3186), (-81.38016,37.31784), (-81.37735,37.31845),
++    (-81.37131,37.32411), (-81.3676,37.32757), (-81.36938,37.33183), (-81.36809,37.33242), (-81.36705,37.3345),
++    (-81.36632,37.33593), (-81.36216,37.33769), (-81.3201,37.29932), (-81.2251,37.23487), (-81.20477,37.24301),
++    (-81.16703,37.26288), (-81.1126,37.2785), (-81.08401,37.2844), (-81.03465,37.29075), (-80.98132,37.29346),
++    (-80.98004,37.29312), (-80.97389,37.29144), (-80.96656,37.29216), (-80.9479,37.29587), (-80.91926,37.30616),
++    (-80.90054,37.315), (-80.84945,37.34691), (-80.87259,37.37235), (-80.86276,37.41183), (-80.85956,37.42956),
++    (-80.85956,37.42957), (-80.85847,37.4283), (-80.85836,37.42817), (-80.81164,37.40751), (-80.79887,37.39581),
++    (-80.77677,37.38413), (-80.77665,37.38368), (-80.77008,37.37236), (-80.62266,37.43331),
++    (-80.51139,37.48167), (-80.49487,37.43507), (-80.4756,37.42295), (-80.46482,37.42614), (-80.44303,37.43813),
++    (-80.42566,37.44988), (-80.32063,37.49888), (-80.31481,37.50094), (-80.33031,37.53624),
++    (-80.31239,37.54624), (-80.28877,37.58196), (-80.24027,37.60696), (-80.22339,37.62318),
++    (-80.22098,37.62777), (-80.23929,37.63767), (-80.25443,37.64235), (-80.25447,37.64233),
++    (-80.26328,37.64508), (-80.26329,37.6451), (-80.26483,37.64553), (-80.26487,37.64551), (-80.26723,37.64601),
++    (-80.26745,37.64611), (-80.27035,37.64893), (-80.27032,37.64898), (-80.29226,37.68373),
++    (-80.29234,37.68398), (-80.29614,37.69178), (-80.28711,37.6964), (-80.26394,37.71914), (-80.25934,37.73121),
++    (-80.26031,37.73352), (-80.26277,37.73834), (-80.25741,37.75608), (-80.23155,37.79259),
++    (-80.22709,37.79889), (-80.1622,37.87512), (-80.14896,37.88606), (-80.14732,37.88594), (-80.14613,37.88445),
++    (-80.13046,37.89319), (-80.05528,37.9517), (-80.00251,37.99277), (-79.97843,38.02908), (-79.95984,38.0637),
++    (-79.93391,38.09917), (-79.93103,38.1014), (-79.93839,38.13056), (-79.93375,38.13551), (-79.92875,38.14444),
++    (-79.92868,38.14493), (-79.92551,38.15024), (-79.92525,38.15046), (-79.92103,38.17995), (-79.9212,38.18038),
++    (-79.91706,38.18374), (-79.91617,38.18439), (-79.89235,38.2024), (-79.892,38.20338), (-79.79457,38.26486),
++    (-79.79013,38.26765), (-79.78894,38.2687), (-79.81011,38.30504), (-79.80871,38.30943), (-79.73166,38.37414),
++    (-79.69138,38.43956), (-79.68954,38.44251), (-79.68896,38.44954), (-79.6882,38.45048), (-79.69901,38.47515),
++    (-79.69557,38.47784), (-79.66913,38.51088), (-79.66913,38.51098), (-79.64907,38.59152),
++    (-79.59795,38.57277), (-79.55547,38.56022), (-79.53687,38.55092), (-79.52147,38.53392),
++    (-79.47664,38.45723), (-79.31228,38.41188), (-79.29776,38.41644), (-79.29571,38.41813),
++    (-79.29181,38.41963), (-79.29053,38.42076), (-79.28026,38.42547), (-79.28266,38.43102),
++    (-79.26741,38.43832), (-79.26533,38.44177), (-79.26338,38.44376), (-79.26291,38.44459),
++    (-79.24202,38.46433), (-79.24006,38.46984), (-79.23441,38.47301), (-79.23162,38.47404),
++    (-79.22584,38.47945), (-79.21003,38.49423), (-79.21001,38.49428), (-79.2097,38.49557), (-79.20787,38.50012),
++    (-79.20788,38.50043), (-79.17488,38.56631), (-79.17451,38.56653), (-79.14697,38.62564),
++    (-79.14674,38.62582), (-79.13701,38.64066), (-79.13637,38.6424), (-79.13555,38.64372), (-79.13547,38.64406),
++    (-79.09227,38.69921), (-79.09256,38.70015), (-79.05725,38.76141), (-79.05535,38.78221),
++    (-78.99975,38.84616), (-78.994,38.8501), (-78.86928,38.76299)
++  ),
++  (
++    (-75.24227,38.02721), (-75.29687,37.95904), (-75.31933,37.92248), (-75.3343,37.89348), (-75.34934,37.87314),
++    (-75.35904,37.86414), (-75.36683,37.85945), (-75.37464,37.85945), (-75.39201,37.86774),
++    (-75.40054,37.87486), (-75.42896,37.8753), (-75.43787,37.87232), (-75.45268,37.86351), (-75.46795,37.85133),
++    (-75.48749,37.83214), (-75.51492,37.79915), (-75.54808,37.74238), (-75.55687,37.72441),
++    (-75.57246,37.70157), (-75.58133,37.68359), (-75.58614,37.66065), (-75.60322,37.62024),
++    (-75.61081,37.60591), (-75.61224,37.5856), (-75.60812,37.57802), (-75.59572,37.57666), (-75.59404,37.5697),
++    (-75.60672,37.55717), (-75.63337,37.52214), (-75.66618,37.47212), (-75.6655,37.46732), (-75.66431,37.4589),
++    (-75.66179,37.45503), (-75.66596,37.43921), (-75.67265,37.42992), (-75.69791,37.4053), (-75.72074,37.37313),
++    (-75.72733,37.36035), (-75.72563,37.35842), (-75.72669,37.35013), (-75.73583,37.33543), (-75.7654,37.3056),
++    (-75.77882,37.29718), (-75.78077,37.29722), (-75.78463,37.30098), (-75.79191,37.30059),
++    (-75.79845,37.29628), (-75.79083,37.27621), (-75.79934,37.25178), (-75.79588,37.23692),
++    (-75.79039,37.23123), (-75.78993,37.22813), (-75.7909,37.22507), (-75.80445,37.20801), (-75.80047,37.20103),
++    (-75.80075,37.1973), (-75.83034,37.1706), (-75.87767,37.1356), (-75.88637,37.12609), (-75.8973,37.11804),
++    (-75.90673,37.11419), (-75.91231,37.11515), (-75.91322,37.11985), (-75.92552,37.1336), (-75.94254,37.12514),
++    (-75.94587,37.12051), (-75.9626,37.11753), (-75.97043,37.11861), (-75.97,37.12886), (-75.97808,37.15734),
++    (-75.99865,37.18874), (-76.00609,37.19481), (-76.01307,37.20537), (-76.01378,37.21926),
++    (-76.01054,37.23158), (-76.01403,37.23538), (-76.02575,37.25741), (-76.02366,37.26897),
++    (-76.01551,37.28087), (-76.02348,37.28907), (-76.01865,37.31782), (-76.01425,37.33194),
++    (-75.99778,37.35174), (-75.98712,37.36855), (-75.97997,37.40461), (-75.9831,37.4158), (-75.98162,37.43412),
++    (-75.97649,37.44488), (-75.96088,37.46756), (-75.9635,37.47535), (-75.96333,37.48179), (-75.95897,37.50013),
++    (-75.94997,37.52188), (-75.94032,37.53458), (-75.93766,37.54965), (-75.9373,37.55173), (-75.94115,37.55844),
++    (-75.94118,37.56384), (-75.92476,37.60021), (-75.90959,37.62267), (-75.87706,37.66064),
++    (-75.86848,37.66822), (-75.86952,37.67436), (-75.86835,37.68761), (-75.85926,37.70311),
++    (-75.84558,37.70799), (-75.83768,37.71299), (-75.83077,37.72549), (-75.83144,37.73169),
++    (-75.82792,37.73799), (-75.82481,37.74167), (-75.81216,37.7495), (-75.80304,37.76246), (-75.81212,37.77659),
++    (-75.81812,37.7917), (-75.7934,37.80449), (-75.7846,37.80683), (-75.77061,37.8046), (-75.7431,37.80666),
++    (-75.73588,37.81656), (-75.72322,37.82012), (-75.71659,37.8267), (-75.71449,37.83778), (-75.70911,37.8477),
++    (-75.70291,37.84966), (-75.68984,37.86182), (-75.68529,37.87334), (-75.68758,37.88634),
++    (-75.70963,37.90062), (-75.72049,37.90193), (-75.7245,37.90018), (-75.7267,37.8973), (-75.75305,37.89661),
++    (-75.7588,37.89762), (-75.75983,37.89933), (-75.75769,37.90391), (-75.71206,37.93608), (-75.70432,37.92901),
++    (-75.69394,37.93036), (-75.66971,37.9508), (-75.66096,37.95917), (-75.64651,37.973), (-75.64629,37.97321),
++    (-75.64525,37.9742), (-75.6451,37.97435), (-75.64467,37.97476), (-75.64459,37.97483), (-75.64454,37.97488),
++    (-75.63979,37.97943), (-75.6355,37.98353), (-75.63022,37.98858), (-75.62613,37.9925), (-75.62434,37.99421),
++    (-75.43596,38.01028), (-75.42881,38.01085), (-75.39884,38.01328), (-75.37785,38.01514),
++    (-75.26378,38.02529), (-75.26209,38.02544), (-75.26063,38.02557), (-75.25608,38.02598),
++    (-75.25036,38.02649), (-75.2423,38.02721), (-75.24227,38.02721)
++  ),
++  (
++    (-75.99474,37.9535), (-75.9939,37.95349), (-76.00313,37.948), (-76.01759,37.93516), (-76.03249,37.91501),
++    (-76.0358,37.92901), (-76.04653,37.95359), (-76.04556,37.95367), (-76.04169,37.954), (-76.0414,37.95401),
++    (-76.03803,37.9539), (-76.03012,37.95365), (-76.02946,37.95378), (-76.0294,37.95378), (-76.02232,37.95388),
++    (-76.02171,37.95389), (-76.02093,37.95388), (-76.0208,37.95388), (-76.01769,37.95383), (-76.00589,37.95366),
++    (-75.99474,37.9535)
++  ),
++  (
++    (-75.97361,37.83582), (-75.97171,37.83093), (-75.9773,37.82582), (-75.98216,37.80623), (-75.9873,37.80492),
++    (-75.9983,37.81263), (-76.00112,37.83495), (-75.99966,37.8482), (-75.99686,37.85042), (-75.99256,37.84889),
++    (-75.98802,37.84108), (-75.9821,37.83725), (-75.97361,37.83582)
++  ),
++)
+diff --git a/openpilot/sunnypilot/selfdrive/reckless_watch/watcher.py b/openpilot/sunnypilot/selfdrive/reckless_watch/watcher.py
+new file mode 100644
+index 0000000..b0bc512
+--- /dev/null
++++ b/openpilot/sunnypilot/selfdrive/reckless_watch/watcher.py
+@@ -0,0 +1,103 @@
++"""
++Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
++
++This file is part of sunnypilot and is licensed under the MIT License.
++See the LICENSE.md file in the root directory for more details.
++"""
++
++from dataclasses import dataclass
++from enum import IntEnum
++
++from openpilot.sunnypilot.selfdrive.reckless_watch.geofence import StateTracker
++
++MS_TO_MPH = 2.23694
++
++# Virginia Code 46.2-862: reckless driving is (i) 20 mph or more over the applicable maximum speed
++# limit, or (ii) in excess of 85 mph regardless of the limit. Class 1 misdemeanor, up to 12 months.
++# The absolute figure was 80 before HB 1442 raised it on 2020-07-01 -- do not "correct" it back.
++STATUTE_ABSOLUTE_MPH = 85
++STATUTE_OVER_LIMIT_MPH = 20
++
++# Default warn point, a few mph under the statute so there is room to react. User-configurable.
++DEFAULT_THRESHOLD_MPH = 82
++
++# Drop this far below the threshold before the audible alert can fire again. Without it, sitting
++# at the threshold retriggers constantly, which is exactly the nagging this feature must avoid.
++REARM_MARGIN_MPH = 3.0
++
++
++class Reason(IntEnum):
++  none = 0
++  absolute = 1      # over the absolute threshold
++  overLimit = 2     # 20+ over a known posted limit
++
++
++@dataclass
++class WatchState:
++  in_virginia: bool = False
++  over: bool = False
++  reason: Reason = Reason.none
++  threshold_mph: float = 0.0        # what was actually breached, for the alert text
++  entered_virginia: bool = False    # one-shot edge
++  started_speeding: bool = False    # one-shot edge
++
++
++class RecklessWatch:
++  """Decides when to warn about Virginia reckless-driving speed thresholds.
++
++  Deliberately free of cereal and params so it can be tested as pure logic. The caller supplies
++  position, speed and the resolved speed limit; this returns edges and a sticky over/under state.
++  """
++
++  def __init__(self, threshold_mph: float = DEFAULT_THRESHOLD_MPH):
++    self.threshold_mph = threshold_mph
++    self.state_tracker = StateTracker()
++    self._alerted = False
++    self._state = WatchState()
++
++  def _limits(self, speed_limit_ms: float) -> list[tuple[float, Reason]]:
++    """Active thresholds in mph, lowest first.
++
++    The 20-over rule only participates when a limit is actually known. OSM coverage is patchy and
++    a guessed limit would produce false alarms; the absolute rule still applies either way.
++    """
++    out: list[tuple[float, Reason]] = [(self.threshold_mph, Reason.absolute)]
++    if speed_limit_ms > 0:
++      limit_mph = speed_limit_ms * MS_TO_MPH
++      out.append((limit_mph + STATUTE_OVER_LIMIT_MPH, Reason.overLimit))
++    out.sort()
++    return out
++
++  def update(self, lat: float, lon: float, horizontal_accuracy: float,
++             v_ego_ms: float, speed_limit_ms: float = 0.0) -> WatchState:
++    entered = self.state_tracker.update(lat, lon, horizontal_accuracy)
++    inside = bool(self.state_tracker.inside)
++
++    st = WatchState(in_virginia=inside, entered_virginia=entered)
++
++    if not inside:
++      # leaving the state clears everything, including the re-arm latch
++      self._alerted = False
++      self._state = st
++      return st
++
++    speed_mph = v_ego_ms * MS_TO_MPH
++    breached = [(t, r) for t, r in self._limits(speed_limit_ms) if speed_mph > t]
++
++    if breached:
++      threshold, reason = breached[0]
++      st.over = True
++      st.reason = reason
++      st.threshold_mph = threshold
++      if not self._alerted:
++        st.started_speeding = True
++        self._alerted = True
++    else:
++      # Re-arm only once genuinely back under, not the instant the number dips. Hovering at the
++      # threshold must not produce a stream of alerts.
++      lowest = self._limits(speed_limit_ms)[0][0]
++      if speed_mph < lowest - REARM_MARGIN_MPH:
++        self._alerted = False
++
++    self._state = st
++    return st
+diff --git a/openpilot/sunnypilot/selfdrive/selfdrived/events.py b/openpilot/sunnypilot/selfdrive/selfdrived/events.py
+index 3c010cc..906c289 100644
+--- a/openpilot/sunnypilot/selfdrive/selfdrived/events.py
++++ b/openpilot/sunnypilot/selfdrive/selfdrived/events.py
+@@ -90,6 +90,24 @@ class EventsSP(EventsBase):
+ 
+ EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
+   # sunnypilot
++  EventNameSP.enteredVirginia: {
++    ET.PERMANENT: Alert(
++      "Entering Virginia",
++      "Reckless driving above 85 mph or 20 over the limit",
++      AlertStatus.normal, AlertSize.mid,
++      Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 6.),
++  },
++
++  # Fires once on the rising edge only. The pulsing border is what keeps this visible afterwards;
++  # repeating the sound was explicitly not wanted.
++  EventNameSP.recklessSpeed: {
++    ET.PERMANENT: Alert(
++      "Reckless driving speed",
++      "Virginia: this is a criminal offence, not a ticket",
++      AlertStatus.critical, AlertSize.mid,
++      Priority.HIGH, VisualAlert.none, AudibleAlert.warningSoft, 4.),
++  },
++
+   EventNameSP.lkasEnable: {
+     ET.ENABLE: EngagementAlert(AudibleAlert.engage),
+   },

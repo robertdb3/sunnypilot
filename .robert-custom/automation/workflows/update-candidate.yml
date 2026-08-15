@@ -1,0 +1,101 @@
+name: Build staging candidate
+
+on:
+  schedule:
+    - cron: "17 10 * * *"
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - ".robert-custom/**"
+      - ".github/workflows/update-candidate.yml"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: custompilot-staging-candidate
+  cancel-in-progress: false
+
+jobs:
+  candidate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out maintenance branch
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Install test dependencies
+        run: python3 -m pip install --disable-pip-version-check numpy pycapnp raylib
+
+      - name: Fetch installable sunnypilot staging
+        run: |
+          git remote add upstream https://github.com/sunnypilot/sunnypilot.git 2>/dev/null || true
+          git fetch --no-tags upstream staging
+          git fetch --no-tags origin custompilot-staging custompilot-stable 2>/dev/null || true
+
+      - name: Preserve maintenance assets
+        run: cp -R .robert-custom "$RUNNER_TEMP/robert-custom"
+
+      - name: Build and validate candidate
+        run: |
+          git checkout -B custompilot-staging upstream/staging
+          bash "$RUNNER_TEMP/robert-custom/automation/apply_candidate.sh" "$GITHUB_WORKSPACE" "$RUNNER_TEMP/robert-custom"
+          bash "$RUNNER_TEMP/robert-custom/automation/validate_candidate.sh" "$GITHUB_WORKSPACE" "$RUNNER_TEMP/robert-custom"
+
+      - name: Detect unchanged candidate
+        id: candidate_state
+        run: |
+          unchanged=false
+          if git show origin/custompilot-staging:CUSTOM_FORK_MANIFEST.json > "$RUNNER_TEMP/previous-manifest.json" 2>/dev/null; then
+            if python3 - "$RUNNER_TEMP/previous-manifest.json" CUSTOM_FORK_MANIFEST.json <<'PY'
+          import json
+          import sys
+          old = json.load(open(sys.argv[1]))
+          new = json.load(open(sys.argv[2]))
+          keys = ("upstream", "customization_sha256")
+          raise SystemExit(0 if all(old.get(k) == new.get(k) for k in keys) else 1)
+          PY
+            then
+              unchanged=true
+            fi
+          fi
+          echo "unchanged=$unchanged" >> "$GITHUB_OUTPUT"
+
+      - name: Commit candidate
+        if: steps.candidate_state.outputs.unchanged != 'true'
+        run: |
+          git config user.name "robertdb3 update bot"
+          git config user.email "robertdb3@users.noreply.github.com"
+          git diff --name-only -z | xargs -0 -r git add --
+          git ls-files --others --exclude-standard -z | xargs -0 -r git add --
+          upstream_sha=$(python3 -c 'import json; print(json.load(open("CUSTOM_FORK_MANIFEST.json"))["upstream"]["commit"])')
+          git commit -m "Build Outback candidate from sunnypilot ${upstream_sha:0:12}" \
+            -m "Assisted-by: Claude" \
+            -m "Assisted-by: OpenAI Codex"
+
+      - name: Publish candidate branch
+        if: steps.candidate_state.outputs.unchanged != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          old_sha=$(git rev-parse --verify origin/custompilot-staging 2>/dev/null || true)
+          if [ -n "$old_sha" ]; then
+            git push --force-with-lease=refs/heads/custompilot-staging:"$old_sha" origin HEAD:custompilot-staging
+          else
+            git push origin HEAD:custompilot-staging
+          fi
+
+          if git rev-parse --verify origin/custompilot-stable >/dev/null 2>&1; then
+            if ! gh pr view custompilot-staging --json number >/dev/null 2>&1; then
+              upstream_sha=$(python3 -c 'import json; print(json.load(open("CUSTOM_FORK_MANIFEST.json"))["upstream"]["commit"])')
+              gh pr create --base custompilot-stable --head custompilot-staging \
+                --draft \
+                --title "Review sunnypilot staging ${upstream_sha:0:12}" \
+                --body "Automated candidate only. Review the upstream and custom diffs, require all checks to pass, then test deliberately before manual promotion to custompilot-stable."
+            fi
+          fi

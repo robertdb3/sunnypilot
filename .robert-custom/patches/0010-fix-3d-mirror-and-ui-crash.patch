@@ -1,0 +1,200 @@
+diff --git a/openpilot/selfdrive/ui/sunnypilot/onroad/developer_ui/elements.py b/openpilot/selfdrive/ui/sunnypilot/onroad/developer_ui/elements.py
+index f89edef..af62c31 100644
+--- a/openpilot/selfdrive/ui/sunnypilot/onroad/developer_ui/elements.py
++++ b/openpilot/selfdrive/ui/sunnypilot/onroad/developer_ui/elements.py
+@@ -12,6 +12,22 @@ from openpilot.selfdrive.ui.ui_state import ui_state
+ from openpilot.system.ui.lib.text_measure import measure_text_cached
+ 
+ 
++def _roll(sm) -> float:
++  """Read roll across the liveParameters -> vehicleParameters schema transition."""
++  for service in ("vehicleParameters", "liveParameters"):
++    if service in sm.valid and sm.valid[service]:
++      return float(sm[service].roll)
++  return 0.0
++
++
++def _torque_params(sm):
++  """Read torque learning across the liveTorqueParameters rename."""
++  for service in ("lateralTorqueParameters", "liveTorqueParameters"):
++    if service in sm.valid:
++      return sm[service], bool(sm.valid[service])
++  raise KeyError("no torque-parameter service subscribed")
++
++
+ @dataclass
+ class UiElement:
+   value: str
+@@ -160,7 +176,7 @@ class ActualLateralAccelElement(LateralControlElement):
+     controls_state = sm['controlsState']
+     curvature = controls_state.curvature
+     v_ego = sm['carState'].vEgo
+-    roll = sm['vehicleParameters'].roll if sm.valid['vehicleParameters'] else 0.0
++    roll = _roll(sm)
+     lat_active = sm['carControl'].latActive
+     steer_override = sm['carState'].steeringPressed
+ 
+@@ -179,7 +195,7 @@ class DesiredLateralAccelElement(LateralControlElement):
+     controls_state = sm['controlsState']
+     desired_curvature = controls_state.desiredCurvature
+     v_ego = sm['carState'].vEgo
+-    roll = sm['vehicleParameters'].roll if sm.valid['vehicleParameters'] else 0.0
++    roll = _roll(sm)
+     lat_active = sm['carControl'].latActive
+     steer_override = sm['carState'].steeringPressed
+ 
+@@ -250,9 +266,11 @@ class FrictionCoefficientElement:
+     if ui_state.enforce_torque_control and ui_state.custom_torque_params and ui_state.torque_override_enabled:
+       return UiElement(f"{ui_state.torque_override_friction:.3f}", "FRIC.", self.unit, rl.WHITE)
+ 
+-    ltp = sm['lateralTorqueParameters']
++    ltp, service_valid = _torque_params(sm)
+     value = f"{ltp.frictionCoefficientFiltered:.3f}"
+-    color = rl.Color(0, 255, 0, 255) if ltp.liveValid else rl.WHITE
++    # The older lateralTorqueParameters schema has valid instead of liveValid.
++    learned_valid = getattr(ltp, "liveValid", getattr(ltp, "valid", service_valid))
++    color = rl.Color(0, 255, 0, 255) if learned_valid else rl.WHITE
+     return UiElement(value, "FRIC.", self.unit, color)
+ 
+ 
+@@ -264,9 +282,10 @@ class LatAccelFactorElement:
+     if ui_state.enforce_torque_control and ui_state.custom_torque_params and ui_state.torque_override_enabled:
+       return UiElement(f"{ui_state.torque_override_lat_accel_factor:.3f}", "L.A.F.", self.unit, rl.WHITE)
+ 
+-    ltp = sm['lateralTorqueParameters']
++    ltp, service_valid = _torque_params(sm)
+     value = f"{ltp.latAccelFactorFiltered:.3f}"
+-    color = rl.Color(0, 255, 0, 255) if ltp.liveValid else rl.WHITE
++    learned_valid = getattr(ltp, "liveValid", getattr(ltp, "valid", service_valid))
++    color = rl.Color(0, 255, 0, 255) if learned_valid else rl.WHITE
+     return UiElement(value, "L.A.F.", self.unit, color)
+ 
+ 
+diff --git a/openpilot/selfdrive/ui/sunnypilot/onroad/scene3d/geometry.py b/openpilot/selfdrive/ui/sunnypilot/onroad/scene3d/geometry.py
+index f05c5e9..a2e7d3f 100644
+--- a/openpilot/selfdrive/ui/sunnypilot/onroad/scene3d/geometry.py
++++ b/openpilot/selfdrive/ui/sunnypilot/onroad/scene3d/geometry.py
+@@ -7,7 +7,7 @@ See the LICENSE.md file in the root directory for more details.
+ 
+ import numpy as np
+ 
+-# openpilot's car frame is x forward, y LEFT, z UP.
++# openpilot's calibrated/model frame is x forward, y RIGHT, z DOWN.
+ # raylib's world is x right, y up, right-handed, so forward is -z.
+ # Getting this backwards produces a scene that looks plausible but is mirrored, so it is done in
+ # exactly one place and unit tested.
+@@ -16,8 +16,8 @@ import numpy as np
+ def car_to_world(pts: np.ndarray) -> np.ndarray:
+   """(N,3) points in car frame -> (N,3) in raylib world space."""
+   out = np.empty_like(pts, dtype=np.float32)
+-  out[:, 0] = -pts[:, 1]  # right   = -left
+-  out[:, 1] = pts[:, 2]   # up      =  up
++  out[:, 0] = pts[:, 1]   # right   =  right
++  out[:, 1] = -pts[:, 2]  # up      = -down
+   out[:, 2] = -pts[:, 0]  # -into screen = forward
+   return out
+ 
+@@ -63,7 +63,8 @@ def ribbon(x: np.ndarray, y: np.ndarray, z: np.ndarray, width: float, z_lift: fl
+   if len(x) < 2:
+     return np.zeros((0, 3, 3), dtype=np.float32)
+ 
+-  pts = np.stack([x, y, z + z_lift], axis=1).astype(np.float32)
++  # Model z points down, so a positive visual lift subtracts from z.
++  pts = np.stack([x, y, z - z_lift], axis=1).astype(np.float32)
+ 
+   # perpendicular in the ground plane, from forward differences
+   d = np.gradient(pts[:, :2], axis=0)
+@@ -99,7 +100,7 @@ def ribbon_varying(x: np.ndarray, y: np.ndarray, z: np.ndarray, widths: np.ndarr
+   if len(x) < 2:
+     return np.zeros((0, 3, 3), dtype=np.float32)
+ 
+-  pts = np.stack([x, y, z + z_lift], axis=1).astype(np.float32)
++  pts = np.stack([x, y, z - z_lift], axis=1).astype(np.float32)
+   d = np.gradient(pts[:, :2], axis=0)
+   norm = np.linalg.norm(d, axis=1, keepdims=True)
+   norm[norm < 1e-6] = 1e-6
+diff --git a/openpilot/selfdrive/ui/sunnypilot/onroad/scene3d/renderer.py b/openpilot/selfdrive/ui/sunnypilot/onroad/scene3d/renderer.py
+index e9086ac..889e479 100644
+--- a/openpilot/selfdrive/ui/sunnypilot/onroad/scene3d/renderer.py
++++ b/openpilot/selfdrive/ui/sunnypilot/onroad/scene3d/renderer.py
+@@ -5,6 +5,8 @@ This file is part of sunnypilot and is licensed under the MIT License.
+ See the LICENSE.md file in the root directory for more details.
+ """
+ 
++from dataclasses import replace
++
+ import numpy as np
+ import pyray as rl
+ 
+@@ -37,7 +39,10 @@ class Scene3DRenderer:
+ 
+   def update(self) -> None:
+     sm = ui_state.sm
+-    state = SceneState(light_sensor=ui_state.light_sensor, is_metric=ui_state.is_metric)
++    # modelV2 arrives at 20 Hz while the UI renders at 60 Hz. Preserve the immutable array
++    # references between message updates instead of converting every model field to numpy three
++    # times per model frame.
++    state = replace(self._state, light_sensor=ui_state.light_sensor, is_metric=ui_state.is_metric)
+ 
+     if sm.updated.get("carState"):
+       cs = sm["carState"]
+@@ -49,7 +54,8 @@ class Scene3DRenderer:
+       state.right_blindspot = self._state.right_blindspot
+       state.v_ego = self._state.v_ego
+ 
+-    if sm.valid.get("modelV2") and sm.recv_frame["modelV2"] >= ui_state.started_frame:
++    model_valid = sm.valid.get("modelV2") and sm.recv_frame["modelV2"] >= ui_state.started_frame
++    if model_valid and sm.updated.get("modelV2"):
+       model = sm["modelV2"]
+       state.lane_lines = [_xyz(line) for line in model.laneLines]
+       state.lane_line_probs = [float(p) for p in model.laneLineProbs]
+@@ -63,7 +69,7 @@ class Scene3DRenderer:
+       # radar, and cars like this Subaru have neither, so radarState would render nothing.
+       state.leads = geo.lead_positions(model.leadsV3)
+       state.valid = len(state.lane_lines) > 0
+-    else:
++    elif not model_valid:
+       state.valid = False
+ 
+     self._state = state
+diff --git a/openpilot/selfdrive/ui/sunnypilot/onroad/scene3d/scene.py b/openpilot/selfdrive/ui/sunnypilot/onroad/scene3d/scene.py
+index 97afbea..244d9ce 100644
+--- a/openpilot/selfdrive/ui/sunnypilot/onroad/scene3d/scene.py
++++ b/openpilot/selfdrive/ui/sunnypilot/onroad/scene3d/scene.py
+@@ -187,8 +187,8 @@ class Scene3D:
+ 
+     # a wider shoulder pass under the surface gives the road a lip instead of a paper edge
+     for pad, colour, lift in ((0.55, pal.road_shoulder, Z_ROAD), (0.0, pal.road, Z_ROAD + 0.002)):
+-      left = np.stack([lx[:n], ly[:n] + pad, lz[:n] + lift], axis=1).astype(np.float32)
+-      right = np.stack([rx[:n], ry[:n] - pad, rz[:n] + lift], axis=1).astype(np.float32)
++      left = np.stack([lx[:n], ly[:n] - pad, lz[:n] - lift], axis=1).astype(np.float32)
++      right = np.stack([rx[:n], ry[:n] + pad, rz[:n] - lift], axis=1).astype(np.float32)
+       lw, rw = geo.car_to_world(left), geo.car_to_world(right)
+       a, b, c, d = lw[:-1], rw[:-1], lw[1:], rw[1:]
+       _tris(np.concatenate([np.stack([a, c, b], axis=1), np.stack([b, c, d], axis=1)], axis=0), colour)
+@@ -213,8 +213,8 @@ class Scene3D:
+     if n < 2:
+       return
+ 
+-    left = np.stack([lx[:n], ly[:n], lz[:n] + Z_ROAD + 0.004], axis=1).astype(np.float32)
+-    right = np.stack([rx[:n], ry[:n], rz[:n] + Z_ROAD + 0.004], axis=1).astype(np.float32)
++    left = np.stack([lx[:n], ly[:n], lz[:n] - Z_ROAD - 0.004], axis=1).astype(np.float32)
++    right = np.stack([rx[:n], ry[:n], rz[:n] - Z_ROAD - 0.004], axis=1).astype(np.float32)
+     lw, rw = geo.car_to_world(left), geo.car_to_world(right)
+     a, b, c, d = lw[:-1], rw[:-1], lw[1:], rw[1:]
+     _tris(np.concatenate([np.stack([a, c, b], axis=1), np.stack([b, c, d], axis=1)], axis=0),
+@@ -267,12 +267,12 @@ class Scene3D:
+ 
+   def _draw_blindspots(self, pal: Palette, state: SceneState):
+     """BSM is a lamp, not a position: draw the zone that is occupied, never a car in it."""
+-    for active, sign in ((state.left_blindspot, 1.0), (state.right_blindspot, -1.0)):
++    for active, sign in ((state.left_blindspot, -1.0), (state.right_blindspot, 1.0)):
+       if not active:
+         continue
+       near, far = -5.5, 2.0
+       inner, outer = sign * 1.6, sign * 4.5
+-      lift = np.array([0.0, 0.0, Z_LANE + 0.01], dtype=np.float32)
++      lift = np.array([0.0, 0.0, -Z_LANE - 0.01], dtype=np.float32)
+       corners = np.array([[near, inner, 0.0], [far, inner, 0.0],
+                           [far, outer, 0.0], [near, outer, 0.0]], dtype=np.float32) + lift
+       _tris(geo.quad(corners), pal.blindspot)

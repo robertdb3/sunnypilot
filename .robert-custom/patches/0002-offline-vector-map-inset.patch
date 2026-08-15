@@ -1,0 +1,664 @@
+diff --git a/openpilot/common/params_keys.h b/openpilot/common/params_keys.h
+index bb79893..b242987 100644
+--- a/openpilot/common/params_keys.h
++++ b/openpilot/common/params_keys.h
+@@ -184,6 +184,8 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
+     {"ScreenSaverTimeout", {PERSISTENT | BACKUP, INT, "300"}},
+     {"ShowAdvancedControls", {PERSISTENT | BACKUP, BOOL, "0"}},
+     {"ShowTurnSignals", {PERSISTENT | BACKUP, BOOL, "0"}},
++    {"MapPanel", {PERSISTENT | BACKUP, BOOL, "0"}},
++    {"MapPanelZoom", {PERSISTENT | BACKUP, INT, "1"}},
+     {"StandstillTimer", {PERSISTENT | BACKUP, BOOL, "0"}},
+     {"TrueVEgoUI", {PERSISTENT | BACKUP, BOOL, "0"}},
+ 
+diff --git a/openpilot/selfdrive/ui/sunnypilot/layouts/settings/visuals.py b/openpilot/selfdrive/ui/sunnypilot/layouts/settings/visuals.py
+index 84be5a2..ef1bcee 100644
+--- a/openpilot/selfdrive/ui/sunnypilot/layouts/settings/visuals.py
++++ b/openpilot/selfdrive/ui/sunnypilot/layouts/settings/visuals.py
+@@ -93,6 +93,13 @@ class VisualsLayout(Widget):
+            "This displays what the car is currently doing, not what the planner is requesting."),
+         None,
+       ),
++      "MapPanel": (
++        lambda: tr("Map Panel"),
++        tr("Show a heading-up map in the corner of the driving screen. It is drawn from the offline " +
++           "maps downloaded on the OSM page, so it needs no data connection. Download your region " +
++           "there first, otherwise the panel stays empty."),
++        None,
++      ),
+     }
+     self._toggles = {}
+     for param, (title, desc, callback) in self._toggle_defs.items():
+@@ -121,9 +128,19 @@ class VisualsLayout(Widget):
+       inline=False
+     )
+ 
++    self._map_panel_zoom = multiple_button_item_sp(
++      title=lambda: tr("Map Panel Zoom"),
++      description=lambda: tr("How much ground the map panel covers."),
++      buttons=[lambda: tr("Close"), lambda: tr("Medium"), lambda: tr("Wide")],
++      param="MapPanelZoom",
++      button_width=350,
++      inline=False
++    )
++
+     items = list(self._toggles.values()) + [
+       self._chevron_info,
+       self._dev_ui_info,
++      self._map_panel_zoom,
+     ]
+     return items
+ 
+diff --git a/openpilot/selfdrive/ui/sunnypilot/onroad/hud_renderer.py b/openpilot/selfdrive/ui/sunnypilot/onroad/hud_renderer.py
+index f8e4257..09518e2 100644
+--- a/openpilot/selfdrive/ui/sunnypilot/onroad/hud_renderer.py
++++ b/openpilot/selfdrive/ui/sunnypilot/onroad/hud_renderer.py
+@@ -9,6 +9,7 @@ import pyray as rl
+ from openpilot.common.constants import CV
+ from openpilot.selfdrive.ui.mici.onroad.torque_bar import TorqueBar
+ from openpilot.selfdrive.ui.sunnypilot.onroad.developer_ui import DeveloperUiRenderer, DeveloperUiState, get_bottom_dev_ui_offset
++from openpilot.selfdrive.ui.sunnypilot.onroad.map_panel import MapPanelRenderer
+ from openpilot.selfdrive.ui.sunnypilot.onroad.road_name import RoadNameRenderer
+ from openpilot.selfdrive.ui.sunnypilot.onroad.rocket_fuel import RocketFuel
+ from openpilot.selfdrive.ui.sunnypilot.onroad.speed_limit import SpeedLimitRenderer
+@@ -29,6 +30,7 @@ class HudRendererSP(HudRenderer):
+   def __init__(self):
+     super().__init__()
+     self.developer_ui = DeveloperUiRenderer()
++    self.map_panel_renderer = MapPanelRenderer()
+     self.road_name_renderer = RoadNameRenderer()
+     self.rocket_fuel = RocketFuel()
+     self.speed_limit_renderer = SpeedLimitRenderer()
+@@ -54,6 +56,7 @@ class HudRendererSP(HudRenderer):
+     self.speed_cluster = ui_state.sm['carState'].cruiseState.speedCluster * self.speed_conv
+ 
+     super()._update_state()
++    self.map_panel_renderer.update()
+     self.road_name_renderer.update()
+     self.speed_limit_renderer.update()
+     self.smart_cruise_control_renderer.update()
+@@ -138,6 +141,7 @@ class HudRendererSP(HudRenderer):
+       self._torque_bar.render(torque_rect)
+ 
+     self.developer_ui.render(rect)
++    self.map_panel_renderer.render(rect)
+     self.road_name_renderer.render(rect)
+     self.speed_limit_renderer.render(rect)
+     self.smart_cruise_control_renderer.render(rect)
+diff --git a/openpilot/selfdrive/ui/sunnypilot/onroad/map_panel.py b/openpilot/selfdrive/ui/sunnypilot/onroad/map_panel.py
+new file mode 100644
+index 0000000..e8958e9
+--- /dev/null
++++ b/openpilot/selfdrive/ui/sunnypilot/onroad/map_panel.py
+@@ -0,0 +1,246 @@
++"""
++Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
++
++This file is part of sunnypilot and is licensed under the MIT License.
++See the LICENSE.md file in the root directory for more details.
++"""
++
++# Heading-up inset map drawn from the offline OSM data mapd already downloads, so it works
++# with no signal. Geometry comes from openpilot.sunnypilot.mapd.offline_map on a worker
++# thread; everything here is projection and drawing.
++#
++# Points are projected with one vectorised numpy pass and memmoved straight into a Vector2
++# buffer -- raylib's Vector2 is two float32s, so a float32 (N, 2) array is bit-identical and
++# needs no per-point Python work. Only the per-way draw_line_strip calls are interpreted,
++# and MAX_DRAWN_WAYS bounds those.
++
++import math
++
++import numpy as np
++import pyray as rl
++
++from openpilot.selfdrive.ui.ui_state import ui_state
++from openpilot.sunnypilot.mapd.offline_map import OfflineMapLoader
++from openpilot.system.ui.widgets import Widget
++
++EARTH_R = 6371000.0
++
++PANEL_SIZE = 460
++PANEL_MARGIN = 40
++CORNER_ROUNDNESS = 0.06
++
++# metres per pixel for each zoom setting, closest first
++ZOOM_LEVELS = (0.55, 1.1, 2.2)
++DEFAULT_ZOOM = 1
++
++# how much of the panel sits ahead of the car: 0.5 centres it, higher pushes it down
++FORWARD_BIAS = 0.68
++
++# hard ceilings per frame. Segments are what actually costs: each one is a draw_line_ex
++# call, so this is the number that protects the frame rate, not the way count.
++MAX_DRAWN_WAYS = 400
++MAX_DRAWN_SEGMENTS = 1200
++
++# (colour, width) per class priority from offline_map.CLASS_PRIORITY, index is the priority
++ROAD_STYLES = (
++  (rl.Color(255, 186, 92, 255), 6.0),   # 0  motorway
++  (rl.Color(252, 168, 86, 255), 5.5),   # 1  trunk
++  (rl.Color(247, 224, 138, 255), 5.0),  # 2  primary
++  (rl.Color(255, 186, 92, 220), 4.0),   # 3  motorway/trunk links
++  (rl.Color(238, 238, 238, 235), 4.0),  # 4  secondary
++  (rl.Color(247, 224, 138, 200), 3.0),  # 5  primary link
++  (rl.Color(224, 224, 224, 220), 3.5),  # 6  tertiary
++  (rl.Color(238, 238, 238, 190), 2.5),  # 7  secondary link
++  (rl.Color(224, 224, 224, 190), 2.5),  # 8  tertiary link
++  (rl.Color(196, 196, 196, 190), 2.5),  # 9  unclassified
++  (rl.Color(178, 178, 178, 190), 2.5),  # 10 residential
++  (rl.Color(168, 168, 168, 170), 2.0),  # 11 living street
++  (rl.Color(150, 150, 150, 150), 2.0),  # 12 unknown
++)
++
++BACKGROUND = rl.Color(18, 20, 24, 205)
++BORDER = rl.Color(255, 255, 255, 40)
++CAR_COLOR = rl.Color(70, 160, 255, 255)
++NO_FIX_COLOR = rl.Color(200, 200, 200, 150)
++
++
++def project(points: np.ndarray, lat0: float, lon0: float, bearing_deg: float,
++            metres_per_px: float, cx: float, cy: float) -> np.ndarray:
++  """Project lat/lon to heading-up panel pixels. Returns float32 (N, 2), ready to memmove.
++
++  Local equirectangular about (lat0, lon0), which is well under a pixel of error at the
++  couple-of-km radius this draws. Bearing is degrees clockwise from north; the car's
++  forward direction maps to screen up.
++  """
++  if len(points) == 0:
++    return np.zeros((0, 2), dtype=np.float32)
++
++  lat_scale = math.pi / 180.0 * EARTH_R
++  lon_scale = lat_scale * math.cos(math.radians(lat0))
++
++  east = (points[:, 1] - lon0) * lon_scale
++  north = (points[:, 0] - lat0) * lat_scale
++
++  b = math.radians(bearing_deg)
++  sin_b, cos_b = math.sin(b), math.cos(b)
++
++  right = east * cos_b - north * sin_b
++  forward = east * sin_b + north * cos_b
++
++  out = np.empty((len(points), 2), dtype=np.float32)
++  out[:, 0] = cx + right / metres_per_px
++  out[:, 1] = cy - forward / metres_per_px
++  return out
++
++
++def visible_ways(xy: np.ndarray, starts: np.ndarray, counts: np.ndarray,
++                 classes: np.ndarray, rect: rl.Rectangle, limit: int) -> np.ndarray:
++  """Indices of ways overlapping the panel, most important first, capped at limit."""
++  if len(starts) == 0:
++    return np.zeros(0, dtype=np.int64)
++
++  # per-way screen bbox without a Python loop
++  min_x = np.minimum.reduceat(xy[:, 0], starts)
++  max_x = np.maximum.reduceat(xy[:, 0], starts)
++  min_y = np.minimum.reduceat(xy[:, 1], starts)
++  max_y = np.maximum.reduceat(xy[:, 1], starts)
++
++  visible = ((max_x >= rect.x) & (min_x <= rect.x + rect.width) &
++             (max_y >= rect.y) & (min_y <= rect.y + rect.height) & (counts >= 2))
++
++  idx = np.flatnonzero(visible)
++  # always order by importance, not just when trimming: the caller also stops on a segment
++  # budget, and that must drop side streets rather than whatever sorted last by index.
++  # Stable, so the result stays deterministic frame to frame.
++  idx = idx[np.argsort(classes[idx], kind="stable")]
++  return idx[:limit]
++
++
++class MapPanelRenderer(Widget):
++  def __init__(self):
++    super().__init__()
++    self._loader = OfflineMapLoader()
++    self._started = False
++
++    self._lat = 0.0
++    self._lon = 0.0
++    self._bearing = 0.0
++    self._has_fix = False
++
++    self._buf = rl.ffi.new("Vector2[]", 1)
++    self._buf_len = 1
++
++  def _gps(self):
++    """Newest valid fix. A 3X publishes gpsLocation (qcom) or gpsLocationExternal (ublox)
++    depending on hardware, so take whichever socket is actually alive."""
++    sm = ui_state.sm
++    best = None
++    for service in ("gpsLocation", "gpsLocationExternal"):
++      if service not in sm.data:
++        continue
++      if not sm.valid[service] or not sm.alive[service]:
++        continue
++      msg = sm[service]
++      if not msg.hasFix:
++        continue
++      if best is None or msg.unixTimestampMillis > best.unixTimestampMillis:
++        best = msg
++    return best
++
++  def update(self):
++    if not ui_state.map_panel:
++      return
++
++    if not self._started:
++      self._loader.start()
++      self._started = True
++
++    fix = self._gps()
++    if fix is None:
++      self._has_fix = False
++      return
++
++    self._has_fix = True
++    self._lat = fix.latitude
++    self._lon = fix.longitude
++    self._bearing = fix.bearingDeg
++    self._loader.update_position(self._lat, self._lon)
++
++  def _ensure_buffer(self, n: int) -> None:
++    if n > self._buf_len:
++      self._buf = rl.ffi.new("Vector2[]", n)
++      self._buf_len = n
++
++  def _render(self, rect: rl.Rectangle):
++    if not ui_state.map_panel:
++      return
++
++    panel = rl.Rectangle(
++      rect.x + rect.width - PANEL_SIZE - PANEL_MARGIN,
++      rect.y + rect.height - PANEL_SIZE - PANEL_MARGIN,
++      PANEL_SIZE, PANEL_SIZE,
++    )
++
++    rl.draw_rectangle_rounded(panel, CORNER_ROUNDNESS, 12, BACKGROUND)
++    rl.draw_rectangle_rounded_lines(panel, CORNER_ROUNDNESS, 12, BORDER)
++
++    cx = panel.x + panel.width / 2.0
++    cy = panel.y + panel.height * FORWARD_BIAS
++
++    rl.begin_scissor_mode(int(panel.x), int(panel.y), int(panel.width), int(panel.height))
++    try:
++      if self._has_fix:
++        self._draw_roads(panel, cx, cy)
++        self._draw_car(cx, cy)
++      else:
++        rl.draw_circle(int(cx), int(cy), 8.0, NO_FIX_COLOR)
++    finally:
++      rl.end_scissor_mode()
++
++  def _draw_roads(self, panel: rl.Rectangle, cx: float, cy: float) -> None:
++    data = self._loader.get_slice()
++    if data is None or data.num_ways == 0:
++      return
++
++    zoom = ui_state.map_panel_zoom
++    mpp = ZOOM_LEVELS[zoom] if 0 <= zoom < len(ZOOM_LEVELS) else ZOOM_LEVELS[DEFAULT_ZOOM]
++
++    xy = project(data.points, self._lat, self._lon, self._bearing, mpp, cx, cy)
++    idx = visible_ways(xy, data.starts, data.counts, data.classes, panel, MAX_DRAWN_WAYS)
++    if len(idx) == 0:
++      return
++
++    # one copy of every projected point into the C buffer, then index into it per segment.
++    # draw_line_ex rather than draw_line_strip: the strip is always hairline, and GLES
++    # commonly ignores glLineWidth, so thickness has to come from geometry.
++    self._ensure_buffer(len(xy))
++    rl.ffi.memmove(self._buf, rl.ffi.from_buffer(xy), xy.nbytes)
++
++    starts, counts, classes = data.starts, data.counts, data.classes
++    styles = ROAD_STYLES
++    last = len(styles) - 1
++    buf = self._buf
++    draw = rl.draw_line_ex
++    budget = MAX_DRAWN_SEGMENTS
++
++    for i in idx:
++      n = int(counts[i])
++      if n < 2:
++        continue
++      if budget <= 0:
++        break
++      color, width = styles[min(int(classes[i]), last)]
++      start = int(starts[i])
++      n = min(n, budget + 1)
++      for j in range(start, start + n - 1):
++        draw(buf[j], buf[j + 1], width, color)
++      budget -= n - 1
++
++  @staticmethod
++  def _draw_car(cx: float, cy: float) -> None:
++    rl.draw_triangle(
++      rl.Vector2(cx, cy - 15),
++      rl.Vector2(cx - 10, cy + 11),
++      rl.Vector2(cx + 10, cy + 11),
++      CAR_COLOR,
++    )
+diff --git a/openpilot/selfdrive/ui/sunnypilot/ui_state.py b/openpilot/selfdrive/ui/sunnypilot/ui_state.py
+index 602830a..7c27d03 100644
+--- a/openpilot/selfdrive/ui/sunnypilot/ui_state.py
++++ b/openpilot/selfdrive/ui/sunnypilot/ui_state.py
+@@ -48,6 +48,8 @@ class UIStateSP:
+     self.custom_interactive_timeout: int = 0
+     self.developer_ui = None
+     self.hide_v_ego_ui: bool = False
++    self.map_panel: bool = False
++    self.map_panel_zoom: int = 1
+     self.onroad_brightness: int = 0
+     self.onroad_brightness_timer: int = 0
+     self.onroad_brightness_timer_param: int = 0
+@@ -156,6 +158,8 @@ class UIStateSP:
+     self.custom_interactive_timeout = self.params.get("InteractivityTimeout", return_default=True)
+     self.developer_ui = self.params.get("DevUIInfo")
+     self.hide_v_ego_ui = self.params.get_bool("HideVEgoUI")
++    self.map_panel = self.params.get_bool("MapPanel")
++    self.map_panel_zoom = self.params.get("MapPanelZoom", return_default=True)
+     self.onroad_brightness = int(float(self.params.get("OnroadScreenOffBrightness", return_default=True)))
+     self.onroad_brightness_timer_param = self.params.get("OnroadScreenOffTimer", return_default=True)
+     self.rainbow_path = self.params.get_bool("RainbowMode")
+diff --git a/openpilot/sunnypilot/mapd/offline.capnp b/openpilot/sunnypilot/mapd/offline.capnp
+new file mode 100644
+index 0000000..2400245
+--- /dev/null
++++ b/openpilot/sunnypilot/mapd/offline.capnp
+@@ -0,0 +1,64 @@
++@0xda3a0d9284ca402f;
++
++# Schema for the offline map data downloaded by mapd (the OSM page in settings).
++#
++# Vendored from pfeiferj/mapd (MIT), cereal/offline/offline.capnp, with the Go
++# package annotations removed so pycapnp can load it without /go.capnp. The struct
++# id, field numbering and ordering are unchanged, which is what the wire format
++# depends on -- do not renumber anything here.
++#
++# Files live at {Paths.mapd_root()}/offline/<groupLat>/<groupLon>/<minLat>_<minLon>_<maxLat>_<maxLon>
++# in 0.25 degree cells, grouped into 2 degree directories. See offline_map.py.
++
++enum HighwayClass {
++  unknown @0;
++  motorway @1;
++  motorwayLink @2;
++  trunk @3;
++  trunkLink @4;
++  primary @5;
++  primaryLink @6;
++  secondary @7;
++  secondaryLink @8;
++  tertiary @9;
++  tertiaryLink @10;
++  unclassified @11;
++  residential @12;
++  livingStreet @13;
++}
++
++struct Way {
++  name @0 :Text;
++  ref @1 :Text;
++  maxSpeed @2 :Float64;
++  minLat @3 :Float64;
++  minLon @4 :Float64;
++  maxLat @5 :Float64;
++  maxLon @6 :Float64;
++  nodes @7 :List(Coordinates);
++  lanes @8 :UInt8;
++  advisorySpeed @9 :Float64;
++  hazard @10 :Text;
++  oneWay @11 :Bool;
++  maxSpeedForward @12 :Float64;
++  maxSpeedBackward @13 :Float64;
++  id @14 :Int64;
++  highwayClass @15 :HighwayClass;
++  maxSpeedConditional @16 :Text;
++  maxSpeedForwardConditional @17 :Text;
++  maxSpeedBackwardConditional @18 :Text;
++}
++
++struct Coordinates {
++  latitude @0 :Float64;
++  longitude @1 :Float64;
++}
++
++struct Offline {
++  minLat @0 :Float64;
++  minLon @1 :Float64;
++  maxLat @2 :Float64;
++  maxLon @3 :Float64;
++  ways @4 :List(Way);
++  overlap @5 :Float64;
++}
+diff --git a/openpilot/sunnypilot/mapd/offline_map.py b/openpilot/sunnypilot/mapd/offline_map.py
+new file mode 100644
+index 0000000..6314667
+--- /dev/null
++++ b/openpilot/sunnypilot/mapd/offline_map.py
+@@ -0,0 +1,227 @@
++"""
++Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
++
++This file is part of sunnypilot and is licensed under the MIT License.
++See the LICENSE.md file in the root directory for more details.
++"""
++
++# Reads the offline OSM data that mapd already downloads for speed limits, and turns the
++# slice around the car into flat arrays the onroad map panel can project and draw.
++#
++# Layout on disk, confirmed against real downloads:
++#   {mapd_root}/offline/<groupLat>/<groupLon>/<minLat>_<minLon>_<maxLat>_<maxLon>
++# where cells are 0.25 degrees and groups are 2 degrees (64 cells per group directory).
++# Both are floored, which matters for the negative longitudes across the US.
++#
++# Cost, measured on the densest cell in the US data (9.3MB, 39913 ways, NW DC):
++#   unpack                                    5 ms
++#   extracting every way's nodes            326 ms
++#   bbox reject first, extract survivors     53 ms
++# Way carries its own minLat/maxLat/minLon/maxLon, so rejecting on those never touches the
++# node list. That is the whole reason this is cheap enough to do without a preprocessing
++# cache. Keep the bbox test before any access to w.nodes.
++
++import math
++import os
++import threading
++
++import capnp
++import numpy as np
++
++from openpilot.common.hardware.hw import Paths
++
++capnp.remove_import_hook()
++offline_capnp = capnp.load(os.path.join(os.path.dirname(os.path.abspath(__file__)), "offline.capnp"))
++
++CELL_DEG = 0.25
++GROUP_DEG = 2
++EARTH_R = 6371000.0
++
++# how far around the car we keep geometry, and how far it may drift before we rebuild
++DEFAULT_RADIUS_M = 2000.0
++REBUILD_DISTANCE_M = 500.0
++
++# lower sorts first when we have to drop ways to stay inside the render budget
++CLASS_PRIORITY = {
++  "motorway": 0, "trunk": 1, "primary": 2, "motorwayLink": 3, "trunkLink": 3,
++  "secondary": 4, "primaryLink": 5, "tertiary": 6, "secondaryLink": 7,
++  "tertiaryLink": 8, "unclassified": 9, "residential": 10, "livingStreet": 11,
++  "unknown": 12,
++}
++MAX_PRIORITY = max(CLASS_PRIORITY.values())
++
++
++def cell_origin(lat: float, lon: float) -> tuple[float, float]:
++  """Bottom-left corner of the 0.25 degree cell containing this point."""
++  return math.floor(lat / CELL_DEG) * CELL_DEG, math.floor(lon / CELL_DEG) * CELL_DEG
++
++
++def group_origin(lat: float, lon: float) -> tuple[int, int]:
++  """Directory pair for the 2 degree group containing this point."""
++  return int(math.floor(lat / GROUP_DEG) * GROUP_DEG), int(math.floor(lon / GROUP_DEG) * GROUP_DEG)
++
++
++def cell_path(lat: float, lon: float, root: str | None = None) -> str:
++  """Absolute path of the offline file covering this point. Existence is not checked."""
++  base = root if root is not None else Paths.mapd_root()
++  min_lat, min_lon = cell_origin(lat, lon)
++  g_lat, g_lon = group_origin(lat, lon)
++  name = f"{min_lat:.6f}_{min_lon:.6f}_{min_lat + CELL_DEG:.6f}_{min_lon + CELL_DEG:.6f}"
++  return os.path.join(base, "offline", str(g_lat), str(g_lon), name)
++
++
++class MapSlice:
++  """Ways near a point, flattened so projection is a single vectorised operation.
++
++  points is (N, 2) of lat/lon; starts/counts index into it per way; classes holds the
++  render priority so the panel can style and cull without going back to capnp.
++  """
++
++  def __init__(self, lat: float, lon: float, points: np.ndarray, starts: np.ndarray,
++               counts: np.ndarray, classes: np.ndarray):
++    self.lat = lat
++    self.lon = lon
++    self.points = points
++    self.starts = starts
++    self.counts = counts
++    self.classes = classes
++
++  @property
++  def num_ways(self) -> int:
++    return len(self.starts)
++
++  @staticmethod
++  def empty(lat: float = 0.0, lon: float = 0.0) -> "MapSlice":
++    return MapSlice(lat, lon, np.zeros((0, 2)), np.zeros(0, dtype=np.int32),
++                    np.zeros(0, dtype=np.int32), np.zeros(0, dtype=np.uint8))
++
++
++def _cells_to_load(lat: float, lon: float, radius_m: float) -> list[tuple[float, float]]:
++  """The cell under the car, plus neighbours when the radius crosses a cell edge."""
++  d_lat = radius_m / EARTH_R * 180.0 / math.pi
++  d_lon = d_lat / max(math.cos(math.radians(lat)), 1e-6)
++
++  cells = set()
++  for la in (lat - d_lat, lat, lat + d_lat):
++    for lo in (lon - d_lon, lon, lon + d_lon):
++      cells.add(cell_origin(la, lo))
++  return sorted(cells)
++
++
++def load_slice(lat: float, lon: float, radius_m: float = DEFAULT_RADIUS_M,
++               root: str | None = None) -> MapSlice:
++  """Read every cell the radius touches and flatten the ways that fall inside it."""
++  d_lat = radius_m / EARTH_R * 180.0 / math.pi
++  d_lon = d_lat / max(math.cos(math.radians(lat)), 1e-6)
++  lat_lo, lat_hi = lat - d_lat, lat + d_lat
++  lon_lo, lon_hi = lon - d_lon, lon + d_lon
++
++  chunks: list[np.ndarray] = []
++  starts: list[int] = []
++  counts: list[int] = []
++  classes: list[int] = []
++  offset = 0
++
++  for c_lat, c_lon in _cells_to_load(lat, lon, radius_m):
++    # cell_path takes any point inside the cell; the origin plus a nudge stays inside
++    path = cell_path(c_lat + CELL_DEG / 2, c_lon + CELL_DEG / 2, root)
++    try:
++      with open(path, "rb") as f:
++        data = f.read()
++    except OSError:
++      continue  # region not downloaded, or ocean
++
++    try:
++      # traversal limit has to be lifted or large cells raise part way through
++      msg = offline_capnp.Offline.from_bytes_packed(data, traversal_limit_in_words=2**62)
++      ways = msg.ways
++    except Exception:
++      continue
++
++    for w in ways:
++      # bbox reject BEFORE touching w.nodes -- this is the 6x
++      if w.maxLat < lat_lo or w.minLat > lat_hi or w.maxLon < lon_lo or w.minLon > lon_hi:
++        continue
++      nodes = w.nodes
++      n = len(nodes)
++      if n < 2:
++        continue
++      arr = np.empty((n, 2))
++      for i, node in enumerate(nodes):
++        arr[i, 0] = node.latitude
++        arr[i, 1] = node.longitude
++      chunks.append(arr)
++      starts.append(offset)
++      counts.append(n)
++      classes.append(CLASS_PRIORITY.get(str(w.highwayClass), MAX_PRIORITY))
++      offset += n
++
++  if not chunks:
++    return MapSlice.empty(lat, lon)
++
++  return MapSlice(lat, lon, np.concatenate(chunks),
++                  np.array(starts, dtype=np.int32),
++                  np.array(counts, dtype=np.int32),
++                  np.array(classes, dtype=np.uint8))
++
++
++class OfflineMapLoader:
++  """Loads slices on a worker thread so the render loop never blocks on disk or capnp."""
++
++  def __init__(self, radius_m: float = DEFAULT_RADIUS_M, root: str | None = None):
++    self._radius_m = radius_m
++    self._root = root
++    self._lock = threading.Lock()
++    self._wake = threading.Event()
++    self._requested: tuple[float, float] | None = None
++    self._slice: MapSlice | None = None
++    self._loading = False
++    self._thread: threading.Thread | None = None
++
++  def start(self) -> None:
++    if self._thread is not None:
++      return
++    self._thread = threading.Thread(target=self._run, daemon=True, name="offline_map")
++    self._thread.start()
++
++  def update_position(self, lat: float, lon: float) -> None:
++    """Ask for a rebuild if the car has drifted far enough from the current slice."""
++    with self._lock:
++      if self._loading:
++        return
++      cur = self._slice
++      if cur is not None and _distance_m(cur.lat, cur.lon, lat, lon) < REBUILD_DISTANCE_M:
++        return
++      self._requested = (lat, lon)
++      self._loading = True
++    self._wake.set()
++
++  def get_slice(self) -> MapSlice | None:
++    with self._lock:
++      return self._slice
++
++  def _run(self) -> None:
++    while True:
++      self._wake.wait()
++      self._wake.clear()
++      with self._lock:
++        req = self._requested
++        self._requested = None
++      if req is None:
++        with self._lock:
++          self._loading = False
++        continue
++      try:
++        result = load_slice(req[0], req[1], self._radius_m, self._root)
++      except Exception:
++        result = MapSlice.empty(req[0], req[1])
++      with self._lock:
++        self._slice = result
++        self._loading = False
++
++
++def _distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
++  """Equirectangular approximation, plenty accurate for the sub-km checks here."""
++  x = math.radians(lon2 - lon1) * math.cos(math.radians((lat1 + lat2) / 2))
++  y = math.radians(lat2 - lat1)
++  return math.hypot(x, y) * EARTH_R

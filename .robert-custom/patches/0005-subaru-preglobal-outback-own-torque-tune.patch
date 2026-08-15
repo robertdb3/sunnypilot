@@ -1,0 +1,34 @@
+diff --git a/opendbc_repo/opendbc/car/torque_data/override.toml b/opendbc_repo/opendbc/car/torque_data/override.toml
+index 381f5cf..c737386 100644
+--- a/opendbc_repo/opendbc/car/torque_data/override.toml
++++ b/opendbc_repo/opendbc/car/torque_data/override.toml
+@@ -47,6 +47,17 @@ legend = ["LAT_ACCEL_FACTOR", "MAX_LAT_ACCEL_MEASURED", "FRICTION"]
+ "RAM_1500_5TH_GEN" = [2.0, 2.0, 0.05]
+ "RAM_HD_5TH_GEN" = [1.4, 1.4, 0.05]
+ "SUBARU_OUTBACK" = [2.0, 1.5, 0.2]
++# 2018-19 Outback. Previously substituted to SUBARU_IMPREZA, whose LAT_ACCEL_FACTOR of 1.067 is
++# roughly half of every other Subaru on the same STEER_MAX=2047 scale -- it commanded about twice
++# the steer torque a corner needs, which shows up as overshoot and oscillation in bends while
++# straight-line driving looks fine (the feedforward is lateral_accel / LAT_ACCEL_FACTOR, so the
++# error scales with how hard you are turning).
++# These are the 2020-22 Outback's hand-set values: same model line, next platform generation.
++# An informed starting point, NOT a measurement -- its real job is to put torqued's sanity
++# window somewhere that contains the true value so Self-Tune can find it. The other preglobals
++# (Forester, Legacy, 2015-17 Outback) still borrow the Impreza and likely have the same problem,
++# but are unverified here and the Legacy has a different steering ratio.
++"SUBARU_OUTBACK_PREGLOBAL_2018" = [2.0, 1.5, 0.2]
+ "CADILLAC_ESCALADE" = [1.899999976158142, 1.842270016670227, 0.1120000034570694]
+ "CADILLAC_ESCALADE_ESV_2019" = [1.15, 1.3, 0.2]
+ "CADILLAC_XT4" = [1.45, 1.6, 0.2]
+diff --git a/opendbc_repo/opendbc/car/torque_data/substitute.toml b/opendbc_repo/opendbc/car/torque_data/substitute.toml
+index 945ab35..7db2872 100644
+--- a/opendbc_repo/opendbc/car/torque_data/substitute.toml
++++ b/opendbc_repo/opendbc/car/torque_data/substitute.toml
+@@ -81,7 +81,6 @@ legend = ["LAT_ACCEL_FACTOR", "MAX_LAT_ACCEL_MEASURED", "FRICTION"]
+ "SUBARU_LEGACY" = "SUBARU_OUTBACK"
+ 
+ # Old subarus don't have much data guessing it's like low torque impreza"
+-"SUBARU_OUTBACK_PREGLOBAL_2018" = "SUBARU_IMPREZA"
+ "SUBARU_OUTBACK_PREGLOBAL" = "SUBARU_IMPREZA"
+ "SUBARU_FORESTER_PREGLOBAL" = "SUBARU_IMPREZA"
+ "SUBARU_LEGACY_PREGLOBAL" = "SUBARU_IMPREZA"

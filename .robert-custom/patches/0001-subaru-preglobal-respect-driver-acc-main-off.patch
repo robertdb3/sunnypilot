@@ -1,0 +1,116 @@
+diff --git a/opendbc_repo/opendbc/car/subaru/carcontroller.py b/opendbc_repo/opendbc/car/subaru/carcontroller.py
+index fbc55f0..812d816 100644
+--- a/opendbc_repo/opendbc/car/subaru/carcontroller.py
++++ b/opendbc_repo/opendbc/car/subaru/carcontroller.py
+@@ -6,6 +6,7 @@ from opendbc.car.interfaces import CarControllerBase
+ from opendbc.car.subaru import subarucan
+ from opendbc.car.subaru.values import DBC, GLOBAL_ES_ADDR, CanBus, CarControllerParams, SubaruFlags
+ 
++from opendbc.sunnypilot.car.subaru.main_cruise import PreglobalMainCruise
+ from opendbc.sunnypilot.car.subaru.stop_and_go import SnGCarController
+ 
+ # FIXME: These limits aren't exact. The real limit is more than likely over a larger time period and
+@@ -21,6 +22,7 @@ class CarController(CarControllerBase, SnGCarController):
+     self.apply_torque_last = 0
+ 
+     self.cruise_button_prev = 0
++    self.main_cruise = PreglobalMainCruise()
+     self.steer_rate_counter = 0
+ 
+     self.p = CarControllerParams(CP)
+@@ -78,22 +80,33 @@ class CarController(CarControllerBase, SnGCarController):
+ 
+     # *** alerts and pcm cancel ***
+     if self.CP.flags & SubaruFlags.PREGLOBAL:
++      self.main_cruise.update(self.frame, CS.out.cruiseState.available)
++
+       if self.frame % 5 == 0:
++        mocked_main_press = False
+         # 1 = main, 2 = set shallow, 3 = set deep, 4 = resume shallow, 5 = resume deep
+         # disengage ACC when OP is disengaged
+         if pcm_cancel_cmd:
+           cruise_button = 1
+-        # turn main on if off and past start-up state
+-        elif not CS.out.cruiseState.available and CS.ready:
++          mocked_main_press = True
++        # turn main on if off and past start-up state, unless the driver turned main off:
++        # ACC main is the only MADS lateral toggle on this platform, so restoring it here
++        # would blip lateral off and straight back on instead of latching it off
++        elif self.main_cruise.should_restore(CS.out.cruiseState.available, CS.ready):
+           cruise_button = 1
++          mocked_main_press = True
+         else:
+           cruise_button = CS.cruise_button
+ 
+         # unstick previous mocked button press
+         if cruise_button == 1 and self.cruise_button_prev == 1:
+           cruise_button = 0
++          mocked_main_press = False
+         self.cruise_button_prev = cruise_button
+ 
++        if mocked_main_press:
++          self.main_cruise.mocked_press(self.frame)
++
+         can_sends.append(subarucan.create_preglobal_es_distance(self.packer, cruise_button, CS.es_distance_msg))
+ 
+     else:
+diff --git a/opendbc_repo/opendbc/sunnypilot/car/subaru/main_cruise.py b/opendbc_repo/opendbc/sunnypilot/car/subaru/main_cruise.py
+new file mode 100644
+index 0000000..e1b1567
+--- /dev/null
++++ b/opendbc_repo/opendbc/sunnypilot/car/subaru/main_cruise.py
+@@ -0,0 +1,54 @@
++"""
++Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
++
++This file is part of sunnypilot and is licensed under the MIT License.
++See the LICENSE.md file in the root directory for more details.
++"""
++
++# Preglobal Subarus have no LKAS button, so MADS has no dedicated lateral toggle
++# (see opendbc/sunnypilot/car/subaru/mads.py, which only reads ES_LKAS_State on global cars).
++# The only lateral toggle the driver has is the ACC main (cruise ON/OFF) button, which MADS
++# picks up through cruiseState.available.
++#
++# The preglobal carcontroller mocks a main button press whenever main is off and the car is
++# past its start-up state. That press is also how openpilot cancels ACC on this platform, so
++# it can't simply be removed: cancel presses main off, and the same code presses it back on.
++# The side effect is that a driver pressing main off gets it turned straight back on, which
++# blips MADS lateral off and immediately back on instead of latching it off.
++#
++# This tracks who turned main off, so openpilot only restores main when openpilot is the one
++# that turned it off.
++
++# How long we wait for a mocked press to land before giving up on it. The carcontroller runs
++# at 100Hz, so this is ~1s. A main state change inside this window is ours, not the driver's.
++MAIN_CRUISE_PRESS_TIMEOUT_FRAMES = 100
++
++
++class PreglobalMainCruise:
++  def __init__(self):
++    self.available_prev = False
++    self.driver_turned_off = False
++    self.pending_press_frame: int | None = None
++
++  def update(self, frame: int, available: bool) -> None:
++    press_in_flight = self.pending_press_frame is not None and \
++                      (frame - self.pending_press_frame) < MAIN_CRUISE_PRESS_TIMEOUT_FRAMES
++
++    if self.available_prev != available:
++      if press_in_flight:
++        # our own mocked press landed, whichever way main moved
++        self.pending_press_frame = None
++      elif not available:
++        # main went off and openpilot didn't ask for it: the driver pressed ACC main
++        self.driver_turned_off = True
++
++    if available:
++      self.driver_turned_off = False
++
++    self.available_prev = available
++
++  def should_restore(self, available: bool, ready: bool) -> bool:
++    return not available and ready and not self.driver_turned_off
++
++  def mocked_press(self, frame: int) -> None:
++    self.pending_press_frame = frame
