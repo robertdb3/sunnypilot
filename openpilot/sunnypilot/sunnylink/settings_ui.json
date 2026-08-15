@@ -2371,6 +2371,17 @@
       "description": "",
       "items": [
         {
+          "key": "ToyotaAutoHold",
+          "widget": "toggle",
+          "needs_onroad_cycle": true,
+          "title": "Toyota: Auto Brake Hold FOR TSS2 HYBRID CARS",
+          "enablement": [
+            {
+              "type": "not_engaged"
+            }
+          ]
+        },
+        {
           "key": "ToyotaEnhancedBsm",
           "widget": "toggle",
           "needs_onroad_cycle": true,
