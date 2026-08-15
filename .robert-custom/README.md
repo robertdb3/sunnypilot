@@ -20,6 +20,12 @@ https://install.sunnypilot.ai/fork/robertdb3/custompilot-stable
 one-click GitHub comparison link. Promotion requires a human to review the upstream diff, open the
 pull request, and merge it deliberately.
 
+The updater pushes candidates with GitHub's workflow token. GitHub can mark the resulting PR event
+as `action_required` instead of starting another workflow recursively. In that case, manually run
+**Validate custom fork** on `custompilot-staging`; never bypass or remove the required `validate`
+check. After promotion, an unchanged staging tip that is already an ancestor of stable is treated
+as current so the daily updater does not create provenance-only churn.
+
 ## Automated update sequence
 
 `.github/workflows/update-candidate.yml` runs daily and can also be started manually. It:

@@ -422,6 +422,11 @@ different times to communication rate and driving-model lag—two different prob
     but create the published candidate commit with the current `custompilot-stable` tip as its
     parent. Also keep the stable-validation workflow on the repository's default branch so GitHub
     registers and runs the required `validate` check on promotion PRs.
+16. **Do not weaken protection when a bot-updated promotion PR says `action_required`.** A push
+    made with GitHub's workflow token does not recursively start a normal PR workflow. Manually
+    dispatch **Validate custom fork** on `custompilot-staging` and wait for its `validate` job.
+    Once staging has been promoted and is an ancestor of stable, treat matching provenance as
+    unchanged; requiring its parent to equal the new stable merge commit would create daily churn.
 
 ## What remains deliberately unresolved
 
