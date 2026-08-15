@@ -63,7 +63,8 @@ jobs:
             then
               stable_sha=$(git rev-parse --verify origin/custompilot-stable 2>/dev/null || true)
               candidate_parent=$(git rev-parse --verify origin/custompilot-staging^ 2>/dev/null || true)
-              if [ -n "$stable_sha" ] && [ "$candidate_parent" = "$stable_sha" ]; then
+              if { [ -n "$stable_sha" ] && [ "$candidate_parent" = "$stable_sha" ]; } ||
+                 git merge-base --is-ancestor origin/custompilot-staging origin/custompilot-stable 2>/dev/null; then
                 unchanged=true
               fi
             fi
