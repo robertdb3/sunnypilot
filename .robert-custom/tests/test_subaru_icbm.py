@@ -68,10 +68,9 @@ class _CS:
 
 class _CCSP:
   """vTarget and vCruiseCluster are display units (mph here), whole numbers, never m/s."""
-  def __init__(self, send, target_mph=55, cluster_mph=55, fine=True):
+  def __init__(self, send, target_mph=55, cluster_mph=55):
     self.intelligentCruiseButtonManagement = types.SimpleNamespace(
-      sendButton=send, vTarget=float(target_mph), vCruiseCluster=float(cluster_mph),
-      fineStepEnabled=fine)
+      sendButton=send, vTarget=float(target_mph), vCruiseCluster=float(cluster_mph))
 
 
 def _iface():
@@ -97,18 +96,15 @@ def _settle(target_mph, start_mph, max_presses=40):
     if btn == icbm.BUTTON_NONE:
       break
 
-    # A fine action repeats the shallow code across one bounded hold. Consume all of its CAN
-    # slots, then model the ECU's single resulting 1-unit change; do not count every frame as a
-    # separate tap.
-    if i.hold_button != icbm.BUTTON_NONE:
-      while i.hold_button != icbm.BUTTON_NONE:
-        frame += icbm.ES_DISTANCE_FRAME_STEP
-        i.button_for(_CCSP(send, target_mph, cluster), _CS(cluster), frame)
-      cluster += 1 if send == _SendButtonState.increase else -1
-    elif btn == icbm.BUTTON_SET_COARSE:
+    # apply what the car would actually do with that button
+    if btn == icbm.BUTTON_SET_COARSE:
       cluster = icbm.coarse_down(cluster)
     elif btn == icbm.BUTTON_RES_COARSE:
       cluster = icbm.coarse_up(cluster)
+    elif btn == icbm.BUTTON_SET_FINE:
+      cluster -= 1
+    elif btn == icbm.BUTTON_RES_FINE:
+      cluster += 1
     presses += 1
     frame += 200   # past the confirmation wait
 
@@ -142,13 +138,9 @@ class TestNoOscillation(unittest.TestCase):
   def test_settles_and_stops_when_target_is_unreachable(self):
     """With coarse-only steps an odd target cannot be hit exactly; it must stop at the nearest
     reachable value rather than hunt around it."""
-    icbm.FINE_STEP_ENABLED = False
-    try:
-      final, presses = _settle(target_mph=58, start_mph=72)
-      self.assertEqual(final, 60)          # 60 is 2 away; 55 would be 3
-      self.assertLess(presses, 6)
-    finally:
-      icbm.FINE_STEP_ENABLED = True
+    final, presses = _settle(target_mph=58, start_mph=72)
+    self.assertEqual(final, 60)          # 60 is 2 away; 55 would be 3
+    self.assertLess(presses, 6)
 
   def test_already_on_target_sends_nothing(self):
     i = _iface()
@@ -220,73 +212,18 @@ class TestGuards(unittest.TestCase):
 
 
 class TestFineStep(unittest.TestCase):
-  def test_measured_hold_constants_are_enabled(self):
-    self.assertTrue(icbm.FINE_STEP_ENABLED)
-    self.assertEqual(icbm.FINE_HOLD_SLOTS, 19)
+  def test_disabled_by_default(self):
+    """Coarse-only until the probe confirms a single frame of code 3/5 does the 1 mph action."""
+    self.assertFalse(icbm.FINE_STEP_ENABLED)
 
-  def test_measured_hold_reaches_non_multiple_of_five(self):
-    final, presses = _settle(target_mph=58, start_mph=72)
-    self.assertEqual(final, 58)
-    self.assertLess(presses, 8)
-
-  def test_setting_off_retains_coarse_only_behavior(self):
-    i = _iface()
-    self.assertEqual(i.button_for(_CCSP(_SendButtonState.decrease, 58, 60, fine=False),
-                                  _CS(60), 5000), icbm.BUTTON_NONE)
-
-  def test_fine_repeats_shallow_code_for_bounded_slots(self):
+  def test_fine_lands_exactly_when_enabled(self):
     icbm.FINE_STEP_ENABLED = True
-    icbm.FINE_HOLD_SLOTS = 3
     try:
-      i = _iface()
-      cc = _CCSP(_SendButtonState.decrease, 58, 60)
-      self.assertEqual(i.button_for(cc, _CS(60), 5000), icbm.BUTTON_SET_COARSE)
-      self.assertEqual(i.button_for(cc, _CS(60), 5005), icbm.BUTTON_SET_COARSE)
-      self.assertEqual(i.button_for(cc, _CS(60), 5010), icbm.BUTTON_SET_COARSE)
-      self.assertEqual(i.button_for(cc, _CS(60), 5015), icbm.BUTTON_NONE)
+      final, presses = _settle(target_mph=58, start_mph=72)
+      self.assertEqual(final, 58)
+      self.assertLess(presses, 8)
     finally:
-      icbm.FINE_STEP_ENABLED = True
-      icbm.FINE_HOLD_SLOTS = 19
-
-  def test_fine_uses_no_unobserved_deep_code(self):
-    self.assertEqual(icbm.BUTTON_SET_FINE, 2)
-    self.assertEqual(icbm.BUTTON_RES_FINE, 4)
-
-  def test_interrupted_hold_is_abandoned(self):
-    icbm.FINE_STEP_ENABLED = True
-    icbm.FINE_HOLD_SLOTS = 4
-    try:
-      i = _iface()
-      cc = _CCSP(_SendButtonState.decrease, 58, 60)
-      self.assertEqual(i.button_for(cc, _CS(60), 5000), icbm.BUTTON_SET_COARSE)
-      # Missing the expected 5005 slot simulates cancel/main winning ES_Distance priority.
-      self.assertEqual(i.button_for(cc, _CS(60), 5010), icbm.BUTTON_NONE)
-      self.assertEqual(i.hold_button, icbm.BUTTON_NONE)
-    finally:
-      icbm.FINE_STEP_ENABLED = True
-      icbm.FINE_HOLD_SLOTS = 19
-
-  def test_driver_press_abandons_hold_and_starts_cooldown(self):
-    icbm.FINE_STEP_ENABLED = True
-    icbm.FINE_HOLD_SLOTS = 4
-    try:
-      i = _iface()
-      cc = _CCSP(_SendButtonState.decrease, 58, 60)
-      i.button_for(cc, _CS(60), 5000)
-      self.assertEqual(i.button_for(cc, _CS(60, cruise_button=4), 5005), icbm.BUTTON_NONE)
-      self.assertEqual(i.hold_button, icbm.BUTTON_NONE)
-      self.assertEqual(i.button_for(cc, _CS(60), 5010), icbm.BUTTON_NONE)
-    finally:
-      icbm.FINE_STEP_ENABLED = True
-      icbm.FINE_HOLD_SLOTS = 19
-
-  def test_observed_one_mph_change_releases_early(self):
-    i = _iface()
-    cc = _CCSP(_SendButtonState.decrease, 58, 60)
-    self.assertEqual(i.button_for(cc, _CS(60), 5000), icbm.BUTTON_SET_COARSE)
-    self.assertEqual(i.button_for(_CCSP(_SendButtonState.decrease, 58, 59), _CS(59), 5005),
-                     icbm.BUTTON_NONE)
-    self.assertEqual(i.hold_button, icbm.BUTTON_NONE)
+      icbm.FINE_STEP_ENABLED = False
 
 
 if __name__ == "__main__":

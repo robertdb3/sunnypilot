@@ -41,7 +41,7 @@ done
 # layer supplies metadata only for our five keys and preserves strict rejection of all others.
 apply_one "$ASSETS/ports/staging-30a9cdc/0001-prebuilt-custom-params-compat.patch"
 
-for number in 0007 0008 0009 0010 0011 0012; do
+for number in 0007 0008 0009 0010; do
   patch=$(find "$ASSETS/patches" -maxdepth 1 -type f -name "$number-*.patch" -print)
   if [ "$(printf '%s\n' "$patch" | grep -c .)" -ne 1 ]; then
     echo "error: expected exactly one $number patch" >&2
