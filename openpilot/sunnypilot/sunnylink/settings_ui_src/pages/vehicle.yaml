@@ -82,6 +82,12 @@ sections:
   title: Toyota / Lexus Settings
   description: ''
   items:
+  - key: ToyotaTSS2Long
+    widget: toggle
+    needs_onroad_cycle: true
+    title: 'Toyota: custom longitudinal for TSS2'
+    enablement:
+    - $ref: '#/macros/not_engaged'
   - key: ToyotaEnforceStockLongitudinal
     widget: toggle
     needs_onroad_cycle: true
