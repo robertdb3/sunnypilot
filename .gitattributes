@@ -12,3 +12,6 @@
 
 openpilot/selfdrive/car/tests/test_models_segs.txt filter=lfs diff=lfs merge=lfs -text
 openpilot/common/hardware/comma/updater filter=lfs diff=lfs merge=lfs -text
+
+# Unified diffs require a one-character context marker on otherwise blank lines.
+.robert-custom/patches/*.patch -whitespace
