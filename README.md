@@ -1,3 +1,9 @@
+<!-- robertdb3-custom-fork-notice -->
+> [!IMPORTANT]
+> **Unofficial personal fork.** This is not affiliated with or endorsed by comma.ai or
+> SUNNYPILOT LLC. This project uses software from Haibin Wen and SUNNYPILOT LLC and is licensed under a custom license requiring permission for use. See
+> [CUSTOM_FORK_NOTICE.md](CUSTOM_FORK_NOTICE.md) before installing.
+
 ![](https://user-images.githubusercontent.com/47793918/233812617-beab2e71-57b9-479e-8bff-c3931347ca40.png)
 
 ## 🌞 What is sunnypilot?

@@ -30,6 +30,7 @@ from openpilot.sunnypilot.mads.mads import ModularAssistiveDrivingSystem
 from openpilot.sunnypilot import get_sanitize_int_param
 from openpilot.sunnypilot.selfdrive.car.car_specific import CarSpecificEventsSP
 from openpilot.sunnypilot.selfdrive.car.cruise_helpers import CruiseHelper
+from openpilot.sunnypilot.selfdrive.reckless_watch.watcher import RecklessWatch, DEFAULT_THRESHOLD_MPH
 from openpilot.sunnypilot.selfdrive.car.intelligent_cruise_button_management.controller import IntelligentCruiseButtonManagement
 from openpilot.sunnypilot.selfdrive.selfdrived.button_state_tracker import ButtonStateTracker
 from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
@@ -173,6 +174,11 @@ class SelfdriveD(CruiseHelper):
       set_offroad_alert("Offroad_CarUnrecognized", True)
     elif self.CP.passive:
       self.events.add(EventName.dashcamMode, static=True)
+
+    self.reckless_watch_enabled = self.params.get_bool("RecklessWatch")
+    self.reckless_watch = RecklessWatch(
+      float(self.params.get("RecklessWatchThresholdMph", return_default=True) or DEFAULT_THRESHOLD_MPH))
+    self.reckless_state = None
 
     self.events_sp = EventsSP()
     self.events_sp_prev = []
@@ -508,6 +514,8 @@ class SelfdriveD(CruiseHelper):
     if CS.gearShifter == car.CarState.GearShifter.park and self.mads.enabled:
       self.events.remove(EventName.canBusMissing)
 
+    self.update_reckless_watch(CS)
+
     CruiseHelper.update(self, CS, self.events_sp, self.experimental_mode)
 
     # decrement personality on distance button press
@@ -585,6 +593,33 @@ class SelfdriveD(CruiseHelper):
     self.AM.add_many(self.sm.frame, alerts + alerts_sp)
     self.AM.process_alerts(self.sm.frame, clear_event_types)
 
+  def update_reckless_watch(self, CS):
+    """Virginia reckless-speed watch.
+
+    Raises the two alerts on their rising edges only -- "does not keep annoying me" was the
+    requirement, so the sticky over/under state goes out on selfdriveStateSP and the UI paints a
+    pulsing border instead of repeating the sound.
+    """
+    if not self.reckless_watch_enabled:
+      self.reckless_state = None
+      return
+
+    if not self.sm.valid[self.gps_location_service]:
+      return
+    gps = self.sm[self.gps_location_service]
+
+    # resolved limit, 0 when unknown -- the 20-over rule stays silent rather than guessing
+    speed_limit = self.sm['longitudinalPlanSP'].speedLimit.resolver.speedLimit
+
+    st = self.reckless_watch.update(gps.latitude, gps.longitude, gps.horizontalAccuracy,
+                                    CS.vEgo, speed_limit)
+    self.reckless_state = st
+
+    if st.entered_virginia:
+      self.events_sp.add(custom.OnroadEventSP.EventName.enteredVirginia)
+    if st.started_speeding:
+      self.events_sp.add(custom.OnroadEventSP.EventName.recklessSpeed)
+
   def publish_selfdriveState(self, CS):
     # selfdriveState
     ss_msg = messaging.new_message('selfdriveState')
@@ -629,6 +664,14 @@ class SelfdriveD(CruiseHelper):
     icbm.state = self.icbm.state
     icbm.sendButton = self.icbm.cruise_button
     icbm.vTarget = self.icbm.v_target
+    icbm.vCruiseCluster = self.icbm.v_cruise_cluster
+
+    rw = ss_sp.recklessWatch
+    if self.reckless_state is not None:
+      rw.inVirginia = self.reckless_state.in_virginia
+      rw.over = self.reckless_state.over
+      rw.reason = ['none', 'absolute', 'overLimit'][int(self.reckless_state.reason)]
+      rw.thresholdMph = float(self.reckless_state.threshold_mph)
 
     self.button_state_tracker.publish(ss_sp)
 

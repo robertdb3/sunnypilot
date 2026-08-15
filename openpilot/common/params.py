@@ -99,6 +99,18 @@ CPP_2_PYTHON = {
   ParamKeyType.BYTES: lambda v: v,
 }
 
+# Custom UI features can be added to source-only/prebuilt releases where libparams_c was
+# compiled before the keys existed. The native storage layer already supports arbitrary
+# keys; only type/default metadata and Python-side validation need to be supplied here.
+# Keep this list narrow so misspelled parameter names still fail loudly.
+CUSTOM_PARAM_SPECS = {
+  b"MapPanel": (ParamKeyType.BOOL, b"0", ParamKeyFlag.PERSISTENT | ParamKeyFlag.BACKUP),
+  b"Scene3D": (ParamKeyType.BOOL, b"0", ParamKeyFlag.PERSISTENT | ParamKeyFlag.BACKUP),
+  b"RecklessWatch": (ParamKeyType.BOOL, b"0", ParamKeyFlag.PERSISTENT | ParamKeyFlag.BACKUP),
+  b"RecklessWatchThresholdMph": (ParamKeyType.INT, b"82", ParamKeyFlag.PERSISTENT | ParamKeyFlag.BACKUP),
+  b"MapPanelZoom": (ParamKeyType.INT, b"1", ParamKeyFlag.PERSISTENT | ParamKeyFlag.BACKUP),
+}
+
 
 def ensure_bytes(v):
   return v.encode() if isinstance(v, str) else v
@@ -126,11 +138,21 @@ class Params:
     return (type(self), (self.d,))
 
   def clear_all(self, tx_flag=ParamKeyFlag.ALL):
+    # Prebuilt native libraries remove keys they do not know during filtered clears.
+    # Preserve custom values unless their declared flags explicitly request clearing.
+    preserved = {}
+    for key, (_, _, flags) in CUSTOM_PARAM_SPECS.items():
+      if not flags & tx_flag:
+        value = _copy_string(params_get(self.p, key, False))
+        if value not in (None, b""):
+          preserved[key] = value
     params_clear_all(self.p, int(tx_flag))
+    for key, value in preserved.items():
+      params_put(self.p, key, value, len(value), True)
 
   def check_key(self, key):
     key = ensure_bytes(key)
-    if b"\0" in key or not params_check_key(self.p, key):
+    if b"\0" in key or (not params_check_key(self.p, key) and key not in CUSTOM_PARAM_SPECS):
       raise UnknownKeyName(key)
     return key
 
@@ -150,6 +172,8 @@ class Params:
       return self._cpp2python(t, default, None, key)
 
   def _default(self, key):
+    if key in CUSTOM_PARAM_SPECS:
+      return CUSTOM_PARAM_SPECS[key][1]
     return _copy_string(params_get_default(self.p, key))
 
   def get(self, key, block=False, return_default=False):
@@ -186,18 +210,24 @@ class Params:
     return _copy_string(params_get_path(self.p, key, len(key))).decode()
 
   def get_type(self, key):
-    return ParamKeyType(params_get_key_type(self.p, self.check_key(key)))
+    key = self.check_key(key)
+    if key in CUSTOM_PARAM_SPECS:
+      return CUSTOM_PARAM_SPECS[key][0]
+    return ParamKeyType(params_get_key_type(self.p, key))
 
   def all_keys(self, flag=ParamKeyFlag.ALL):
     if flag == ParamKeyFlag.ALL:
       keys = []
       for i in range(params_keys_size(self.p)):
         keys.append(_copy_string(params_key_at(self.p, i)))
+      keys.extend(k for k in CUSTOM_PARAM_SPECS if k not in keys)
       return keys
     max_keys = 1024
     buf = (ParamsBuffer * max_keys)()
     count = params_keys_by_flag(self.p, int(flag), buf, max_keys)
-    return [_copy_string(buf[i]) for i in range(min(count, max_keys))]
+    keys = [_copy_string(buf[i]) for i in range(min(count, max_keys))]
+    keys.extend(k for k, (_, _, flags) in CUSTOM_PARAM_SPECS.items() if flags & flag and k not in keys)
+    return keys
 
   def get_default_value(self, key):
     k = self.check_key(key)

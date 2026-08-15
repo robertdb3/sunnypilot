@@ -84,11 +84,15 @@ class AugmentedRoadView(CameraView, AugmentedRoadViewSP):
       int(self._content_rect.height)
     )
 
-    # Render the base camera view
-    super()._render(self._content_rect)
+    # Render the base camera view, unless the 3D scene is replacing it
+    scene_3d = AugmentedRoadViewSP.render_scene_3d(self, self._content_rect)
+    if not scene_3d:
+      super()._render(self._content_rect)
 
-    # Draw all UI overlays
-    self.model_renderer.render(self._content_rect)
+    # Draw all UI overlays. The 3D scene draws its own lanes and path, so the flat model overlay
+    # would double up on top of it.
+    if not scene_3d:
+      self.model_renderer.render(self._content_rect)
     AugmentedRoadViewSP.update_fade_out_bottom_overlay(self, self._content_rect)
     self._hud_renderer.render(self._content_rect)
     self.alert_renderer.render(self._content_rect)

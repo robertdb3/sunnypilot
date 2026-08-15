@@ -90,6 +90,24 @@ class EventsSP(EventsBase):
 
 EVENTS_SP: dict[int, dict[str, Alert | AlertCallbackType]] = {
   # sunnypilot
+  EventNameSP.enteredVirginia: {
+    ET.PERMANENT: Alert(
+      "Entering Virginia",
+      "Reckless driving above 85 mph or 20 over the limit",
+      AlertStatus.normal, AlertSize.mid,
+      Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 6.),
+  },
+
+  # Fires once on the rising edge only. The pulsing border is what keeps this visible afterwards;
+  # repeating the sound was explicitly not wanted.
+  EventNameSP.recklessSpeed: {
+    ET.PERMANENT: Alert(
+      "Reckless driving speed",
+      "Virginia: this is a criminal offence, not a ticket",
+      AlertStatus.critical, AlertSize.mid,
+      Priority.HIGH, VisualAlert.none, AudibleAlert.warningSoft, 4.),
+  },
+
   EventNameSP.lkasEnable: {
     ET.ENABLE: EngagementAlert(AudibleAlert.engage),
   },

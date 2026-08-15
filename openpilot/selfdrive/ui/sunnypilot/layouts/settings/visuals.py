@@ -7,7 +7,7 @@ See the LICENSE.md file in the root directory for more details.
 from openpilot.common.params import Params
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.lib.multilang import tr, tr_noop
-from openpilot.system.ui.sunnypilot.widgets.list_view import toggle_item_sp, multiple_button_item_sp
+from openpilot.system.ui.sunnypilot.widgets.list_view import toggle_item_sp, multiple_button_item_sp, option_item_sp
 from openpilot.system.ui.widgets.scroller_tici import Scroller
 from openpilot.system.ui.widgets import Widget
 
@@ -93,6 +93,30 @@ class VisualsLayout(Widget):
            "This displays what the car is currently doing, not what the planner is requesting."),
         None,
       ),
+      "RecklessWatch": (
+        lambda: tr("Virginia Reckless Speed Watch"),
+        tr("Virginia treats 20 mph over the limit, or any speed above 85 mph, as reckless driving "
+           "\u2014 a criminal offence rather than a ticket. Notifies you on entering the state, "
+           "sounds once when you cross the threshold below, then shows a pulsing red border while "
+           "you stay above it. The 20-over check stays quiet where no speed limit data exists. "
+           "A driver aid, not legal advice: your car's speed will differ from an officer's radar."),
+        None,
+      ),
+      "Scene3D": (
+        lambda: tr("3D Driving Scene"),
+        tr("Replace the camera view with a rendered 3D scene: your car, the road, lane lines, "
+           "the planned path, and any vehicles the model actually detects ahead. Only measured "
+           "objects are drawn \u2014 nothing is shown behind you, and a blind spot appears as a "
+           "zone rather than a car, because the sensor reports presence and not position."),
+        None,
+      ),
+      "MapPanel": (
+        lambda: tr("Map Panel"),
+        tr("Show a heading-up map in the corner of the driving screen. It is drawn from the offline " +
+           "maps downloaded on the OSM page, so it needs no data connection. Download your region " +
+           "there first, otherwise the panel stays empty."),
+        None,
+      ),
     }
     self._toggles = {}
     for param, (title, desc, callback) in self._toggle_defs.items():
@@ -121,9 +145,31 @@ class VisualsLayout(Widget):
       inline=False
     )
 
+    self._reckless_threshold = option_item_sp(
+      title=lambda: tr("Reckless Watch Alert Speed"),
+      param="RecklessWatchThresholdMph",
+      description=lambda: tr("Sound the alert at this speed. Virginia's statute is above 85 mph; "
+                             "the default of 82 leaves room to react and absorbs speedometer error."),
+      min_value=60,
+      max_value=90,
+      value_change_step=1,
+      label_callback=lambda x: f"{x} mph",
+    )
+
+    self._map_panel_zoom = multiple_button_item_sp(
+      title=lambda: tr("Map Panel Zoom"),
+      description=lambda: tr("How much ground the map panel covers."),
+      buttons=[lambda: tr("Close"), lambda: tr("Medium"), lambda: tr("Wide")],
+      param="MapPanelZoom",
+      button_width=350,
+      inline=False
+    )
+
     items = list(self._toggles.values()) + [
+      self._reckless_threshold,
       self._chevron_info,
       self._dev_ui_info,
+      self._map_panel_zoom,
     ]
     return items
 

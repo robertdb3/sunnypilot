@@ -184,6 +184,11 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"ScreenSaverTimeout", {PERSISTENT | BACKUP, INT, "300"}},
     {"ShowAdvancedControls", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"ShowTurnSignals", {PERSISTENT | BACKUP, BOOL, "0"}},
+    {"MapPanel", {PERSISTENT | BACKUP, BOOL, "0"}},
+    {"Scene3D", {PERSISTENT | BACKUP, BOOL, "0"}},
+    {"RecklessWatch", {PERSISTENT | BACKUP, BOOL, "0"}},
+    {"RecklessWatchThresholdMph", {PERSISTENT | BACKUP, INT, "82"}},
+    {"MapPanelZoom", {PERSISTENT | BACKUP, INT, "1"}},
     {"StandstillTimer", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"TrueVEgoUI", {PERSISTENT | BACKUP, BOOL, "0"}},
 

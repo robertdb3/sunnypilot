@@ -11,7 +11,9 @@ import openpilot.cereal.messaging as messaging
 
 
 def main():
-  config_realtime_process(5, Priority.CTRL_LOW)
+  # Stay with radar fusion on the otherwise-idle core 6 so UI load on core 5 cannot delay the
+  # model-synchronous planning chain and trip communication-rate safety checks.
+  config_realtime_process(6, Priority.CTRL_LOW)
 
   cloudlog.info("plannerd is waiting for CarParams")
   params = Params()

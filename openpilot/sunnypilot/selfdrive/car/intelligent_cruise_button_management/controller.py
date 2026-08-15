@@ -4,6 +4,8 @@ Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
 This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 """
+import math
+
 from openpilot.cereal import custom
 from opendbc.car.structs import car
 from opendbc.car import structs, apply_hysteresis
@@ -13,6 +15,7 @@ from openpilot.sunnypilot.selfdrive.car.intelligent_cruise_button_management.hel
 from openpilot.sunnypilot.selfdrive.car.cruise_ext import CRUISE_BUTTON_TIMER, update_manual_button_timers
 
 LongitudinalPlanSource = custom.LongitudinalPlanSP.LongitudinalPlanSource
+SpeedLimitSource = custom.LongitudinalPlanSP.SpeedLimit.Source
 State = custom.IntelligentCruiseButtonManagement.IntelligentCruiseButtonManagementState
 SendButtonState = custom.IntelligentCruiseButtonManagement.SendButtonState
 
@@ -42,6 +45,7 @@ class IntelligentCruiseButtonManagement:
     self.is_ready = False
     self.is_ready_prev = False
     self.v_target_ms_last = 0.0
+    self.target_valid = False
     self.is_metric = False
 
     self.cruise_button_timers = CRUISE_BUTTON_TIMER
@@ -54,7 +58,16 @@ class IntelligentCruiseButtonManagement:
     speed_conv = CV.MS_TO_KPH if self.is_metric else CV.MS_TO_MPH
     ms_conv = CV.KPH_TO_MS if self.is_metric else CV.MPH_TO_MS
 
-    self.v_target_ms_last = apply_hysteresis(LP_SP.vTarget, self.v_target_ms_last, HYST_GAP * ms_conv)
+    # ICBM manipulates the *stock ACC set speed*, so its authority must come from an actual
+    # resolved speed limit. LP_SP.vTarget is the general longitudinal planner target and falls
+    # back to the unset cruise ceiling (90 mph on this car) when no speed limit is available.
+    # Following that value caused repeated RES presses all the way to the ceiling.
+    resolver = LP_SP.speedLimit.resolver
+    speed_limit = float(resolver.speedLimitFinal)
+    self.target_valid = bool(resolver.speedLimitValid and resolver.source != SpeedLimitSource.none and
+                             math.isfinite(speed_limit) and speed_limit > 0.0)
+    target = speed_limit if self.target_valid else 0.0
+    self.v_target_ms_last = apply_hysteresis(target, self.v_target_ms_last, HYST_GAP * ms_conv)
 
     self.v_target = round(self.v_target_ms_last * speed_conv)
     self.v_cruise_min = get_minimum_set_speed(self.is_metric)
@@ -112,7 +125,7 @@ class IntelligentCruiseButtonManagement:
     ready = CC.enabled and not CC.cruiseControl.override and not CC.cruiseControl.cancel and not CC.cruiseControl.resume
     button_pressed = any(self.cruise_button_timers[k] > 0 for k in self.cruise_button_timers)
 
-    self.is_ready = ready and not button_pressed
+    self.is_ready = ready and self.target_valid and not button_pressed
 
   def run(self, CS: car.CarState, CC: car.CarControl, LP_SP: custom.LongitudinalPlanSP, is_metric: bool) -> None:
     if self.CP_SP.pcmCruiseSpeed:

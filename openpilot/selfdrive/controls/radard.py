@@ -273,7 +273,9 @@ class RadarD:
 
 # fuses camera and radar data for best lead detection
 def main() -> None:
-  config_realtime_process(5, Priority.CTRL_LOW)
+  # The custom onroad UI can saturate core 5, where radard normally runs below UI priority.
+  # Core 6 is otherwise idle on comma 3X; keep radar fusion realtime and isolated from rendering.
+  config_realtime_process(6, Priority.CTRL_LOW)
 
   # wait for stats about the car to come in from controls
   cloudlog.info("radard is waiting for CarParams")

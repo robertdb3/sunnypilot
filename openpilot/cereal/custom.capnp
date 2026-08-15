@@ -29,6 +29,10 @@ struct IntelligentCruiseButtonManagement {
   state @0 :IntelligentCruiseButtonManagementState;
   sendButton @1 :SendButtonState;
   vTarget @2 :Float32;
+  # Both speeds are in the cluster's DISPLAY units (mph or kph per IsMetric), not m/s. The car
+  # port needs the cluster value in the same units as vTarget to reason about set-speed steps,
+  # and opendbc has no access to IsMetric.
+  vCruiseCluster @3 :Float32;
 
   enum IntelligentCruiseButtonManagementState {
     inactive @0;      # No button press or default state
@@ -66,11 +70,27 @@ struct LeadData {
   aLeadDEPRECATED @5 :Float32;
 }
 
+struct RecklessWatch {
+  # Virginia Code 46.2-862 watch. thresholdMph is whichever limit was actually breached, in the
+  # cluster's display units, so the UI does not have to re-derive it.
+  inVirginia @0 :Bool;
+  over @1 :Bool;
+  reason @2 :Reason;
+  thresholdMph @3 :Float32;
+
+  enum Reason {
+    none @0;
+    absolute @1;
+    overLimit @2;
+  }
+}
+
 struct SelfdriveStateSP @0x81c2f05a394cf4af {
   mads @0 :ModularAssistiveDrivingSystem;
   intelligentCruiseButtonManagement @1 :IntelligentCruiseButtonManagement;
   buttonsPressed @2 :UInt16;
   buttonsReleaseToggle @3 :UInt16;
+  recklessWatch @4 :RecklessWatch;
 
   enum AudibleAlert {
     none @0;
@@ -352,6 +372,8 @@ struct OnroadEventSP @0xda96579883444c35 {
     speedLimitPending @22;
     e2eChime @23;
     laneChangeRoadEdge @24;
+    enteredVirginia @25;
+    recklessSpeed @26;
   }
 }
 

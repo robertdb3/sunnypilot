@@ -12,6 +12,22 @@ from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.lib.text_measure import measure_text_cached
 
 
+def _roll(sm) -> float:
+  """Read roll across the liveParameters -> vehicleParameters schema transition."""
+  for service in ("vehicleParameters", "liveParameters"):
+    if service in sm.valid and sm.valid[service]:
+      return float(sm[service].roll)
+  return 0.0
+
+
+def _torque_params(sm):
+  """Read torque learning across the liveTorqueParameters rename."""
+  for service in ("lateralTorqueParameters", "liveTorqueParameters"):
+    if service in sm.valid:
+      return sm[service], bool(sm.valid[service])
+  raise KeyError("no torque-parameter service subscribed")
+
+
 @dataclass
 class UiElement:
   value: str
@@ -160,7 +176,7 @@ class ActualLateralAccelElement(LateralControlElement):
     controls_state = sm['controlsState']
     curvature = controls_state.curvature
     v_ego = sm['carState'].vEgo
-    roll = sm['vehicleParameters'].roll if sm.valid['vehicleParameters'] else 0.0
+    roll = _roll(sm)
     lat_active = sm['carControl'].latActive
     steer_override = sm['carState'].steeringPressed
 
@@ -179,7 +195,7 @@ class DesiredLateralAccelElement(LateralControlElement):
     controls_state = sm['controlsState']
     desired_curvature = controls_state.desiredCurvature
     v_ego = sm['carState'].vEgo
-    roll = sm['vehicleParameters'].roll if sm.valid['vehicleParameters'] else 0.0
+    roll = _roll(sm)
     lat_active = sm['carControl'].latActive
     steer_override = sm['carState'].steeringPressed
 
@@ -250,9 +266,11 @@ class FrictionCoefficientElement:
     if ui_state.enforce_torque_control and ui_state.custom_torque_params and ui_state.torque_override_enabled:
       return UiElement(f"{ui_state.torque_override_friction:.3f}", "FRIC.", self.unit, rl.WHITE)
 
-    ltp = sm['lateralTorqueParameters']
+    ltp, service_valid = _torque_params(sm)
     value = f"{ltp.frictionCoefficientFiltered:.3f}"
-    color = rl.Color(0, 255, 0, 255) if ltp.liveValid else rl.WHITE
+    # The older lateralTorqueParameters schema has valid instead of liveValid.
+    learned_valid = getattr(ltp, "liveValid", getattr(ltp, "valid", service_valid))
+    color = rl.Color(0, 255, 0, 255) if learned_valid else rl.WHITE
     return UiElement(value, "FRIC.", self.unit, color)
 
 
@@ -264,9 +282,10 @@ class LatAccelFactorElement:
     if ui_state.enforce_torque_control and ui_state.custom_torque_params and ui_state.torque_override_enabled:
       return UiElement(f"{ui_state.torque_override_lat_accel_factor:.3f}", "L.A.F.", self.unit, rl.WHITE)
 
-    ltp = sm['lateralTorqueParameters']
+    ltp, service_valid = _torque_params(sm)
     value = f"{ltp.latAccelFactorFiltered:.3f}"
-    color = rl.Color(0, 255, 0, 255) if ltp.liveValid else rl.WHITE
+    learned_valid = getattr(ltp, "liveValid", getattr(ltp, "valid", service_valid))
+    color = rl.Color(0, 255, 0, 255) if learned_valid else rl.WHITE
     return UiElement(value, "L.A.F.", self.unit, color)
 
 

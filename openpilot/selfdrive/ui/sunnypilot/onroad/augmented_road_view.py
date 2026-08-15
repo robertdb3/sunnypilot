@@ -4,10 +4,15 @@ Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
 This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 """
+from typing import TYPE_CHECKING
+
 import pyray as rl
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.selfdrive.ui.ui_state import UIStatus, ui_state
 from openpilot.system.ui.lib.application import gui_app
+
+if TYPE_CHECKING:
+  from openpilot.selfdrive.ui.sunnypilot.onroad.scene3d.renderer import Scene3DRenderer
 
 BORDER_COLORS_SP = {
   UIStatus.LAT_ONLY: rl.Color(0x00, 0xC8, 0xC8, 0xFF),  # Cyan for lateral-only state
@@ -19,6 +24,26 @@ class AugmentedRoadViewSP:
   def __init__(self):
     self._fade_texture = gui_app.texture("icons_mici/onroad/onroad_fade.png")
     self._fade_alpha_filter = FirstOrderFilter(0, 0.1, 1 / gui_app.target_fps)
+    self._scene_3d: Scene3DRenderer | None = None
+
+  def render_scene_3d(self, content_rect) -> bool:
+    """Draw the synthetic 3D scene in place of the camera feed.
+
+    Returns True when it drew, so the caller knows to skip the camera and model overlay. The HUD,
+    alerts and driver state still draw on top either way. The caller is already inside
+    begin_scissor_mode for content_rect, which the scene relies on to bound its clear.
+    """
+    if not ui_state.scene_3d:
+      return False
+
+    if self._scene_3d is None:
+      # imported lazily so devices with the toggle off never build the meshes
+      from openpilot.selfdrive.ui.sunnypilot.onroad.scene3d.renderer import Scene3DRenderer
+      self._scene_3d = Scene3DRenderer()
+
+    self._scene_3d.update()
+    self._scene_3d.render(content_rect)
+    return True
 
   def update_fade_out_bottom_overlay(self, _content_rect):
     # Fade out bottom of overlays for looks (only when engaged)

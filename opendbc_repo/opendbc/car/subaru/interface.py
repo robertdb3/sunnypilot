@@ -107,6 +107,14 @@ class CarInterface(CarInterfaceBase):
     if not stock_cp.flags & (SubaruFlags.GLOBAL_GEN2 | SubaruFlags.HYBRID):
       stock_cp.autoResumeSng = True
 
+    # ICBM taps SET/RES through ES_Distance->Cruise_Button to walk the stock ACC set speed toward
+    # the speed limit. Preglobal only: subaru_preglobal_tx_hook checks nothing but ES_LKAS, so the
+    # button is already permitted, whereas subaru_tx_hook rejects any ES_Distance that is not a
+    # cancel when openpilot is not controlling longitudinal. Enabling this for global would need a
+    # panda safety change and the test coverage that comes with it.
+    if stock_cp.flags & SubaruFlags.PREGLOBAL:
+      ret.intelligentCruiseButtonManagementAvailable = True
+
     return ret
 
   @staticmethod

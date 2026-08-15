@@ -48,10 +48,14 @@ class UIStateSP:
     self.custom_interactive_timeout: int = 0
     self.developer_ui = None
     self.hide_v_ego_ui: bool = False
+    self.map_panel: bool = False
+    self.map_panel_zoom: int = 1
     self.onroad_brightness: int = 0
     self.onroad_brightness_timer: int = 0
     self.onroad_brightness_timer_param: int = 0
     self.rainbow_path: bool = False
+    self.scene_3d: bool = False
+    self.reckless_over: bool = False
     self.road_name_toggle: bool = False
     self.rocket_fuel: bool = False
     self.speed_limit_mode = None
@@ -148,6 +152,8 @@ class UIStateSP:
     if CP_SP_bytes is not None:
       self.CP_SP = messaging.log_from_bytes(CP_SP_bytes, custom.CarParamsSP)
       self.has_icbm = self.CP_SP.intelligentCruiseButtonManagementAvailable and self.params.get_bool("IntelligentCruiseButtonManagement")
+    if self.sm.updated.get('selfdriveStateSP'):
+      self.reckless_over = bool(self.sm['selfdriveStateSP'].recklessWatch.over)
 
     self._enforce_constraints()
     self.active_bundle = self.params.get("ModelManager_ActiveBundle")
@@ -156,6 +162,9 @@ class UIStateSP:
     self.custom_interactive_timeout = self.params.get("InteractivityTimeout", return_default=True)
     self.developer_ui = self.params.get("DevUIInfo")
     self.hide_v_ego_ui = self.params.get_bool("HideVEgoUI")
+    self.map_panel = self.params.get_bool("MapPanel")
+    self.scene_3d = self.params.get_bool("Scene3D")
+    self.map_panel_zoom = self.params.get("MapPanelZoom", return_default=True)
     self.onroad_brightness = int(float(self.params.get("OnroadScreenOffBrightness", return_default=True)))
     self.onroad_brightness_timer_param = self.params.get("OnroadScreenOffTimer", return_default=True)
     self.rainbow_path = self.params.get_bool("RainbowMode")
