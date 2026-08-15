@@ -653,6 +653,58 @@
               ]
             },
             {
+              "key": "AccelPersonalityEnabled",
+              "widget": "toggle",
+              "title": "Enable Accel Controller",
+              "description": "Begin slowing early and smoothly behind lead vehicles. Stock longitudinal control retains braking and stopping authority.",
+              "visibility": [
+                {
+                  "type": "capability",
+                  "field": "has_longitudinal_control",
+                  "equals": true
+                }
+              ],
+              "enablement": [
+                {
+                  "type": "capability",
+                  "field": "has_longitudinal_control",
+                  "equals": true
+                }
+              ]
+            },
+            {
+              "key": "AccelPersonality",
+              "widget": "multiple_button",
+              "title": "Acceleration Profile",
+              "description": "Eco slows earliest and recovers gently, Normal balances comfort and response, and Sport reacts and recovers more quickly.",
+              "options": [
+                {
+                  "value": 0,
+                  "label": "Eco"
+                },
+                {
+                  "value": 1,
+                  "label": "Normal"
+                },
+                {
+                  "value": 2,
+                  "label": "Sport"
+                }
+              ],
+              "enablement": [
+                {
+                  "type": "capability",
+                  "field": "has_longitudinal_control",
+                  "equals": true
+                },
+                {
+                  "type": "param",
+                  "key": "AccelPersonalityEnabled",
+                  "equals": true
+                }
+              ]
+            },
+            {
               "key": "IntelligentCruiseButtonManagement",
               "widget": "toggle",
               "title": "Intelligent Cruise Button Management (ICBM) (Alpha)",
