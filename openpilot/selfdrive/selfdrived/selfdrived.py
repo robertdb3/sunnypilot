@@ -665,6 +665,7 @@ class SelfdriveD(CruiseHelper):
     icbm.sendButton = self.icbm.cruise_button
     icbm.vTarget = self.icbm.v_target
     icbm.vCruiseCluster = self.icbm.v_cruise_cluster
+    icbm.fineStepEnabled = self.icbm.fine_step_enabled
 
     rw = ss_sp.recklessWatch
     if self.reckless_state is not None:

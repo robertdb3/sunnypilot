@@ -47,6 +47,12 @@ class CruiseLayout(Widget):
       description="",
       param="IntelligentCruiseButtonManagement")
 
+    self.icbm_fine_toggle = toggle_item_sp(
+      title=tr("ICBM Fine 1-mph Adjustments"),
+      description=tr("Allow ICBM to use measured long button holds for exact 1-mph adjustments. "
+                     "Turn off to retain factory-style 5-mph snapping."),
+      param="IcbmFineAdjustments")
+
     self.scc_v_toggle = toggle_item_sp(
       title=tr("Smart Cruise Control - Vision"),
       description=tr("Use vision path predictions to estimate the appropriate speed to drive through turns ahead."),
@@ -89,6 +95,7 @@ class CruiseLayout(Widget):
 
     items = [
       self.icbm_toggle,
+      self.icbm_fine_toggle,
       self.dec_toggle,
       self.scc_v_toggle,
       self.scc_m_toggle,
@@ -125,10 +132,13 @@ class CruiseLayout(Widget):
 
       if ui_state.CP_SP.intelligentCruiseButtonManagementAvailable and not has_long:
         self.icbm_toggle.action_item.set_enabled(ui_state.is_offroad())
+        self.icbm_fine_toggle.action_item.set_enabled(has_icbm and ui_state.is_offroad())
         self.icbm_toggle.set_description(tr(ICBM_DESC))
       else:
         ui_state.params.remove("IntelligentCruiseButtonManagement")
+        ui_state.params.remove("IcbmFineAdjustments")
         self.icbm_toggle.action_item.set_enabled(False)
+        self.icbm_fine_toggle.action_item.set_enabled(False)
 
         long_desc = ICMB_UNAVAILABLE
         if has_long:
@@ -160,6 +170,7 @@ class CruiseLayout(Widget):
     else:
       has_icbm = has_long = False
       self.icbm_toggle.action_item.set_enabled(False)
+      self.icbm_fine_toggle.action_item.set_enabled(False)
       self.icbm_toggle.set_description(tr(ONROAD_ONLY_DESCRIPTION))
 
     show_custom_acc_desc = False

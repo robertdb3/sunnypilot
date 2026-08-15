@@ -33,6 +33,7 @@ struct IntelligentCruiseButtonManagement {
   # port needs the cluster value in the same units as vTarget to reason about set-speed steps,
   # and opendbc has no access to IsMetric.
   vCruiseCluster @3 :Float32;
+  fineStepEnabled @4 :Bool;
 
   enum IntelligentCruiseButtonManagementState {
     inactive @0;      # No button press or default state

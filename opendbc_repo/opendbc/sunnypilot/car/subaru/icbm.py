@@ -22,9 +22,9 @@ SendButtonState = structs.IntelligentCruiseButtonManagement.SendButtonState
 # SNAPS to the next multiple of 5, so from 63 a tap down lands on 60, not 58.
 BUTTON_NONE = 0
 BUTTON_SET_COARSE = 2    # short tap down -> snap to next lower multiple of 5
-BUTTON_SET_FINE = 3      # long hold down -> -1
+BUTTON_SET_FINE = 2      # sustained shallow SET; duration selects the fine action
 BUTTON_RES_COARSE = 4    # short tap up   -> snap to next higher multiple of 5
-BUTTON_RES_FINE = 5      # long hold up   -> +1
+BUTTON_RES_FINE = 4      # sustained shallow RES; duration selects the fine action
 
 COARSE_SNAP = 5          # mph the coarse tap snaps to
 
@@ -36,13 +36,14 @@ COARSE_SNAP = 5          # mph the coarse tap snaps to
 # ES_Distance goes out every 5 frames (20 Hz), so a press occupies one 50 ms slot.
 PRESS_CONFIRM_TIMEOUT = 1.2    # s to wait for the set speed to move before assuming the tap was lost
 DRIVER_COOLDOWN = 1.0          # s to stay out of the way after the driver touches a button
+ES_DISTANCE_FRAME_STEP = 5
 
-# Whether a single frame of the fine code actually produces the 1 mph action, or whether the ECU
-# decodes "long hold" from a sustained assertion, is unverified on the car. Coarse-only is a
-# perfectly good shipping state: US limits are multiples of 5 and the coarse tap snaps to
-# multiples of 5, so it lands exactly on the limit for any offset that is 0 or a multiple of 5.
-# Flip this on once tools/probe_cruise_button.py shows the fine code working from a tap.
-FINE_STEP_ENABLED = False
+# The read-only raw-CAN probe proved that quick and held physical presses both use shallow codes
+# 2/4; a hold is represented by repeating that code at 20 Hz. Six on-road trials changed the set
+# speed once after 0.806-0.856 s. Nineteen slots assert through 0.90 s, while the state machine
+# releases earlier when it observes the first change.
+FINE_STEP_ENABLED = True
+FINE_HOLD_SLOTS = 19
 
 
 def coarse_down(v: int) -> int:
@@ -74,24 +75,37 @@ class IntelligentCruiseButtonManagementInterface(IntelligentCruiseButtonManageme
     self.driver_active_frame = -10_000
     self.pending_since_frame: int | None = None
     self.cluster_at_press = 0
+    self.hold_button = BUTTON_NONE
+    self.hold_slots_remaining = 0
+    self.hold_last_frame = 0
+    self.hold_increase = False
 
-  def _candidates(self, v: int, increase: bool) -> list[tuple[int, int]]:
-    """(predicted set speed, button) in preference order: coarse to close, fine to land."""
+  def _clear_hold(self) -> None:
+    self.hold_button = BUTTON_NONE
+    self.hold_slots_remaining = 0
+    self.hold_last_frame = 0
+
+  def _candidates(self, v: int, increase: bool) -> list[tuple[int, int, int]]:
+    """(predicted set speed, button, slots) in preference order."""
     out = [(coarse_up(v) if increase else coarse_down(v),
-            BUTTON_RES_COARSE if increase else BUTTON_SET_COARSE)]
-    if FINE_STEP_ENABLED:
+            BUTTON_RES_COARSE if increase else BUTTON_SET_COARSE, 1)]
+    if FINE_STEP_ENABLED and FINE_HOLD_SLOTS >= 2 and self.fine_step_enabled:
       out.append((v + 1 if increase else v - 1,
-                  BUTTON_RES_FINE if increase else BUTTON_SET_FINE))
+                  BUTTON_RES_FINE if increase else BUTTON_SET_FINE, FINE_HOLD_SLOTS))
     return out
 
   def button_for(self, CC_SP, CS, frame: int) -> int:
     """Return the Cruise_Button value to send this cycle, or BUTTON_NONE."""
     icbm = getattr(CC_SP, "intelligentCruiseButtonManagement", None)
     if icbm is None or icbm.sendButton == SendButtonState.none:
+      self._clear_hold()
       return BUTTON_NONE
+
+    self.fine_step_enabled = bool(getattr(icbm, "fineStepEnabled", False))
 
     # Only ever nudge a cruise system that is actually engaged.
     if not CS.out.cruiseState.enabled:
+      self._clear_hold()
       return BUTTON_NONE
 
     # Preglobal Subaru publishes no cruise buttonEvents, so the shared controller's
@@ -100,12 +114,42 @@ class IntelligentCruiseButtonManagementInterface(IntelligentCruiseButtonManageme
     if CS.cruise_button != BUTTON_NONE:
       self.driver_active_frame = frame
       self.pending_since_frame = None
+      self._clear_hold()
       return BUTTON_NONE
 
     if (frame - self.driver_active_frame) * DT_CTRL < DRIVER_COOLDOWN:
       return BUTTON_NONE
 
     cluster = round(getattr(icbm, "vCruiseCluster", 0.0))
+
+    target = round(getattr(icbm, "vTarget", 0.0))
+    if target <= 0 or cluster <= 0:
+      self._clear_hold()
+      return BUTTON_NONE
+
+    increase = icbm.sendButton == SendButtonState.increase
+
+    # A fine action is the same shallow code repeated in uninterrupted 50 ms slots. Abort on a
+    # missed carcontroller call (for example cancel/main taking priority), a direction change,
+    # target invalidation/crossing, or the first observed set-speed movement. Never resume a
+    # partially transmitted hold after another message source has occupied ES_Distance.
+    if self.hold_button != BUTTON_NONE:
+      uninterrupted = frame - self.hold_last_frame == ES_DISTANCE_FRAME_STEP
+      same_direction = increase == self.hold_increase
+      still_toward_target = target > cluster if increase else target < cluster
+      set_speed_unchanged = cluster == self.cluster_at_press
+      if not (uninterrupted and same_direction and still_toward_target and set_speed_unchanged):
+        self._clear_hold()
+        return BUTTON_NONE
+
+      if self.hold_slots_remaining > 0:
+        self.hold_slots_remaining -= 1
+        self.hold_last_frame = frame
+        return self.hold_button
+
+      self._clear_hold()
+      self.pending_since_frame = frame
+      return BUTTON_NONE
 
     # Wait for the previous tap to land before sending another. Gating on observed movement
     # instead of a fixed interval makes overshoot structurally impossible rather than tuned away,
@@ -117,18 +161,19 @@ class IntelligentCruiseButtonManagementInterface(IntelligentCruiseButtonManageme
         return BUTTON_NONE
       self.pending_since_frame = None
 
-    target = round(getattr(icbm, "vTarget", 0.0))
-    if target <= 0 or cluster <= 0:
-      return BUTTON_NONE
-
-    increase = icbm.sendButton == SendButtonState.increase
     error = abs(target - cluster)
 
-    for predicted, button in self._candidates(cluster, increase):
+    for predicted, button, slots in self._candidates(cluster, increase):
       if abs(target - predicted) < error:
-        self.pending_since_frame = frame
         self.cluster_at_press = cluster
         self.button_frame += 1
+        if slots > 1:
+          self.hold_button = button
+          self.hold_slots_remaining = slots - 1
+          self.hold_last_frame = frame
+          self.hold_increase = increase
+        else:
+          self.pending_since_frame = frame
         return button
 
     # Nothing available gets us closer -- we are as near as this car's steps allow. The shared
