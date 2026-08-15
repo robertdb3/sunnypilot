@@ -2094,6 +2094,22 @@
                   "equals": true
                 }
               ]
+            },
+            {
+              "key": "PlanplusControl",
+              "widget": "option",
+              "title": "Plan Plus Controls",
+              "description": "Adjust planplus model recentering strength. The higher this number the more aggressively the model will recover to lane center; too high and it will ping-pong.",
+              "min": 0.0,
+              "max": 2.0,
+              "step": 0.1,
+              "enablement": [
+                {
+                  "type": "param",
+                  "key": "ShowAdvancedControls",
+                  "equals": true
+                }
+              ]
             }
           ]
         },
