@@ -132,6 +132,11 @@ hand:
 rg '^diff --git a/' patches ports | sed -E 's#.*diff --git a/([^ ]+) b/.*#\1#' | sort -u
 ```
 
+On 2026-08-16 the same audit was repeated against the newer upstream base `5b4820d` after the drift
+described in symptom 11. Patches `0001` through `0006`, the `staging-30a9cdc` port, and `0007`
+through `0010` again applied in order against a fresh clone, once patch `0010` was corrected. Re-run
+this audit against the exact upstream tip whenever the candidate build fails to apply.
+
 Every intentional source difference in the local patched checkout is represented by at least one
 tracked patch. The only unmatched local files were generated `__pycache__/*.pyc` bytecode, which
 must not be committed. The `sunnypilot/` working clone is intentionally gitignored by the outer
@@ -315,6 +320,47 @@ Do not reintroduce the fine-step feature by adding a field to this prebuilt stru
 design must avoid that schema/dataclass boundary (for example, a carefully validated setting read
 inside the Subaru ICBM implementation) and must include an installed-device smoke test that starts
 and observes `card` before promotion.
+
+### 11. A patch that had applied for weeks suddenly failed in the candidate build
+
+**Observed:** on 2026-08-16 the scheduled **Build staging candidate** run failed after about two
+minutes. Nothing on the device had changed and no customization had been touched since the last
+green run.
+
+```text
+error: patch failed: openpilot/selfdrive/ui/sunnypilot/onroad/developer_ui/elements.py:250
+error: openpilot/selfdrive/ui/sunnypilot/onroad/developer_ui/elements.py: patch does not apply
+```
+
+**Cause:** upstream `sunnypilot/staging` advanced from `30a9cdc` to `5b4820d` and fixed a latent bug
+in `elements.py`. No schema field was renamed—`LateralTorqueParameters` has spelled the bit `valid`
+all along:
+
+| | `elements.py` reads | `log.capnp` defines |
+|---|---|---|
+| `30a9cdc` | `ltp.liveValid` | `valid` (no `liveValid`) |
+| `5b4820d` | `ltp.valid` | `valid` |
+
+Upstream had been reading a member that does not exist on that struct. That is the same defect
+recorded in symptom 7 as the developer-panel UI crash. Patch `0010` carried the buggy line as hunk
+context, so the moment upstream corrected it, `git apply --check` no longer matched.
+
+**Resolution:** the two affected hunks were updated to match upstream's corrected text, keeping the
+`getattr(ltp, "liveValid", getattr(ltp, "valid", ...))` fallback. The fallback is now belt-and-braces
+on current upstream but still resolves correctly, and still covers a device tree that predates the
+upstream fix. Verified by applying the entire stack in order against a fresh clone of the new
+upstream tip before merging. Maintenance PR #10.
+
+**The more useful signal:** upstream independently fixed a bug this stack had been patching around.
+Per step 2 of "Updating or rebasing later", that is the cue to check whether the patch is now partly
+redundant. The `liveValid` half of `0010`'s `elements.py` change is; the service-name tolerance
+(`lateralTorqueParameters`/`liveTorqueParameters`, `vehicleParameters`/`liveParameters`) is a
+separate concern and has not been reassessed.
+
+**Lesson:** treat a red scheduled candidate build as upstream drift until proven otherwise, then ask
+*which kind* of drift. A patch whose context breaks because upstream fixed the same bug is telling
+you something different from one that breaks because upstream moved code around—the first means part
+of your stack may be deletable.
 
 ## The reboot/recovery lesson
 
@@ -524,6 +570,17 @@ different times to communication rate and driving-model lag—two different prob
     the same broken code.
 19. **Do not infer fine/coarse behavior from button enum names.** On this Subaru, duration—not a
     separate button code—selects 5 mph versus 1 mph behavior.
+20. **Do not probe a Cap'n Proto union member with only `except AttributeError`.** The two failure
+    modes are different exceptions: a name that is *absent from the schema* raises `AttributeError`,
+    but a name that *exists and is not the currently set union member* raises capnp's `KjException`
+    ("Tried to get() a union member which is not currently initialized"). A compatibility probe that
+    catches only the first works while exactly one spelling exists in the schema, then crashes with a
+    raw capnp traceback the moment it meets a stale or foreign cache. Catch both, and verify the
+    fallback message is actually reachable rather than assuming it is.
+21. **Do not treat a patch stack as validated against anything but a named upstream commit.** The
+    stack is checked against two moving authorities: `/data/openpilot` for installed device APIs and
+    `upstream/staging` for patch applicability. Green against one proves nothing about the other, and
+    upstream can move on any day the schedule fires.
 
 ## What remains deliberately unresolved
 
@@ -554,6 +611,11 @@ Never blindly reapply all patches to a new sunnypilot release.
 6. Install while offroad and validate the smallest behavior first: model services, main toggle,
    ICBM limits, then optional UI features.
 7. Keep an untouched known-good commit available for rollback.
+
+Upstream can also change a line underneath a patch that has applied cleanly for weeks, without any
+action on your part—including by fixing the very bug the patch works around. The scheduled candidate
+build is what detects this, so read its failure as drift detection working rather than as a broken
+pipeline, and use it to trigger step 2 above; see symptom 11.
 
 The device checkout, exported patches, and this runbook should agree. If they do not, stop and
 reconstruct the actual device diff before driving.
