@@ -27,6 +27,23 @@ Last verified after a successful drive home with no issues:
 | Device address during this work | `fe80::20a:f5ff:feaf:4679%en0` (link-local and not permanent) |
 | Last rollback validation | Known-good tree restored; `card` and `controlsd` running; public staging/stable driving code matched the restored device tree |
 
+Published branch state as of 2026-08-16, recorded because the candidate has moved ahead of both
+stable and the device:
+
+| Branch | Commit | Upstream base | Relationship to the device |
+|---|---|---|---|
+| `custompilot-stable` | `08e9e98` | `30a9cdc` | Install target; driving code matched the restored device tree |
+| `custompilot-staging` | `0a641d2` | `5b4820d` | Candidate only. **Never installed or driven.** Not promoted |
+
+The candidate carries an upstream jump the device has never run—not just the local customization
+changes. Confirm the actual delta before promoting rather than assuming it is limited to your own
+patches:
+
+```bash
+git fetch origin
+git diff origin/custompilot-stable origin/custompilot-staging -- . ':(exclude)CUSTOM_FORK_MANIFEST.json'
+```
+
 The IP address and git hashes will change after future updates. The comma was also seen at
 `172.20.10.3` on the iPhone hotspot, while IPv6 link-local was the reliable connection. Identify
 the device and inspect its actual checkout again rather than treating either address as permanent.
@@ -113,7 +130,7 @@ The patch order matters because later patches harden or correct earlier behavior
 | `0007` | Fix tinygrad acceleration contract | Corrects a scalar/tuple mismatch that broke model output and produced `posenet speed invalid` / `nan m/s`. |
 | `0008` | Fail-closed ICBM and main-button arbitration | Prevents ICBM from following the 90 mph planner fallback and preserves a physical driver main press over the cancel it causes. |
 | `0009` | Move `radard` and `plannerd` to CPU 6 | Isolates the planning chain from the custom UI load that saturated CPU 5 and caused low communication-rate alerts. |
-| `0010` | Fix the mirrored 3D frame and developer UI crashes | Corrects Forward/Right/Down model coordinates, supports both schema generations, and avoids redundant model-array conversions. |
+| `0010` | Fix the mirrored 3D frame and developer UI crashes | Corrects Forward/Right/Down model coordinates, tolerates both cereal *service* names, and avoids redundant model-array conversions. Trimmed on 2026-08-16: the `liveValid` field fallback was removed once upstream fixed that read at the source (symptom 11). |
 
 The canonical patch files live in [`patches/`](../patches). The prebuilt compatibility patch lives
 under [`ports/`](../ports).
@@ -513,7 +530,7 @@ The tools in [`tools/`](../tools) exist because each caught a real class of fail
 | `check_live_service_rates.py` | Verify live rates parked after a CPU-affinity change. |
 | `monitor_main_toggle.py` | Observe physical main transitions and restore attribution while parked. |
 | `probe_cruise_button.py` | Confirm the car's real short/long cruise-button step behavior. |
-| `torque_status.py` | Inspect Self-Tune enablement, validity, learned values, bounds, and bucket progress. |
+| `torque_status.py` | Inspect Self-Tune enablement, validity, learned values, bounds, and bucket progress. Reads either torque-parameter service name and normalizes the validity bit; exits cleanly on a stale cache (see trap 20). |
 | `calibrate_wheel_speed.py` | Derive a wheel-speed factor from a real steady highway drive; never guess it. |
 | `preview_map_panel.py` / `render_scenes.py` / `render_reckless.py` | Exercise visual code off-device before risking the live UI. |
 
@@ -581,6 +598,15 @@ different times to communication rate and driving-model lag—two different prob
     stack is checked against two moving authorities: `/data/openpilot` for installed device APIs and
     `upstream/staging` for patch applicability. Green against one proves nothing about the other, and
     upstream can move on any day the schedule fires.
+22. **Do not trust a local `custompilot-*` ref without fetching first.** The default refspec fetches
+    `master` only, and candidate commits are force-published siblings rather than a chain, so a local
+    copy can sit arbitrarily far behind while looking like a valid branch. Compare
+    `origin/custompilot-stable` against `origin/custompilot-staging` after an explicit fetch, never a
+    stale local ref.
+23. **Do not assume a green candidate build means only your patches changed.** The build tracks the
+    latest upstream staging tip, so a passing run can carry an upstream jump alongside the
+    customization stack. Diff stable against staging, excluding the generated manifest, before
+    promoting.
 
 ## What remains deliberately unresolved
 
@@ -598,6 +624,11 @@ different times to communication rate and driving-model lag—two different prob
   was prevented at its source instead. Revisit only after a branch update that supports the API.
 - **Driving-model lag:** the redundant UI work was reduced and the subsequent drive was clean, but
   any future occurrence must still be treated as a real disengagement and analyzed from its route.
+- **Promotion of the `5b4820d` candidate:** built, green, and unpromoted as of 2026-08-16. It
+  carries an upstream jump the device has never run plus the trimmed `0010`, so it needs an offroad
+  install, `card`/`controlsd` alive across several cycles, a check of `/data/community/crashes`, and
+  the developer UI panel exercised specifically—that panel is what `0010` touches and what crashed
+  in symptom 7.
 
 ## Updating or rebasing later
 
@@ -643,6 +674,39 @@ A branch switch or reinstall is not required merely to point an already-correct 
 branch, but using the URL is the clean supported way to establish the updater-managed install.
 Perform installs offroad, expect commit IDs and possibly the SSH host key to change, and re-run the
 full process checks before driving.
+
+### Candidate commits are replaced, not appended
+
+Each build creates a fresh candidate commit whose parent is the current `custompilot-stable` tip,
+per trap 15, and force-publishes it. Successive candidates are therefore **siblings, not a chain**:
+`0dfc9ed` and `0a641d2` both had `08e9e98` as their parent. Consequences:
+
+- A local `custompilot-staging` branch can never be fast-forwarded after a rebuild. `git pull`
+  fails with "not possible to fast-forward" and only a hard reset will match the remote.
+- Candidate commits are disposable generated artifacts. Discarding a local one loses nothing; it is
+  reproducible from `master` plus the tracked patch stack.
+
+### Keep the pipeline branches as remote-tracking refs only
+
+Do not keep local `custompilot-staging` / `custompilot-stable` branches or a separate candidate
+worktree. Nothing is ever authored on them, so a local branch only adds a ref that must be hand
+synchronized and that cannot fast-forward. On 2026-08-16 the local copies were found still pointing
+at the original `30a9cdc` candidate—months of drift—which is exactly the wrong tree to reach for
+mid-incident under trap 18.
+
+Track them as remote-tracking refs instead, so a bare `git fetch` always makes them current:
+
+```bash
+git config --add remote.origin.fetch '+refs/heads/custompilot-staging:refs/remotes/origin/custompilot-staging'
+git config --add remote.origin.fetch '+refs/heads/custompilot-stable:refs/remotes/origin/custompilot-stable'
+```
+
+The default clone refspec fetches `master` only, which is why these branches silently went stale.
+When the candidate is needed as browsable files, create a throwaway worktree and delete it after:
+
+```bash
+git worktree add /tmp/cand origin/custompilot-staging
+```
 
 ## Focused references
 
