@@ -50,8 +50,8 @@ index f89edef..af62c31 100644
 -    ltp = sm['lateralTorqueParameters']
 +    ltp, service_valid = _torque_params(sm)
      value = f"{ltp.frictionCoefficientFiltered:.3f}"
--    color = rl.Color(0, 255, 0, 255) if ltp.liveValid else rl.WHITE
-+    # The older lateralTorqueParameters schema has valid instead of liveValid.
+-    color = rl.Color(0, 255, 0, 255) if ltp.valid else rl.WHITE
++    # The liveTorqueParameters schema has liveValid instead of valid.
 +    learned_valid = getattr(ltp, "liveValid", getattr(ltp, "valid", service_valid))
 +    color = rl.Color(0, 255, 0, 255) if learned_valid else rl.WHITE
      return UiElement(value, "FRIC.", self.unit, color)
@@ -64,7 +64,7 @@ index f89edef..af62c31 100644
 -    ltp = sm['lateralTorqueParameters']
 +    ltp, service_valid = _torque_params(sm)
      value = f"{ltp.latAccelFactorFiltered:.3f}"
--    color = rl.Color(0, 255, 0, 255) if ltp.liveValid else rl.WHITE
+-    color = rl.Color(0, 255, 0, 255) if ltp.valid else rl.WHITE
 +    learned_valid = getattr(ltp, "liveValid", getattr(ltp, "valid", service_valid))
 +    color = rl.Color(0, 255, 0, 255) if learned_valid else rl.WHITE
      return UiElement(value, "L.A.F.", self.unit, color)
