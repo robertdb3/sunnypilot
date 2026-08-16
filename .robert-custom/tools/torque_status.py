@@ -100,8 +100,24 @@ def _load(params_dir):
     sys.exit("No LiveTorqueParameters cached yet. Drive once with the car engaged, then re-run.")
 
   with log.Event.from_bytes(torque_raw) as evt:
-    ltp = evt.liveTorqueParameters
+    ltp = None
+    for field in ("liveTorqueParameters", "lateralTorqueParameters"):
+      # A name absent from the schema raises AttributeError; a name that exists but is not the
+      # active union member raises capnp's KjException, which is what a stale cache looks like.
+      try:
+        ltp = getattr(evt, field)
+        break
+      except Exception:
+        continue
+    if ltp is None:
+      sys.exit("Cached LiveTorqueParameters has no readable torque-parameters field. "
+               "The cache may be stale or from a different schema; drive once with the car "
+               "engaged to rewrite it.")
     ltp_dict = ltp.to_dict()
+    # Older staging schemas call the fitted-value validity bit `valid`; newer ones call it
+    # `liveValid`. Normalize it so the report below has one vocabulary.
+    if "liveValid" not in ltp_dict and "valid" in ltp_dict:
+      ltp_dict["liveValid"] = ltp_dict["valid"]
 
   cp = None
   if cp_raw is not None:
