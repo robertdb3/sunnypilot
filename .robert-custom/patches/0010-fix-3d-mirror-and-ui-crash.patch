@@ -1,5 +1,5 @@
 diff --git a/openpilot/selfdrive/ui/sunnypilot/onroad/developer_ui/elements.py b/openpilot/selfdrive/ui/sunnypilot/onroad/developer_ui/elements.py
-index f89edef..af62c31 100644
+index a8ecb5f..c636b2d 100644
 --- a/openpilot/selfdrive/ui/sunnypilot/onroad/developer_ui/elements.py
 +++ b/openpilot/selfdrive/ui/sunnypilot/onroad/developer_ui/elements.py
 @@ -12,6 +12,22 @@ from openpilot.selfdrive.ui.ui_state import ui_state
@@ -15,10 +15,10 @@ index f89edef..af62c31 100644
 +
 +
 +def _torque_params(sm):
-+  """Read torque learning across the liveTorqueParameters rename."""
++  """Read torque learning across the lateralTorqueParameters/liveTorqueParameters rename."""
 +  for service in ("lateralTorqueParameters", "liveTorqueParameters"):
 +    if service in sm.valid:
-+      return sm[service], bool(sm.valid[service])
++      return sm[service]
 +  raise KeyError("no torque-parameter service subscribed")
 +
 +
@@ -43,33 +43,24 @@ index f89edef..af62c31 100644
      lat_active = sm['carControl'].latActive
      steer_override = sm['carState'].steeringPressed
  
-@@ -250,9 +266,11 @@ class FrictionCoefficientElement:
+@@ -250,7 +266,7 @@ class FrictionCoefficientElement:
      if ui_state.enforce_torque_control and ui_state.custom_torque_params and ui_state.torque_override_enabled:
        return UiElement(f"{ui_state.torque_override_friction:.3f}", "FRIC.", self.unit, rl.WHITE)
  
 -    ltp = sm['lateralTorqueParameters']
-+    ltp, service_valid = _torque_params(sm)
++    ltp = _torque_params(sm)
      value = f"{ltp.frictionCoefficientFiltered:.3f}"
--    color = rl.Color(0, 255, 0, 255) if ltp.valid else rl.WHITE
-+    # The liveTorqueParameters schema has liveValid instead of valid.
-+    learned_valid = getattr(ltp, "liveValid", getattr(ltp, "valid", service_valid))
-+    color = rl.Color(0, 255, 0, 255) if learned_valid else rl.WHITE
+     color = rl.Color(0, 255, 0, 255) if ltp.valid else rl.WHITE
      return UiElement(value, "FRIC.", self.unit, color)
- 
- 
-@@ -264,9 +282,10 @@ class LatAccelFactorElement:
+@@ -264,7 +280,7 @@ class LatAccelFactorElement:
      if ui_state.enforce_torque_control and ui_state.custom_torque_params and ui_state.torque_override_enabled:
        return UiElement(f"{ui_state.torque_override_lat_accel_factor:.3f}", "L.A.F.", self.unit, rl.WHITE)
  
 -    ltp = sm['lateralTorqueParameters']
-+    ltp, service_valid = _torque_params(sm)
++    ltp = _torque_params(sm)
      value = f"{ltp.latAccelFactorFiltered:.3f}"
--    color = rl.Color(0, 255, 0, 255) if ltp.valid else rl.WHITE
-+    learned_valid = getattr(ltp, "liveValid", getattr(ltp, "valid", service_valid))
-+    color = rl.Color(0, 255, 0, 255) if learned_valid else rl.WHITE
+     color = rl.Color(0, 255, 0, 255) if ltp.valid else rl.WHITE
      return UiElement(value, "L.A.F.", self.unit, color)
- 
- 
 diff --git a/openpilot/selfdrive/ui/sunnypilot/onroad/scene3d/geometry.py b/openpilot/selfdrive/ui/sunnypilot/onroad/scene3d/geometry.py
 index f05c5e9..a2e7d3f 100644
 --- a/openpilot/selfdrive/ui/sunnypilot/onroad/scene3d/geometry.py
