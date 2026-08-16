@@ -18,14 +18,20 @@ Last verified after a successful drive home with no issues:
 | Hardware | comma 3X / `tizi` |
 | Fork | sunnypilot `staging`, v2026.003.000 family |
 | Device repository | `/data/openpilot` |
-| Device commit after this work | `7038b6f` (`Fix mirrored 3D scene and recover UI crashes`) |
-| Local repair repository | `~/projects/sunnypilot-lat-toggle` |
-| Local repair commit | `cc1d2d2` (`Fix mirrored 3D scene and UI recovery`) |
+| Device commit currently restored | `ce4db02231af6645dd71f7a2dc16839a4247d963` |
+| Public maintenance repository | `https://github.com/robertdb3/sunnypilot` |
+| Local public checkout | `~/projects/custompilot-public-shallow` |
+| Candidate branch | `custompilot-staging` (generated and tested; not the normal install target) |
+| Install branch | `custompilot-stable` (manual, protected promotion only) |
+| Installer URL | `https://install.sunnypilot.ai/fork/robertdb3/custompilot-stable` |
 | Device address during this work | `fe80::20a:f5ff:feaf:4679%en0` (link-local and not permanent) |
-| Final validation | Long drive: ICBM followed changing limits; return drive: no alerts or UI issues; 3D orientation correct |
+| Last rollback validation | Known-good tree restored; `card` and `controlsd` running; public staging/stable driving code matched the restored device tree |
 
-The IP address and git hashes will change after future updates. Identify the device and inspect its
-actual checkout again rather than treating them as universal constants.
+The IP address and git hashes will change after future updates. The comma was also seen at
+`172.20.10.3` on the iPhone hotspot, while IPv6 link-local was the reliable connection. Identify
+the device and inspect its actual checkout again rather than treating either address as permanent.
+Software reinstalls can regenerate the device's SSH host identity, so verify a changed fingerprint
+out of band and refresh the saved host key deliberately; never disable host-key checking globally.
 
 ## The architectural facts that drive every decision
 
@@ -84,6 +90,12 @@ Therefore:
 3. Never copy a whole newer-source file onto the device without comparing it to the installed
    version first.
 4. When UI code spans nearby staging generations, support both service names explicitly.
+
+There is a second prebuilt boundary: runtime Cap'n Proto source and the Python/native objects made
+from it are not automatically one unit on this image. A schema file may load successfully through
+`pycapnp` while a prebuilt dependency still exposes an older generated Python dataclass. Source
+compilation and schema-resolution tests alone therefore do not prove that constructing the actual
+runtime message object will work. Exercise the installed producer/consumer path on the device.
 
 ## What was installed, in order
 
@@ -238,6 +250,72 @@ vertical signs were wrong.
 
 The return drive after this change had no alerts or UI problems.
 
+### 8. SCC tags appeared but did not slow stock EyeSight
+
+**Observed:** SCC-V and SCC-M flashed near curves, but the Subaru's displayed ACC set speed did not
+change and braking was still required.
+
+**Cause:** those tags describe planner candidates. This car has stock longitudinal control, so the
+planner cannot directly command EyeSight acceleration or braking. ICBM is the separate bridge that
+simulates cruise-button presses, and its safe implementation consumes only a valid resolved posted
+speed limit—not SCC-V/SCC-M or the general planner target.
+
+Turning Speed Limit Assist off does not make SCC automatically take over ICBM. Wiring curve targets
+into ICBM is a separate feature requiring validation of target arbitration, button timing, minimum
+speed, rapid target changes, and driver override behavior. It remains unimplemented.
+
+### 9. Subaru cruise-button probe settled coarse versus fine behavior
+
+Parked and controlled on-car probing established that this preglobal Subaru does not use different
+CAN button codes for coarse and fine adjustment:
+
+- both actions use codes `2`/`4` for accel/decel;
+- a short press of roughly 100-150 ms performs the coarse 5 mph snap;
+- a sustained hold performs the 1 mph action;
+- across six trials, the first 1 mph change occurred about 0.806-0.856 seconds into the hold;
+- codes `3`/`5` were never observed.
+
+Therefore a one-frame "fine" code is not a solution. Any future exact-mph ICBM implementation must
+hold the normal button for a bounded duration, yield immediately to physical driver input, and be
+tested against the stock ECU. The desired future setting is a dedicated offroad toggle: default
+OFF preserves 5 mph snapping and the existing 14% speed-limit offset behavior; ON would permit
+exact 1 mph landing. That toggle and bounded-hold behavior are **not installed now**.
+
+### 10. Fine-step rollout crashed `card` and was fully rolled back
+
+**Observed:** immediately after the fine-step update, the parked car produced multiple EyeSight
+faults. The device crash log showed:
+
+```text
+TypeError: IntelligentCruiseButtonManagement.__init__() got an unexpected keyword argument 'fineStepEnabled'
+```
+
+**Cause:** the change added `fineStepEnabled` to the runtime cereal/Cap'n Proto definition, but the
+branch ships a prebuilt `opendbc` Python dataclass without that constructor field. `card` then
+crash-looped while converting `CarControlSP`. The car's EyeSight errors were a downstream symptom
+of losing the comma's car-interface process, not a vehicle hardware failure.
+
+**Why CI missed it:** the checks compiled Python, resolved the runtime schema, and tested source
+logic, but did not instantiate the installed prebuilt dataclass through the real `card` conversion
+path. This is another form of the prebuilt-version trap described above.
+
+**Recovery:** the device was reset to known-good commit
+`ce4db02231af6645dd71f7a2dc16839a4247d963` while retaining branch name
+`custompilot-staging`, then rebooted cleanly. `card` and `controlsd` were verified running. The
+public change was reverted in maintenance PR #7 and the protected stable rollback was promoted in
+PR #8. Excluding each branch's generated `CUSTOM_FORK_MANIFEST.json`, both published branches were
+verified to contain the same driving code as the restored device.
+
+**Important rollback lesson:** at the moment of failure, switching from staging to stable would
+not have helped because the broken tree had already been promoted to both. Compare tree contents,
+not branch names, before choosing a rollback target. Keep a known-good commit available even when
+the branch pipeline looks healthy.
+
+Do not reintroduce the fine-step feature by adding a field to this prebuilt structure. A future
+design must avoid that schema/dataclass boundary (for example, a carefully validated setting read
+inside the Subaru ICBM implementation) and must include an installed-device smoke test that starts
+and observes `card` before promotion.
+
 ## The reboot/recovery lesson
 
 During the final recovery, the UI process had crashed and the installed manager did not
@@ -286,6 +364,10 @@ again. ACC availability follows the same factory main state.
 Expected behavior: it changes the stock set speed only while the system is enabled and ready. It
 does nothing on an invalid/missing limit or during driver button input. SCC-V/SCC-M tags do not
 become stock button targets.
+
+Current behavior uses the stock short/coarse 5 mph action. There is no working fine-step toggle in
+the known-good build; the attempted implementation was reverted after the `card` crash described
+above.
 
 ### Torque Self-Tune
 
@@ -362,6 +444,13 @@ cd /data/openpilot && git status --short && git log -1 --oneline
 SSH being online proves only that AGNOS and networking booted. It does not prove manager,
 camerad, UI, or controls started.
 
+For any change that touches `CarControlSP`, `CarStateSP`, cereal, opendbc structures, or ICBM,
+explicitly confirm that both `openpilot.selfdrive.car.card` and
+`openpilot.selfdrive.controls.controlsd` remain alive for several cycles. Inspect new files in
+`/data/community/crashes`; dashboard EyeSight faults plus a missing/crash-looping `card` process is
+an immediate rollback condition. After restoring healthy software, a full ignition-off pause and
+restart may be needed for vehicle-side EyeSight faults to clear.
+
 The clock may initially be wrong, producing temporary certificate errors and cached model/Prime
 fallbacks. Confirm `date -u` becomes correct and that the errors stop before diagnosing this as a
 software regression.
@@ -427,6 +516,14 @@ different times to communication rate and driving-model lag—two different prob
     dispatch **Validate custom fork** on `custompilot-staging` and wait for its `validate` job.
     Once staging has been promoted and is an ancestor of stable, treat matching provenance as
     unchanged; requiring its parent to equal the new stable merge commit would create daily churn.
+17. **Do not add fields to prebuilt cereal/opendbc Python structures without an installed-runtime
+    construction test.** A `.capnp` file resolving does not update an already-built dataclass.
+    Exercise the exact `card` conversion path and verify the process stays alive.
+18. **Do not assume stable is a rollback merely because of its name.** Confirm its tree predates or
+    excludes the regression. During the fine-step incident, staging and stable initially contained
+    the same broken code.
+19. **Do not infer fine/coarse behavior from button enum names.** On this Subaru, duration—not a
+    separate button code—selects 5 mph versus 1 mph behavior.
 
 ## What remains deliberately unresolved
 
@@ -436,6 +533,10 @@ different times to communication rate and driving-model lag—two different prob
   highway sample. No guessed factor should be installed.
 - **Final torque coefficients:** Self-Tune needs varied, engaged driving to fill its buckets. The
   current offline values are a sane learning anchor.
+- **ICBM exact 1 mph landing:** the physical behavior is measured, but the first implementation was
+  reverted. Redesign it without a prebuilt schema/dataclass change and add a real `card` smoke test.
+- **SCC-V/SCC-M through stock EyeSight:** not wired into ICBM. Displayed curve targets alone cannot
+  command longitudinal control on this stock-longitudinal platform.
 - **Automatic UI crash restart:** not available in this manager generation. The known schema crash
   was prevented at its source instead. Revisit only after a branch update that supports the API.
 - **Driving-model lag:** the redundant UI work was reduced and the subsequent drive was clean, but
@@ -456,6 +557,30 @@ Never blindly reapply all patches to a new sunnypilot release.
 
 The device checkout, exported patches, and this runbook should agree. If they do not, stop and
 reconstruct the actual device diff before driving.
+
+## Public update pipeline and installation
+
+The public repository is maintained so normal updates do not require repeatedly editing the comma
+over SSH:
+
+1. The scheduled/manual candidate workflow checks the latest installable sunnypilot staging base.
+2. It reapplies the tracked customization stack and runs compliance, focused tests, and provenance
+   checks.
+3. A passing result updates `custompilot-staging` only.
+4. Review and a protected promotion PR are required before anything reaches
+   `custompilot-stable`.
+5. The comma installs from
+   `https://install.sunnypilot.ai/fork/robertdb3/custompilot-stable`.
+
+The branch called staging is a candidate, not a promise of safety; stable is the intended install
+target, but its contents must still be checked during incident rollback. The installer/updater may
+show a newer commit whose only difference is generated manifest/provenance. Compare source trees
+excluding `CUSTOM_FORK_MANIFEST.json` when determining whether driving code actually changed.
+
+A branch switch or reinstall is not required merely to point an already-correct checkout at a
+branch, but using the URL is the clean supported way to establish the updater-managed install.
+Perform installs offroad, expect commit IDs and possibly the SSH host key to change, and re-run the
+full process checks before driving.
 
 ## Focused references
 
