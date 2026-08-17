@@ -27,13 +27,26 @@ Last verified after a successful drive home with no issues:
 | Device address during this work | `fe80::20a:f5ff:feaf:4679%en0` (link-local and not permanent) |
 | Last rollback validation | Known-good tree restored; `card` and `controlsd` running; public staging/stable driving code matched the restored device tree |
 
-Published branch state as of 2026-08-16, recorded because the candidate has moved ahead of both
+Published branch state as of 2026-08-17, recorded because the candidate has moved ahead of both
 stable and the device:
 
 | Branch | Commit | Upstream base | Relationship to the device |
 |---|---|---|---|
 | `custompilot-stable` | `08e9e98` | `30a9cdc` | Install target; driving code matched the restored device tree |
-| `custompilot-staging` | `0a641d2` | `5b4820d` | Candidate only. **Never installed or driven.** Not promoted |
+| `custompilot-staging` | `3083a0e` | `37d6dc5` | Candidate only. **Never installed or driven.** Not promoted |
+
+This table goes stale every time the daily build publishes. Re-derive it rather than trusting it,
+and note that the candidate's parent is the *stable tip*, not the previous candidate (trap 15), so
+successive candidates are siblings:
+
+```bash
+git fetch
+git rev-parse --short origin/custompilot-staging origin/custompilot-staging^ origin/custompilot-stable
+git show origin/custompilot-staging:CUSTOM_FORK_MANIFEST.json | python3 -c 'import json,sys; print(json.load(sys.stdin)["upstream"]["commit"][:12])'
+```
+
+A bare `git fetch` is correct here **only** if the two extra refspecs are configured; otherwise see
+trap 22 before believing the output.
 
 The candidate carries an upstream jump the device has never run—not just the local customization
 changes. Confirm the actual delta before promoting rather than assuming it is limited to your own
@@ -437,6 +450,23 @@ staging branch, not a sign something is wrong. What changes is the *response*: s
 patch rewrite, symptom 12 needed a deletion. Ask which before touching the hunks—rewriting a patch
 upstream has already made redundant carries the redundancy forward indefinitely.
 
+**Outcome:** maintenance PR #14 merged as `46f259c`; the `push`-to-`master` trigger rebuilt the
+candidate green and force-published `custompilot-staging` `0a641d2` → `3083a0e` on upstream base
+`37d6dc5`. Note that dispatching the workflow on the PR branch would *not* have tested the fix—it
+pins `ref: master` on checkout (trap 25), so merging was the only way to exercise it in CI.
+
+**Two process failures worth more than the patch itself:**
+
+1. The guard test asserted `0007`'s implementation rather than the behavior, so it failed against
+   upstream's *correct* fix and would have blocked the removal. See trap 24.
+2. Verifying the published tip, a hand-written fetch refspec missing its `+` was refused as
+   non-fast-forward, leaving the stale `0a641d2` in place and nearly producing a confidently wrong
+   report. See trap 22.
+
+Both were caught only by checking a second, independent source—running the test against known-bad
+code, and reading the `Publish candidate branch` push line in the run log. Neither would have been
+caught by looking harder at the thing itself.
+
 ## The reboot/recovery lesson
 
 During the final recovery, the UI process had crashed and the installed manager did not
@@ -656,15 +686,50 @@ different times to communication rate and driving-model lag—two different prob
     stack is checked against two moving authorities: `/data/openpilot` for installed device APIs and
     `upstream/staging` for patch applicability. Green against one proves nothing about the other, and
     upstream can move on any day the schedule fires.
-22. **Do not trust a local `custompilot-*` ref without fetching first.** The default refspec fetches
-    `master` only, and candidate commits are force-published siblings rather than a chain, so a local
-    copy can sit arbitrarily far behind while looking like a valid branch. Compare
-    `origin/custompilot-stable` against `origin/custompilot-staging` after an explicit fetch, never a
-    stale local ref.
+22. **Do not trust a local `custompilot-*` ref without fetching first, and do not assume the fetch
+    worked.** The default refspec fetches `master` only, and candidate commits are force-published
+    siblings rather than a chain, so a local copy can sit arbitrarily far behind while looking like a
+    valid branch. Compare `origin/custompilot-stable` against `origin/custompilot-staging` after an
+    explicit fetch, never a stale local ref.
+
+    The second half of this trap was hit on 2026-08-17. A **hand-written refspec missing the leading
+    `+`** cannot fast-forward a force-published candidate, so the update is refused and the
+    remote-tracking ref keeps its old value—after which `git rev-parse` reports the stale tip with no
+    hint anything went wrong. Measured behavior:
+
+    | invocation | stderr | exit | ref updated |
+    |---|---|---|---|
+    | `git fetch origin 'refs/heads/…:refs/remotes/origin/…'` | `! [rejected] … (non-fast-forward)` | **1** | no |
+    | same, plus `-q` | *(nothing)* | **1** | no |
+    | same, refspec prefixed `+` | normal | 0 | yes |
+
+    So the failure is loud in the **exit code** and only ever silent in the **output**. What turns it
+    into a wrong answer is the combination: `-q` hides the rejection, then chaining the next command
+    with `;` (or piping the fetch through `tail`) discards the non-zero status. Use the configured
+    refspecs from "Keep the pipeline branches as remote-tracking refs only" so a bare `git fetch`
+    does the right thing; if you must write one inline, include the `+` and let the fetch fail the
+    command. Then confirm the tip against an independent source—the `Publish candidate branch` step
+    of the run log prints the exact `old...new` it pushed—rather than trusting a single `rev-parse`.
 23. **Do not assume a green candidate build means only your patches changed.** The build tracks the
     latest upstream staging tip, so a passing run can carry an upstream jump alongside the
     customization stack. Diff stable against staging, excluding the generated manifest, before
     promoting.
+24. **Do not let a guard test assert your patch's implementation instead of the property it
+    protects.** `test_non_action_path_computes_should_stop` asserted "at least two `should_stop`
+    assignments," which was true only because patch `0007` duplicated the line into both branches.
+    When upstream fixed the same bug correctly—one assignment, hoisted out of the conditional—the
+    test failed against *better* code and would have blocked the patch's removal. A test written this
+    way inverts its own purpose: it stops protecting the behavior and starts protecting the
+    workaround. Assert the property (the flag is assigned on every path and reaches `shouldStop`),
+    then prove the test still fails against the known-bad source so it has not become a tautology.
+25. **Do not assume a maintenance PR into `master` is tested by anything.** `update-candidate.yml`
+    pins `ref: master` on checkout, so dispatching it against a PR branch rebuilds from `master` and
+    tells you nothing about the PR. `validate-custom-fork.yml` triggers only on PRs into
+    `custompilot-stable`, and it too pins assets to `master`. Nothing in the repository validates a
+    change to `.robert-custom/` before it lands. Reproduce locally by running the real
+    `apply_candidate.sh` and `validate_candidate.sh` against a worktree at the current upstream tip,
+    from a tracked-only export of the assets (`git archive`), so untracked scratch directories such
+    as `.robert-custom/sunnypilot/` cannot leak in and change the result.
 
 ## What remains deliberately unresolved
 
@@ -682,11 +747,18 @@ different times to communication rate and driving-model lag—two different prob
   was prevented at its source instead. Revisit only after a branch update that supports the API.
 - **Driving-model lag:** the redundant UI work was reduced and the subsequent drive was clean, but
   any future occurrence must still be treated as a real disengagement and analyzed from its route.
-- **Promotion of the `5b4820d` candidate:** built, green, and unpromoted as of 2026-08-16. It
-  carries an upstream jump the device has never run plus the trimmed `0010`, so it needs an offroad
-  install, `card`/`controlsd` alive across several cycles, a check of `/data/community/crashes`, and
-  the developer UI panel exercised specifically—that panel is what `0010` touches and what crashed
-  in symptom 7.
+- **Promotion of the `37d6dc5` candidate (`3083a0e`):** built, green, and unpromoted as of
+  2026-08-17; it supersedes the `5b4820d` candidate, which was never promoted either. Measured
+  delta against stable, excluding the manifest: **600 files, ~70k insertions**—and essentially all
+  of it is upstream, not customization. That includes **new driving model weights**
+  (`driving_tinygrad.pkl.chunk02`, 26 MB → 37 MB), a new dmonitoring model, a rewritten
+  `compile_modeld.py`, and USBGPU handling moved to `selfdrive/modeld/helpers`. The device is still
+  at `ce4db02`, so promoting means a new driving model *and* two upstream generations at once.
+  Beyond the standard offroad install, `card`/`controlsd` alive across several cycles, and a check
+  of `/data/community/crashes`, this one also needs the developer UI panel exercised specifically
+  (that panel is what `0010` touches and what crashed in symptom 7) and the model change validated
+  on its own terms—`check_live_service_rates.py` for `modelV2`, and alert-free driving before it is
+  trusted. Do not treat it as a routine customization refresh.
 
 ## Updating or rebasing later
 
