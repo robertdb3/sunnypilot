@@ -33,7 +33,8 @@ as current so the daily updater does not create provenance-only churn.
 1. Fetches `sunnypilot/sunnypilot:staging`.
 2. Requires the upstream `prebuilt` marker used by installable comma 3X snapshots.
 3. Applies patches `0001` through `0006`, the narrow prebuilt Params compatibility port, then
-   patches `0007` through `0010`.
+   patches `0008` through `0010`. (`0007` was retired once upstream fixed the same defect; see
+   symptom 12 in the runbook.)
 4. Rejects patch conflicts and whitespace errors.
 5. Rejects changes to driver monitoring, excessive-actuation checks, `opendbc/safety/`, panda,
    AGNOS, upstream license files, or stock cereal schemas.

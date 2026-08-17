@@ -127,7 +127,7 @@ The patch order matters because later patches harden or correct earlier behavior
 | `0005` | Outback-specific torque anchor | Stops this heavier Outback from inheriting the Impreza's `1.067` lateral-acceleration factor; uses `2.0 / 0.2` as the learning anchor. |
 | `0006` | Virginia reckless-speed watch | Adds geofenced absolute and 20-over reminders, plus visual border and calibration tooling. |
 | prebuilt compatibility port | Register custom setting metadata without rebuilding unavailable native code | Keeps map/scene/watch settings usable across manager transitions on this prebuilt snapshot. |
-| `0007` | Fix tinygrad acceleration contract | Corrects a scalar/tuple mismatch that broke model output and produced `posenet speed invalid` / `nan m/s`. |
+| ~~`0007`~~ | ~~Fix tinygrad acceleration contract~~ | **Retired 2026-08-17.** Corrected a scalar/tuple mismatch that broke model output and produced `posenet speed invalid` / `nan m/s`. Upstream fixed the same defect in `37d6dc5`, more completely; see symptom 12. |
 | `0008` | Fail-closed ICBM and main-button arbitration | Prevents ICBM from following the 90 mph planner fallback and preserves a physical driver main press over the cancel it causes. |
 | `0009` | Move `radard` and `plannerd` to CPU 6 | Isolates the planning chain from the custom UI load that saturated CPU 5 and caused low communication-rate alerts. |
 | `0010` | Fix the mirrored 3D frame and developer UI crashes | Corrects Forward/Right/Down model coordinates, tolerates both cereal *service* names, and avoids redundant model-array conversions. Trimmed on 2026-08-16: the `liveValid` field fallback was removed once upstream fixed that read at the source (symptom 11). |
@@ -153,6 +153,15 @@ On 2026-08-16 the same audit was repeated against the newer upstream base `5b482
 described in symptom 11. Patches `0001` through `0006`, the `staging-30a9cdc` port, and `0007`
 through `0010` again applied in order against a fresh clone, once patch `0010` was corrected. Re-run
 this audit against the exact upstream tip whenever the candidate build fails to apply.
+
+On 2026-08-17 the audit was repeated against upstream `37d6dc5` after the drift described in
+symptom 12, this time with `0007` **removed**: `0001` through `0006`, the `staging-30a9cdc` port,
+then `0008` through `0010` all applied in order against a fresh worktree, and `git diff --check` was
+clean. The stack now touches 36 source files—one fewer than the 2026-08-15 count, because
+`modeld.py` was `0007`'s only file and no other patch touches it. Note that the audit is only as
+current as its named
+base—upstream moved on two consecutive days here, so a green audit dated yesterday proves nothing
+about today (trap 21).
 
 Every intentional source difference in the local patched checkout is represented by at least one
 tracked patch. The only unmatched local files were generated `__pycache__/*.pyc` bytecode, which
@@ -202,6 +211,10 @@ speed estimates became NaN.
 
 **Resolution:** patch `0007` restores the scalar contract expected by this snapshot. This was a
 model pipeline defect, not a wheel-speed calibration problem.
+
+**Since retired:** upstream fixed this itself in `37d6dc5` and the patch was dropped on 2026-08-17.
+The device tree at `ce4db02` still predates that fix, so this history stays relevant to any rollback
+target older than `37d6dc5`. See symptom 12.
 
 ### 4. ICBM attempted to raise the set speed toward 90 mph
 
@@ -378,6 +391,51 @@ separate concern and has not been reassessed.
 *which kind* of drift. A patch whose context breaks because upstream fixed the same bug is telling
 you something different from one that breaks because upstream moved code around—the first means part
 of your stack may be deletable.
+
+### 12. The same drift, one day later—and this time the patch was deletable
+
+**Observed:** on 2026-08-17 the scheduled **Build staging candidate** run failed after about three
+minutes, one day after symptom 11. Again nothing on the device or in the customization had changed.
+
+```text
+error: patch failed: openpilot/sunnypilot/modeld_v2/modeld.py:278
+error: openpilot/sunnypilot/modeld_v2/modeld.py: patch does not apply
+```
+
+**Cause:** upstream advanced from `5b4820d` to `37d6dc5` (v2026.003.000, cut 04:26Z the same
+morning) and fixed the accel-contract bug itself. `get_accel_from_plan` has returned a bare scalar
+throughout; only the caller was wrong:
+
+| | caller in the `if 'action' not in …` branch | where `should_stop` comes from |
+|---|---|---|
+| `5b4820d` | `desired_accel, should_stop = …` (**broken unpack**) | set only in the `else` branch |
+| `0007` applied | `desired_accel = …` | duplicated into the `if` branch |
+| `37d6dc5` | `desired_accel = …` | hoisted out of the conditional, covers **both** branches |
+
+Upstream's fix is a superset of the patch: `0007` repaired only the `if` branch, while upstream
+computes `stop = v_ego < 0.3 and desired_accel < 0.1` once, after both branches. Behavior on this
+car is identical.
+
+**Resolution:** patch `0007` was **deleted**, not rewritten, and dropped from the `apply_candidate.sh`
+loop. This is the outcome symptom 11 predicted—the first time the "deletable" branch of that lesson
+actually fired. Verified by applying `0001`–`0006`, the port, then `0008`–`0010` in order against a
+fresh worktree at `37d6dc5`: all applied, `git diff --check` clean. Of the 36 files the stack
+touches, upstream moved only two—`modeld.py` (this failure) and `params_keys.h` (three new
+`ModelManager_*` keys, no collision with `Scene3D` / `RecklessWatch`).
+
+**The part that matters more than the build failure:** this candidate carries a far larger upstream
+jump than the last one—**597 files, ~70k insertions** in one squashed snapshot, including **new
+driving model weights** (`driving_tinygrad.pkl.chunk02`, 26 MB → 37 MB), a new dmonitoring model, a
+rewritten `compile_modeld.py`, and USBGPU handling moved out to `selfdrive/modeld/helpers`. Trap 23
+applies with force: a green build here is not a small delta. Promoting it would put a new driving
+model and an unrun upstream jump on the car in one step, on top of a device still sitting at
+`ce4db02`. Validate the model change on its own terms rather than treating this as a routine
+customization refresh.
+
+**Lesson:** two consecutive days of drift on a daily schedule is normal for a fork tracking a
+staging branch, not a sign something is wrong. What changes is the *response*: symptom 11 needed a
+patch rewrite, symptom 12 needed a deletion. Ask which before touching the hunks—rewriting a patch
+upstream has already made redundant carries the redundancy forward indefinitely.
 
 ## The reboot/recovery lesson
 
