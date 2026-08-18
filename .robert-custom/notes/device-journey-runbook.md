@@ -906,7 +906,10 @@ different times to communication rate and driving-model lag—two different prob
     `_DynamicListReader`—which indexes but does not slice. Symptom 10 was the same shape with a
     prebuilt dataclass. If a change reads a cereal message, one test must construct a real reader
     (or a stub that refuses the operations capnp refuses), or the change is unvalidated no matter
-    how green the suite is.
+    how green the suite is. `tests/test_device_real_modelv2.py` is where that obligation is
+    discharged: it runs against a real `modelV2` from a stored route and skips everywhere else, so
+    CI stays green while the check itself only ever happens on the comma. Run it there after any
+    patch that reads a cereal message.
 31. **Do not reason about what can reach the car from the pipeline's design.** The protected-
     promotion model is real, and it did not apply: this device tracks `custompilot-staging`, so
     candidates install without review. Check the device's actual branch (`git -C /data/openpilot

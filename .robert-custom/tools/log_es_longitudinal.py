@@ -28,8 +28,12 @@ Panda marks ES_Distance and ES_LKAS `check_relay`, so the camera's copies are st
 openpilot's replace them. ES_Brake and ES_Status are *not* in the preglobal TX list, so they are
 forwarded from the camera untouched. Therefore:
 
-  * bus 2 (camera) = what EyeSight *wants* -- ground truth for the command scaling
-  * bus 0 (main)   = what actually reaches the car
+  * bus 2   (camera)  = what EyeSight *wants* -- ground truth for the command scaling
+  * bus 128 (TX echo) = what was actually placed on the main bus, forwarded or openpilot-generated
+
+Bus 128 is 0 | 0x80: the panda reports frames it transmitted with the echo flag set. Bus 0 itself
+carries nothing on the `can` service, so parsing it returns zeros forever -- which mimics a clean
+comparison whenever the real signal is also zero.
 
 For ES_Brake the two should agree (pure forward). For ES_Distance they will differ in Cruise_Button
 whenever ICBM or a driver press is active. A disagreement anywhere else is worth understanding
@@ -81,7 +85,11 @@ GLOBAL_CONSTANTS = {
 }
 
 CAM_BUS = 2
-MAIN_BUS = 0
+# NOT bus 0. Frames openpilot/panda put onto the main bus are reported back on the `can` service
+# with the TX-echo flag set, i.e. src = 0 | 0x80 = 128; bus 0 itself carries nothing in `can`.
+# Parsing bus 0 silently yields all-zero values forever, which looks like a clean comparison
+# precisely when the real signal is also zero -- verified on route 0000000b--12b500b38a.
+MAIN_TX_ECHO_BUS = 128
 
 
 def segment_key(path: str):
@@ -102,7 +110,7 @@ def build_parsers(fingerprint: str):
 
   dbc = DBC[fingerprint][Bus.pt]
   # Empty message list parses everything in the DBC, matching carstate.get_can_parsers().
-  return dbc, CANParser(dbc, [], CAM_BUS), CANParser(dbc, [], MAIN_BUS)
+  return dbc, CANParser(dbc, [], CAM_BUS), CANParser(dbc, [], MAIN_TX_ECHO_BUS)
 
 
 def read_row(cp_cam, cp_main, state: dict) -> dict:
@@ -116,11 +124,11 @@ def read_row(cp_cam, cp_main, state: dict) -> dict:
   for sig in ES_STATUS_SIGNALS:
     row[f"cam_status_{sig}"] = cp_cam.vl["ES_Status"][sig]
 
-  # Only the signals whose bus-0 value is genuinely informative: brake should be a pure forward,
+  # Only the signals whose TX-echo value is genuinely informative: brake should be a pure forward,
   # throttle should be a verbatim copy, button is where openpilot legitimately differs.
-  row["main_brake_Brake_Pressure"] = cp_main.vl["ES_Brake"]["Brake_Pressure"]
-  row["main_dist_Cruise_Throttle"] = cp_main.vl["ES_Distance"]["Cruise_Throttle"]
-  row["main_dist_Cruise_Button"] = cp_main.vl["ES_Distance"]["Cruise_Button"]
+  row["tx_brake_Brake_Pressure"] = cp_main.vl["ES_Brake"]["Brake_Pressure"]
+  row["tx_dist_Cruise_Throttle"] = cp_main.vl["ES_Distance"]["Cruise_Throttle"]
+  row["tx_dist_Cruise_Button"] = cp_main.vl["ES_Distance"]["Cruise_Button"]
 
   for k in ("v_ego", "a_ego", "standstill", "cruise_enabled", "cruise_speed", "brake_pressed", "gas_pressed"):
     row[k] = state.get(k, "")
@@ -322,17 +330,22 @@ def analyse(rows: list[dict]) -> None:
 
   # Forwarding sanity: ES_Brake should be identical on both buses today.
   mismatch = [r for r in rows
-              if float(r["cam_brake_Brake_Pressure"] or 0) != float(r["main_brake_Brake_Pressure"] or 0)]
-  print(f"\nES_Brake bus2 vs bus0 mismatches: {len(mismatch)} / {len(rows)}")
+              if float(r["cam_brake_Brake_Pressure"] or 0) != float(r["tx_brake_Brake_Pressure"] or 0)]
+  print(f"\nES_Brake camera vs TX-echo mismatches: {len(mismatch)} / {len(rows)}")
   if mismatch:
-    print("  Unexpected -- ES_Brake is not in the preglobal TX list, so it should be a pure forward.\n"
-          "  Understand this before trusting any of the above.")
+    print("  Unexpected -- ES_Brake is not in the preglobal TX list, so the panda forwards it in\n"
+          "  hardware and the echo should be bit-identical. Measured 0/6379 on route 0000000b.\n"
+          "  Understand any nonzero count before trusting the numbers above.")
 
   thr_mismatch = [r for r in rows
-                  if float(r["cam_dist_Cruise_Throttle"] or 0) != float(r["main_dist_Cruise_Throttle"] or 0)]
-  print(f"ES_Distance Cruise_Throttle bus2 vs bus0 mismatches: {len(thr_mismatch)} / {len(rows)}")
-  print("  openpilot rebuilds ES_Distance and copies Cruise_Throttle verbatim, so 0 is expected.\n"
-        "  Non-zero would mean the copy is lossy -- which would matter a great deal.")
+                  if float(r["cam_dist_Cruise_Throttle"] or 0) != float(r["tx_dist_Cruise_Throttle"] or 0)]
+  print(f"ES_Distance Cruise_Throttle camera vs TX-echo mismatches: {len(thr_mismatch)} / {len(rows)}")
+  print("  A high rate here is EXPECTED and is not corruption. openpilot rebuilds ES_Distance only\n"
+        "  every 5th frame (carcontroller: `if self.frame % 5 == 0`) from the latest camera snapshot,\n"
+        "  so its copy trails by up to 5 frames while Cruise_Throttle is moving. Measured on route\n"
+        "  0000000b at full rate: 39% instantaneous mismatch, of which 99.8% match a camera value\n"
+        "  within +/-5 frames and none were zero. What would be alarming is a mismatch that does NOT\n"
+        "  resolve to a recent camera value -- that would mean the rebuild is lossy.")
 
 
 def main() -> int:
