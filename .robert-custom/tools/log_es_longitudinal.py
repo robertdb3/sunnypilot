@@ -184,6 +184,7 @@ def collect_route(route_glob: str, decimate: int) -> list[dict]:
         if len(pending) >= 16:
           flush()
         if n_can % decimate == 0:
+          flush()  # must precede the sample, or the row reflects parser state up to 15 events stale
           try:
             rows.append(read_row(cp_cam, cp_main, state))
           except KeyError as e:
@@ -201,8 +202,15 @@ def collect_live(seconds: float, decimate: int) -> list[dict]:
   sm = messaging.SubMaster(["carState", "carParams"])
   can_sock = messaging.sub_sock("can", conflate=False, timeout=100)
 
-  print("waiting for carParams ...")
+  # carParams is published by `card`, which is only_onroad -- offroad this never arrives, so bound
+  # the wait rather than hanging forever on a parked car with the ignition off.
+  print("waiting for carParams (needs ignition on) ...")
+  deadline = time.monotonic() + 15.0
   while not sm.updated["carParams"]:
+    if time.monotonic() > deadline:
+      print("no carParams after 15s. `card` only runs onroad, so turn the ignition on -- or use\n"
+            "--route-glob to analyse a drive that already happened.", file=sys.stderr)
+      return []
     sm.update(100)
   fingerprint = sm["carParams"].carFingerprint
   print(f"carFingerprint: {fingerprint}")
@@ -215,6 +223,7 @@ def collect_live(seconds: float, decimate: int) -> list[dict]:
   state: dict = {}
   start = time.monotonic()
   n = 0
+  next_sample = decimate
   while time.monotonic() - start < seconds:
     sm.update(0)
     if sm.updated["carState"]:
@@ -223,14 +232,19 @@ def collect_live(seconds: float, decimate: int) -> list[dict]:
                    cruise_enabled=int(cs.cruiseState.enabled), cruise_speed=round(cs.cruiseState.speed, 3),
                    brake_pressed=int(cs.brakePressed), gas_pressed=int(cs.gasPressed))
 
-    can_strs = messaging.drain_sock_raw(can_sock)
+    # wait_for_one blocks on the socket (100 ms timeout) instead of spinning. This matters: the tool
+    # is meant to run while driving, and symptom 6 was a takeover caused by CPU saturation. A busy
+    # loop here would be the same class of mistake the runbook already paid for once.
+    can_strs = messaging.drain_sock_raw(can_sock, wait_for_one=True)
     if can_strs:
       packets = can_capnp_to_list(can_strs)
       cp_cam.update(packets)
       cp_main.update(packets)
-      n += 1
+      # count CAN events, not drain batches, so --decimate means the same thing in both modes
+      n += len(packets)
       state["t"] = time.monotonic() - start
-      if n % decimate == 0:
+      if n >= next_sample:
+        next_sample = n + decimate
         try:
           rows.append(read_row(cp_cam, cp_main, state))
         except KeyError as e:
@@ -238,9 +252,15 @@ def collect_live(seconds: float, decimate: int) -> list[dict]:
           return rows
         if len(rows) % 40 == 0:
           r = rows[-1]
-          print(f"  t={r['t']:6.1f}  v={r['v_ego']:5.1f}  a={r['a_ego']:6.2f}  "
-                f"thr={r['cam_dist_Cruise_Throttle']:6.0f}  rpm={r['cam_status_Cruise_RPM']:6.0f}  "
-                f"brk={r['cam_brake_Brake_Pressure']:5.0f}  act={r['cam_brake_Cruise_Brake_Active']:.0f}")
+          # carState fields are "" until the first carState arrives -- and stay "" for the whole run
+          # if `card` is dead, which is precisely when this tool is most worth running (symptom 10).
+          # Formatting a str with %f raises, so coerce.
+          def num(key, default=float("nan")):
+            v = r.get(key, "")
+            return float(v) if v != "" else default
+          print(f"  t={num('t', 0.0):6.1f}  v={num('v_ego'):5.1f}  a={num('a_ego'):6.2f}  "
+                f"thr={num('cam_dist_Cruise_Throttle'):6.0f}  rpm={num('cam_status_Cruise_RPM'):6.0f}  "
+                f"brk={num('cam_brake_Brake_Pressure'):5.0f}  act={num('cam_brake_Cruise_Brake_Active'):.0f}")
   return rows
 
 

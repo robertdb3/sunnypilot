@@ -58,10 +58,11 @@ code runs on your car today. Then the preglobal branch at line 97 sends only:
 can_sends.append(subarucan.create_preglobal_es_distance(self.packer, cruise_button, CS.es_distance_msg))
 ```
 
-`create_preglobal_es_distance` copies every signal verbatim from the camera's message and overrides
-exactly one: `Cruise_Button`. The computed longitudinal values are discarded. The global branch
-below (lines 102-117) passes them to `create_es_status` and `create_es_brake`. **The plumbing is
-already there and already runs; preglobal simply has nothing consuming it.**
+`create_preglobal_es_distance` copies every signal verbatim from the camera's message, overrides
+`Cruise_Button`, and recomputes the checksum. `Cruise_Throttle` is passed straight through, so the
+computed longitudinal values are simply discarded. The global branch below (lines 102-117) hands
+them to `create_es_status` and `create_es_brake`. **The plumbing is already there and already runs;
+preglobal just has nothing consuming it.**
 
 **(c) Panda would reject the transmission.** `opendbc/safety/modes/subaru_preglobal.h` permits only
 two TX messages:
@@ -100,6 +101,15 @@ while it is genuinely driving the car; on **bus 0** you see what arrives. That i
 the scaling, obtainable with zero risk, and it is what
 [`tools/log_es_longitudinal.py`](../tools/log_es_longitudinal.py) captures.
 
+### A note on where the DBC comes from
+
+No `*_generated.dbc` is committed — `opendbc/dbc/*_generated.dbc` is gitignored, and the prebuilt
+device skips the build step entirely (`launch_chffrplus.sh:91`). The files are nonetheless
+unnecessary: `opendbc/can/dbc.py` resolves a name through `get_generated_dbcs()`, which lazily
+builds every generated DBC **in memory** on first use. So `CANParser("subaru_outback_2019_generated",
+...)` works on the device with no file on disk. This is why the probe tool can construct parsers by
+exactly the same route `carstate.py` does, and one more reason it only runs on the device.
+
 ## 4. What a real implementation would require
 
 Not a sketch — this is the actual checklist, in dependency order.
@@ -137,9 +147,11 @@ Not a sketch — this is the actual checklist, in dependency order.
 | `BRAKE_MIN` / `BRAKE_MAX` | 0 / 600 | "about -3.5 m/s² from testing" |
 
 Whether any of these transfer to preglobal is **unmeasured**. `Cruise_Throttle` is 12-bit on both
-platforms, which is suggestive, but `Brake_Pressure` is 16-bit here and the DBC's stated range
-(`[0|255]`) disagrees with its own bit width — so at least one of those two facts is wrong, and
-nobody should guess which.
+platforms, which is suggestive. `Brake_Pressure` is less reassuring: preglobal declares it 16-bit
+with a stated range of `[0|255]`, while global declares the same signal 16-bit with `[0|65535]`.
+DBC min/max are advisory metadata — the parser does not clamp to them — so this is not a functional
+contradiction, but it does mean preglobal's stated maximum is almost certainly an unverified
+placeholder from whoever reverse-engineered the message. The usable range is genuinely unknown.
 
 Adopting global's numbers unverified would be the same mistake as symptom 14, one tier more
 dangerous: there, an untested assumption crashed the UI; here it would command the brakes.
