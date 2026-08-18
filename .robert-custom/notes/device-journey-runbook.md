@@ -18,11 +18,13 @@ Last verified after a successful drive home with no issues:
 | Hardware | comma 3X / `tizi` |
 | Fork | sunnypilot `staging`, v2026.003.000 family |
 | Device repository | `/data/openpilot` |
-| Device commit currently restored | `ce4db02231af6645dd71f7a2dc16839a4247d963` |
+| **Device commit currently installed** | `3d67803` — **not known-good.** Installed 2026-08-18; UI crash-loops with Scene3D on (symptom 14). Safe only with `Scene3D=0` |
+| Known-good rollback target | `ce4db02231af6645dd71f7a2dc16839a4247d963` |
 | Public maintenance repository | `https://github.com/robertdb3/sunnypilot` |
 | Local public checkout | `~/projects/custompilot-public-shallow` |
 | Candidate branch | `custompilot-staging` (generated and tested; not the normal install target) |
-| Install branch | `custompilot-stable` (manual, protected promotion only) |
+| Install branch *by design* | `custompilot-stable` (manual, protected promotion only) |
+| **Branch the device actually tracks** | `custompilot-staging` — since the symptom-10 recovery. Candidates reach this car **without** promotion review. Verify before relying on the protected-promotion model |
 | Installer URL | `https://install.sunnypilot.ai/fork/robertdb3/custompilot-stable` |
 | Device address during this work | `fe80::20a:f5ff:feaf:4679%en0` (link-local and not permanent) |
 | Last rollback validation | Known-good tree restored; `card` and `controlsd` running; public staging/stable driving code matched the restored device tree |
@@ -33,7 +35,7 @@ stable and the device:
 | Branch | Commit | Upstream base | Relationship to the device |
 |---|---|---|---|
 | `custompilot-stable` | `08e9e98` | `30a9cdc` | Install target; driving code matched the restored device tree |
-| `custompilot-staging` | `3083a0e` | `37d6dc5` | Candidate only. **Never installed or driven.** Not promoted |
+| `custompilot-staging` | `3d67803` | `37d6dc5` | **Installed on the device 2026-08-18** and crash-looped the UI (symptom 14). Superseded by the next build, which excludes `0011` |
 
 This table goes stale every time the daily build publishes. Re-derive it rather than trusting it,
 and note that the candidate's parent is the *stable tip*, not the previous candidate (trap 15), so
@@ -144,7 +146,7 @@ The patch order matters because later patches harden or correct earlier behavior
 | `0008` | Fail-closed ICBM and main-button arbitration | Prevents ICBM from following the 90 mph planner fallback and preserves a physical driver main press over the cancel it causes. |
 | `0009` | Move `radard` and `plannerd` to CPU 6 | Isolates the planning chain from the custom UI load that saturated CPU 5 and caused low communication-rate alerts. |
 | `0010` | Fix the mirrored 3D frame and developer UI crashes | Corrects Forward/Right/Down model coordinates, tolerates both cereal *service* names, and avoids redundant model-array conversions. Trimmed on 2026-08-16: the `liveValid` field fallback was removed once upstream fixed that read at the source (symptom 11). |
-| `0011` | Refine the 3D scene | Temporal smoothing of model geometry, far-field dissolve, scrolling dashes, redesigned blind spot, and a damped camera. Ships the **procedural** ego car: the real-mesh loader is retained but no mesh asset is vendored, for the licensing reason in "What remains deliberately unresolved". |
+| ~~`0011`~~ | ~~Refine the 3D scene~~ | **Quarantined 2026-08-18** after it crash-looped the UI on the device. The scene work is sound; the defect is a Cap'n Proto slice in `renderer.py`. Held in [`quarantine/`](../quarantine), not applied by the build. See symptom 14. |
 
 The canonical patch files live in [`patches/`](../patches). The prebuilt compatibility patch lives
 under [`ports/`](../ports).
@@ -541,6 +543,62 @@ because they will apply again to any replacement asset:
   constraint and the taste call happen to point the same way: the box car is not a consolation
   prize.
 
+### 14. A green candidate crash-looped the UI within minutes of install
+
+**Observed:** on 2026-08-18 the device installed candidate `3d67803`, booted, was interactive for a
+few seconds, and then stuck on the comma logo the moment the car started. SSH still worked.
+
+**Diagnosis over SSH, parked:** `manager`, `camerad`, `modeld`, `dmonitoringmodeld`, `card` and
+`controlsd` were all alive—only `openpilot.selfdrive.ui.ui` was missing, with one crash log:
+
+```text
+File ".../selfdrive/ui/sunnypilot/onroad/scene3d/renderer.py", line 115, in update
+    for i, line in enumerate(model.laneLines[:4])]
+File "capnp/lib/capnp.pyx", line 435, in capnp.lib.capnp._DynamicListReader.__getitem__
+TypeError: an integer is required
+```
+
+**Cause:** patch `0011` slices the `modelV2` lists (`model.laneLines[:4]`, `model.roadEdges[:2]`).
+A Cap'n Proto `_DynamicListReader` supports **integer indexing but not slicing**, so the first real
+onroad frame raises. It is not a rendering bug and not a performance bug—the scene never got to
+draw.
+
+**Why every check passed.** The stack applied cleanly, `git diff --check` was clean, and **166 tests
+were green**—including a 256-line geometry suite written specifically for this patch. None of it
+touched a capnp object: `render_scenes.py` builds *synthetic modelV2-shaped* data out of numpy
+arrays, which slice happily. The offline harness is structurally incapable of reproducing this, and
+a green harness was treated as sufficient for a render path the runbook had already flagged as never
+installed and never driven.
+
+**Two aggravating factors worth separating from the bug itself:**
+
+1. **The device tracks `custompilot-staging`, not `custompilot-stable`.** It has since the symptom-10
+   recovery, which restored `ce4db02` while retaining the branch name. So the candidate reached the
+   car directly, with none of the protected-promotion review the pipeline was designed around. Any
+   reasoning of the form "promotion is manual, so a candidate cannot reach the car" is **false for
+   this device** until its branch is changed. Verify the checkout, not the design.
+2. **Ignition cycling does not restart the UI.** `ui` is an `always_run` process, started at manager
+   start and not tied to onroad/offroad transitions, and this manager generation does not respawn a
+   crashed process. Turning the car off and on left the same manager PIDs and no UI. Only a manager
+   restart, a reboot, or a manual launch brings it back.
+
+**Recovery:** `Scene3D` was set false over SSH, which is enough on its own—the key is
+`PERSISTENT | BACKUP` with default `b"0"` and no `CLEAR_ON_MANAGER_START`, so it survives restarts
+and fails safe. Then reboot offroad, or manually launch the UI as in "The reboot/recovery lesson".
+`card` and `controlsd` never dropped, so this was never the symptom-10 condition.
+
+**Resolution:** `0011` was pulled out of `apply_candidate.sh` and moved to `quarantine/`, which is
+required rather than cosmetic: `verify_candidate.py` demands that every file named in a patch under
+`patches/` appear in the candidate diff, so an unapplied patch cannot simply sit there. The
+0011-dependent tests are gated behind a capability probe instead of deleted, so they return
+automatically when the patch does.
+
+**Lesson:** a test that never constructs the real object proves only that the code is
+self-consistent. This is the same defect as symptom 10—which crash-looped `card` for exactly the
+same reason, a prebuilt runtime object the tests never built—and the runbook already said so. The
+rule that would have caught both: *if a change reads a cereal message, one test must feed it a real
+capnp reader, or the change is unvalidated no matter how many tests are green.*
+
 ## The reboot/recovery lesson
 
 During the final recovery, the UI process had crashed and the installed manager did not
@@ -822,6 +880,21 @@ different times to communication rate and driving-model lag—two different prob
     no licence file. Establish author and terms *before* the asset becomes load-bearing, and prefer
     a design where its absence is a graceful fallback rather than a breakage—that is what made
     dropping it a one-line decision instead of a rewrite.
+30. **Do not accept a green offline test suite as validation for code that reads a cereal message.**
+    The 3D scene shipped with 166 green tests and crash-looped the UI on the first onroad frame,
+    because every test fed it synthetic numpy arrays and the real `modelV2` hands you a Cap'n Proto
+    `_DynamicListReader`—which indexes but does not slice. Symptom 10 was the same shape with a
+    prebuilt dataclass. If a change reads a cereal message, one test must construct a real reader
+    (or a stub that refuses the operations capnp refuses), or the change is unvalidated no matter
+    how green the suite is.
+31. **Do not reason about what can reach the car from the pipeline's design.** The protected-
+    promotion model is real, and it did not apply: this device tracks `custompilot-staging`, so
+    candidates install without review. Check the device's actual branch (`git -C /data/openpilot
+    rev-parse --abbrev-ref HEAD`) before claiming anything is gated.
+32. **Do not expect an ignition cycle to restart a crashed UI.** `ui` is `always_run`—started at
+    manager start, not on onroad/offroad transitions—and this manager generation does not respawn
+    crashed processes. Turning the car off and on leaves the same manager PIDs and no UI. Only a
+    manager restart, a reboot, or a manual launch recovers it.
 
 ## What remains deliberately unresolved
 
@@ -851,12 +924,17 @@ different times to communication rate and driving-model lag—two different prob
   (that panel is what `0010` touches and what crashed in symptom 7) and the model change validated
   on its own terms—`check_live_service_rates.py` for `modelV2`, and alert-free driving before it is
   trusted. Do not treat it as a routine customization refresh.
-- **Patch `0011` on the device:** now applied by the candidate build, but still **never installed or
-  driven**. It touches the onroad developer UI and the whole 3D render path, so it needs the full
-  offroad procedure plus a CPU baseline captured *before* installing—`analyze_proc_load.py` and
-  `check_live_service_rates.py` with Scene3D on, current code—and `radarState` confirmed back at
-  20.00 Hz afterwards. Toggle Scene3D off and on while measuring to isolate the scene's own cost.
-  Being in the candidate is not evidence it is safe; it only means promotion would now carry it.
+- **Patch `0011`, quarantined:** installed 2026-08-18, crash-looped the UI within minutes, and was
+  pulled from the build the same night (symptom 14). The scene work is sound and measured; the
+  defect is two Cap'n Proto slices in `renderer.py`. Before it returns: fix both sites, add a
+  regression test that feeds a reader stub which rejects slicing *and confirm that test fails
+  against the current patch text*, then install offroad and survive an onroad transition with
+  Scene3D on, CPU baseline captured first.
+- **The device's tracking branch:** it follows `custompilot-staging`, so every green candidate
+  installs without review. Either point it at `custompilot-stable` via the installer URL, or accept
+  that the daily build is effectively a direct-to-car channel and treat every candidate as a
+  release. This is the single highest-leverage unresolved item here—it is what turned a bad patch
+  into a stuck car.
 - **A licensed ego-car mesh:** the real-mesh path exists and is tested but ships dormant, because
   the only mesh built so far came from a third-party model with no licence. To enable it, establish
   a properly licensed source, regenerate with `tools/build_car_mesh.py`, and drop the result at
