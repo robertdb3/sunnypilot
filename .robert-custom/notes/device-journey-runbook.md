@@ -767,6 +767,7 @@ The tools in [`tools/`](../tools) exist because each caught a real class of fail
 | `analyze_proc_load.py` | Correlate UI/model/planning CPU use and per-core saturation. |
 | `check_live_service_rates.py` | Verify live rates parked after a CPU-affinity change. |
 | `monitor_main_toggle.py` | Observe physical main transitions and restore attribution while parked. |
+| `log_es_longitudinal.py` | Read-only capture of what EyeSight actually commands: `ES_Brake` / `ES_Distance` / `ES_Status` on bus 2 (camera intent) beside bus 0 (what reaches the car). `--route-glob` parses drives that already happened, so the first numbers need no new driving. Measures the scaling that openpilot only has global-derived guesses for. See [`preglobal-longitudinal.md`](preglobal-longitudinal.md). |
 | `probe_cruise_button.py` | Confirm the car's real short/long cruise-button step behavior. |
 | `torque_status.py` | Inspect Self-Tune enablement, validity, learned values, bounds, and bucket progress. Reads either torque-parameter service name and normalizes the validity bit; exits cleanly on a stale cache (see trap 20). |
 | `calibrate_wheel_speed.py` | Derive a wheel-speed factor from a real steady highway drive; never guess it. |
@@ -927,6 +928,12 @@ different times to communication rate and driving-model lag—two different prob
   reverted. Redesign it without a prebuilt schema/dataclass change and add a real `card` smoke test.
 - **SCC-V/SCC-M through stock EyeSight:** not wired into ICBM. Displayed curve targets alone cannot
   command longitudinal control on this stock-longitudinal platform.
+- **openpilot longitudinal control itself:** disabled at four independent gates, none of them a
+  hardware limit—the preglobal platform carries the same three ES messages the global platform
+  uses. Enabling it requires panda safety changes and custom firmware, i.e. the tier this fork has
+  deliberately never entered (trap 14). Researched in full in
+  [`preglobal-longitudinal.md`](preglobal-longitudinal.md); the measurement that would inform any
+  decision is not yet taken.
 - **Automatic UI crash restart:** not available in this manager generation. The known schema crash
   was prevented at its source instead. Revisit only after a branch update that supports the API.
 - **Driving-model lag:** the redundant UI work was reduced and the subsequent drive was clean, but
@@ -1046,6 +1053,8 @@ git worktree add /tmp/cand origin/custompilot-staging
 - [`decoupled-toggle.md`](decoupled-toggle.md) — why ACC-on/steering-off is a safety project.
 - [`customization-and-risk.md`](customization-and-risk.md) — fork policy and protected surfaces.
 - [`map-panel.md`](map-panel.md) — offline map format, performance, and rendering decisions.
+- [`preglobal-longitudinal.md`](preglobal-longitudinal.md) — why openpilot longitudinal is off on
+  this car, and what turning it on would actually require.
 - [`torque-tuning.md`](torque-tuning.md) — torque anchor, Self-Tune, bounds, and cache traps.
 - [`virginia-watch.md`](virginia-watch.md) — geofence, thresholds, limits, and calibration.
 - [`../README.md`](../README.md) — patch inventory and repository usage.
