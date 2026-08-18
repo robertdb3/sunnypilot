@@ -104,3 +104,9 @@ SKILL.md
 !.idea/customTargets.xml
 !.idea/tools/*
 !.run/*
+
+# custompilot scratch artifacts: patched working clone, mesh sources, mesh toolchain venv.
+# The tracked patch stack is the reproducible source of truth, never these.
+/.robert-custom/sunnypilot/
+/.robert-custom/assets/
+/.robert-custom/.meshvenv/

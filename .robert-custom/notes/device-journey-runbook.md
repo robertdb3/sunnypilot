@@ -144,6 +144,7 @@ The patch order matters because later patches harden or correct earlier behavior
 | `0008` | Fail-closed ICBM and main-button arbitration | Prevents ICBM from following the 90 mph planner fallback and preserves a physical driver main press over the cancel it causes. |
 | `0009` | Move `radard` and `plannerd` to CPU 6 | Isolates the planning chain from the custom UI load that saturated CPU 5 and caused low communication-rate alerts. |
 | `0010` | Fix the mirrored 3D frame and developer UI crashes | Corrects Forward/Right/Down model coordinates, tolerates both cereal *service* names, and avoids redundant model-array conversions. Trimmed on 2026-08-16: the `liveValid` field fallback was removed once upstream fixed that read at the source (symptom 11). |
+| `0011` | Refine the 3D scene | Temporal smoothing of model geometry, far-field dissolve, scrolling dashes, redesigned blind spot, and a damped camera. Ships the **procedural** ego car: the real-mesh loader is retained but no mesh asset is vendored, for the licensing reason in "What remains deliberately unresolved". |
 
 The canonical patch files live in [`patches/`](../patches). The prebuilt compatibility patch lives
 under [`ports/`](../ports).
@@ -175,6 +176,12 @@ clean. The stack now touches 36 source files—one fewer than the 2026-08-15 cou
 current as its named
 base—upstream moved on two consecutive days here, so a green audit dated yesterday proves nothing
 about today (trap 21).
+
+Repeated later on 2026-08-17 with `0011` added to the applied set and its car-mesh asset removed: all
+eleven items applied in order against a fresh worktree at `37d6dc5`, `git diff --check` was clean, and the stack
+touches **38** source files. `0011` was checked for the constraints that have bitten before—it touches no
+`.capnp`, no `opendbc`, no `params_keys.h`, and `scene3d` calls `params.get_bool` nowhere, taking its only
+toggle from the pre-existing `BlindSpot` key via `ui_state`.
 
 Every intentional source difference in the local patched checkout is represented by at least one
 tracked patch. The only unmatched local files were generated `__pycache__/*.pyc` bytecode, which
@@ -467,6 +474,73 @@ Both were caught only by checking a second, independent source—running the tes
 code, and reading the `Publish candidate branch` push line in the run log. Neither would have been
 caught by looking harder at the thing itself.
 
+### 13. The 3D view was smooth-looking but rendered the model raw
+
+**Observed:** the scene jittered, lane lines stayed crisp and full-opacity to 120 m where the model
+is least certain, the dashes never scrolled, and the ego car was a stack of tinted boxes.
+
+**Cause:** `scene3d` had no temporal filtering at all. On the comma 3X the UI runs at 20 FPS
+(`_DEFAULT_FPS = {'tizi': 20}`) and modelV2 arrives at 20 Hz, so this was not a rate mismatch—it was
+the driving model's own frame-to-frame variance rendered literally.
+
+**Resolution in `0011`:**
+
+- everything is resampled onto one fixed distance grid before it is filtered or drawn, which is what
+  makes per-index smoothing meaningful. `laneLines`/`roadEdges` are published on the constant
+  `X_IDXS` grid, but `position` is on `T_IDXS`, so its x is speed-dependent and had to be resampled
+  before it could be filtered at all;
+- a distance-adaptive EMA smooths far points harder than near ones, and **snaps** rather than glides
+  on a lane change, a validity transition or a stale stream. Measured: 68% / 88% / 94% less
+  frame-to-frame jitter at 3 / 33 / 104 m, with the near field still tracking 64% of a real change
+  within two frames;
+- the far field dissolves instead of wobbling, earlier at night because headlights genuinely do not
+  reach 120 m;
+- dashes scroll with ego motion. They never had, because the pattern was anchored to the polyline
+  origin, which is anchored to the car;
+- the blind spot fades in fast and out slow, and is a faint wash plus a bright flank rail rather
+  than a flat orange rectangle.
+
+**Paid for by:** 39% fewer triangles (2822 -> 1712 across the scenario set) and 84% fewer numpy
+geometry builds per frame, mostly from replacing a per-dash `ribbon()` loop with one vectorised
+pass. Net CPU is lower than before, which is the only reason the new work is affordable here.
+
+**A real bug found on the way:** `gui_app` monkey-patches `rl.draw_text_ex` to multiply `font_size`
+by `FONT_SCALE` (1.16, or 1.242 on the big UI), and `measure_text_cached` applies the same scale.
+`scene.py` measured lead labels with raw `rl.measure_text_ex`, which does **not**—so every label box
+was sized 16% too small while its text drew at full size and overflowed the rounded rect. The ruff
+`TID251` ban on `measure_text_ex` exists precisely to prevent this; the lint rule and the bug are
+the same thing. The offline harness cannot reproduce it, because it loads its own font and never
+installs the monkey-patch, so this one is verifiable only by test or on the device.
+
+### The ego car: what shipped, and why it is the box car
+
+A real decimated Outback mesh was built and worked. **It is deliberately not shipped.** The source
+model was a third-party 2022 Outback downloaded with no licence file, so its author and terms are
+unestablished, and an asset you cannot licence is not one you can publish. `0011` therefore ships
+the **procedural** car and vendors no mesh.
+
+The loader survives, unused: `make_car()` returns `MeshCarShape` if `assets/outback.gltf` exists and
+the procedural `CarShape` otherwise, so dropping in a properly licensed mesh later is a one-file
+change with no code edit. Fail-closed by construction—a missing *or unreadable* asset falls back
+rather than drawing nothing. Both paths were tested by deleting and by corrupting the file.
+
+Three findings from the mesh work, kept because `tools/build_car_mesh.py` is still in the tree and
+because they will apply again to any replacement asset:
+
+- raylib's OBJ loader **ignores** vertex colours (it allocates the buffer and fills it white); its
+  glTF loader reads `COLOR_0` correctly. Since there is no shader, baking light into vertex colours
+  is the only way to make a loaded mesh look solid—so the asset has to be glTF, not OBJ.
+- quadric decimation alone could not get near the triangle budget on a SketchUp export. Every trim
+  piece is its own open shell, and quadric collapse will not cross a boundary edge, so it stalled at
+  ~24k faces. Vertex clustering first, which fuses shells regardless of connectivity, let it reach
+  the budget. With *unwelded* vertices it was worse than stalling: it returned confetti with the
+  tyres floating in space.
+- accuracy and legibility are not the same thing at this size. The real mesh has correct
+  proportions, but on screen the car is about 110 px tall and the procedural box car reads *crisper*
+  there—bold flat shapes survive low resolution better than photoreal ones. So the licensing
+  constraint and the taste call happen to point the same way: the box car is not a consolation
+  prize.
+
 ## The reboot/recovery lesson
 
 During the final recovery, the UI process had crashed and the installed manager did not
@@ -731,6 +805,24 @@ different times to communication rate and driving-model lag—two different prob
     from a tracked-only export of the assets (`git archive`), so untracked scratch directories such
     as `.robert-custom/sunnypilot/` cannot leak in and change the result.
 
+26. **Do not bake vertex colours into an OBJ and expect raylib to read them.** Its OBJ loader
+    silently discards them and hands back white; its glTF loader reads `COLOR_0` correctly. With no
+    shader available, baked vertex colour is the only way a loaded mesh reads as solid, so the
+    format is forced. A `.gltf` with base64-inlined buffers is a single text file and can live in a
+    patch.
+27. **Do not quadric-decimate a CAD or SketchUp export without welding and clustering first.** Every
+    trim piece is its own open shell and boundary edges are never collapsed, so decimation either
+    stalls far above the budget or—with unwelded vertices—returns confetti with the tyres floating
+    in space. Weld, then vertex-cluster to fuse the shells, then collapse.
+28. **Do not tint a mesh that already carries baked colours with the body colour.** `draw_model_ex`
+    multiplies, so green over green renders a dark smear. Tint near-white and let the vertex colours
+    be the paint.
+29. **Do not vendor a third-party asset before establishing its licence.** The Outback mesh was
+    built, worked, and was then left out of the shipped patch because the source model arrived with
+    no licence file. Establish author and terms *before* the asset becomes load-bearing, and prefer
+    a design where its absence is a graceful fallback rather than a breakage—that is what made
+    dropping it a one-line decision instead of a rewrite.
+
 ## What remains deliberately unresolved
 
 - **Decoupled steering while ACC remains on:** not implemented; requires verified button input and
@@ -759,6 +851,19 @@ different times to communication rate and driving-model lag—two different prob
   (that panel is what `0010` touches and what crashed in symptom 7) and the model change validated
   on its own terms—`check_live_service_rates.py` for `modelV2`, and alert-free driving before it is
   trusted. Do not treat it as a routine customization refresh.
+- **Patch `0011` on the device:** now applied by the candidate build, but still **never installed or
+  driven**. It touches the onroad developer UI and the whole 3D render path, so it needs the full
+  offroad procedure plus a CPU baseline captured *before* installing—`analyze_proc_load.py` and
+  `check_live_service_rates.py` with Scene3D on, current code—and `radarState` confirmed back at
+  20.00 Hz afterwards. Toggle Scene3D off and on while measuring to isolate the scene's own cost.
+  Being in the candidate is not evidence it is safe; it only means promotion would now carry it.
+- **A licensed ego-car mesh:** the real-mesh path exists and is tested but ships dormant, because
+  the only mesh built so far came from a third-party model with no licence. To enable it, establish
+  a properly licensed source, regenerate with `tools/build_car_mesh.py`, and drop the result at
+  `scene3d/assets/outback.gltf`—no code change required. Note the model used during development was
+  a **2022** Outback (6th generation), not the 5th-gen a 2018 is; at chase distance the difference
+  is subtle but it is a known inaccuracy, and symptom 13 records why the box car may be the better
+  choice on legibility grounds regardless.
 
 ## Updating or rebasing later
 

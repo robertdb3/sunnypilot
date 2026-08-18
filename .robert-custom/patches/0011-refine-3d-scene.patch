@@ -1,0 +1,1497 @@
+diff --git a/openpilot/selfdrive/ui/sunnypilot/onroad/augmented_road_view.py b/openpilot/selfdrive/ui/sunnypilot/onroad/augmented_road_view.py
+index c8f24bc..023af3d 100644
+--- a/openpilot/selfdrive/ui/sunnypilot/onroad/augmented_road_view.py
++++ b/openpilot/selfdrive/ui/sunnypilot/onroad/augmented_road_view.py
+@@ -39,7 +39,9 @@ class AugmentedRoadViewSP:
+     if self._scene_3d is None:
+       # imported lazily so devices with the toggle off never build the meshes
+       from openpilot.selfdrive.ui.sunnypilot.onroad.scene3d.renderer import Scene3DRenderer
+-      self._scene_3d = Scene3DRenderer()
++      # the blind-spot fade and camera damping are specified as time constants, so the
++      # renderer needs the real frame rate: 20 on tizi, 60 elsewhere
++      self._scene_3d = Scene3DRenderer(gui_app.target_fps)
+ 
+     self._scene_3d.update()
+     self._scene_3d.render(content_rect)
+diff --git a/openpilot/selfdrive/ui/sunnypilot/onroad/scene3d/dimensions.py b/openpilot/selfdrive/ui/sunnypilot/onroad/scene3d/dimensions.py
+new file mode 100644
+index 0000000..d795a67
+--- /dev/null
++++ b/openpilot/selfdrive/ui/sunnypilot/onroad/scene3d/dimensions.py
+@@ -0,0 +1,85 @@
++"""
++Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
++
++This file is part of sunnypilot and is licensed under the MIT License.
++See the LICENSE.md file in the root directory for more details.
++
++Vehicle dimensions for the 3D scene, in metres.
++
++Kept free of pyray so the numbers are unit-testable, and so that swapping the procedural car for a
++loaded mesh is a data change rather than a code change: the mesh is normalised to exactly these
++figures at build time.
++
++Published 2018 Subaru Outback: length 4.816 m (189.6 in), width 1.839 m (72.4 in),
++height 1.679 m (66.1 in), wheelbase 2.746 m (108.1 in), ground clearance 0.221 m (8.7 in).
++"""
++
++# ---- overall ----------------------------------------------------------------------------------
++BODY_L = 4.82
++BODY_W = 1.84
++BODY_H = 1.66          # roof rail top; see the stack below
++WHEELBASE = 2.746
++CLEARANCE = 0.221
++
++# 225/65R17 -> 724 mm overall diameter
++WHEEL_R = 0.362
++WHEEL_W = 0.225
++WHEEL_INSET = 0.06
++
++# The car spans z in [-BODY_L/2, +BODY_L/2] with -z forward, so the nose is at -2.41 and the
++# tail at +2.41. Wheel centres sit at +/- half the wheelbase, which is a real measurement rather
++# than the fraction-of-length guess it replaces.
++WHEEL_Z = WHEELBASE * 0.5      # 1.373
++
++# ---- vertical stack ---------------------------------------------------------------------------
++# Absolute heights rather than a relative pile, so they can be checked against the published
++# overall height instead of drifting.
++SILL_Z0, SILL_Z1 = 0.22, 0.62      # black lower cladding
++BODY_Z0, BODY_Z1 = 0.62, 1.10      # beltline; its top is the hood line
++CABIN_Z0, CABIN_Z1 = 1.10, 1.58    # greenhouse
++RAIL_Z0, RAIL_Z1 = 1.58, 1.66      # roof rails
++
++SILL_W = 1.76                      # cladding tucks in from the body sides
++CABIN_W = 1.62
++
++# The wagon greenhouse is the single strongest Outback cue after the roof rails. A long hood with
++# the roof running nearly to the tailgate is what separates it from a sedan; the previous
++# 2.34 m cabin sitting 0.18 m forward of centre read as a saloon.
++HOOD_L = 1.55                      # nose to windscreen base
++CABIN_L = 2.90
++CABIN_OFFS = 0.59                  # +z is rearward, so the greenhouse sits over the cargo area
++
++RAIL_L = 1.55
++RAIL_W = 0.07
++RAIL_X = 0.62                      # lateral offset of each rail from centreline
++
++# Tail lamps, drawn on the rear face. The chase camera looks straight at the back of the car, so
++# these are the strongest "this is my car" cue available for the money.
++LAMP_W, LAMP_H = 0.34, 0.14
++LAMP_X, LAMP_Z = 0.72, 0.95
++
++SHADOW_PAD = 0.30
++
++# ---- baked lighting -----------------------------------------------------------------------------
++# raylib has no lighting without a shader, so the key light is baked into per-face tints. It comes
++# from above and BEHIND the viewer, which matters more than it looks: the chase camera stares at
++# the back of every car in the scene, so a rear face dimmer than the front (as it was) means the
++# only face anyone ever sees is the darkest one, and a dark paint colour renders almost black.
++# Lives here rather than in vehicles.py so it can be tested without importing pyray.
++FACE_TOP, FACE_FRONT, FACE_REAR, FACE_LEFT, FACE_RIGHT = 1.00, 0.62, 0.86, 0.92, 0.72
++
++# ---- mesh normalisation -----------------------------------------------------------------------
++# build_car_mesh.py scales the source model until its bounding box length equals MESH_TARGET_L and
++# drops it onto y=0. Everything else about the mesh follows from that.
++MESH_TARGET_L = BODY_L
++MESH_FILE = "outback.gltf"
++
++
++def overall_height() -> float:
++  """Top of the roof rails. Published figure is 1.679 m with rails."""
++  return RAIL_Z1
++
++
++def cabin_bounds() -> tuple[float, float]:
++  """(front, rear) z of the greenhouse. -z is forward, so front < rear."""
++  return CABIN_OFFS - CABIN_L * 0.5, CABIN_OFFS + CABIN_L * 0.5
+diff --git a/openpilot/selfdrive/ui/sunnypilot/onroad/scene3d/geometry.py b/openpilot/selfdrive/ui/sunnypilot/onroad/scene3d/geometry.py
+index a2e7d3f..edb9609 100644
+--- a/openpilot/selfdrive/ui/sunnypilot/onroad/scene3d/geometry.py
++++ b/openpilot/selfdrive/ui/sunnypilot/onroad/scene3d/geometry.py
+@@ -22,6 +22,100 @@ def car_to_world(pts: np.ndarray) -> np.ndarray:
+   return out
+ 
+ 
++# ---- the render grid --------------------------------------------------------------------------
++# Everything the scene draws is resampled onto one of these fixed distance grids before it is
++# filtered or turned into triangles. Two reasons, and the first is the important one:
++#
++#   1. Temporal filtering needs a stable meaning per index. modelV2 publishes laneLines and
++#      roadEdges on ModelConstants.X_IDXS (a constant 33-value distance grid), so index k already
++#      means "at X_IDXS[k] metres ahead" -- but `position` is published on T_IDXS, where x is
++#      speed-dependent and slides frame to frame. Resampling both onto one distance grid makes
++#      per-index smoothing physically meaningful for all of them: "lateral offset at d metres".
++#   2. X_IDXS is quadratic, so it spends 4 of its first 5 samples inside the ego car's own
++#      footprint (0 -> 3 m) and then strides 15 m at a time out at the horizon. A geometric grid
++#      is much closer to uniform in screen space for the same number of triangles.
++#
++# Resampling is linear and both grids are fixed, so filtering commutes with resampling -- filter
++# after, on 19 values instead of 33.
++GRID_S = np.array([-30.0, -18.0, -10.0, -4.0, 0.0, 3.0, 6.5, 10.5, 15.0, 20.0,
++                   26.0, 33.0, 41.0, 50.0, 61.0, 74.0, 89.0, 104.0, 120.0], dtype=np.float32)
++
++# the path is a near-term intention; drawing it to the horizon is noise
++PATH_GRID_S = np.array([0.0, 3.0, 6.5, 10.5, 15.0, 20.0, 26.0, 33.0, 41.0, 50.0, 61.0, 70.0],
++                       dtype=np.float32)
++
++# Dashes need even arc spacing, not the display grid. 1.5 m divides the 3 m dash exactly, so dash
++# boundaries always land on a sample and the triangle count cannot wobble between frames.
++DASH_STEP = 1.5
++DASH_MAX_S = 42.0
++DASH_S = np.arange(-30.0, DASH_MAX_S + DASH_STEP, DASH_STEP, dtype=np.float32)
++
++
++def resample_to_grid(x: np.ndarray, y: np.ndarray, z: np.ndarray,
++                     grid: np.ndarray) -> tuple[np.ndarray, np.ndarray, int]:
++  """Resample a car-frame polyline onto `grid`, returning (y_g, z_g, n_valid).
++
++  Always returns full-length arrays so the per-index smoother sees a stable shape. `n_valid` is
++  how many leading grid nodes are backed by real model data; the caller truncates to that when
++  drawing. Grid nodes beyond the model's reach must NOT be flat-lined -- at 6 m/s the path only
++  extends ~60 m, and np.interp would happily clamp it into a straight bar out to the horizon.
++
++  Nodes behind the model's first sample are linearly extrapolated, which is what `extend_back`
++  used to do: modelV2 only describes the road ahead, and without it the chase camera looks out
++  over bare ground in the near field.
++  """
++  n = min(len(x), len(y), len(z))
++  empty = np.zeros(len(grid), dtype=np.float32)
++  if n < 2:
++    return empty, empty.copy(), 0
++
++  x, y, z = np.asarray(x[:n], dtype=np.float32), np.asarray(y[:n], dtype=np.float32), np.asarray(z[:n], dtype=np.float32)
++  good = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
++  if good.sum() < 2:
++    return empty, empty.copy(), 0
++  x, y, z = x[good], y[good], z[good]
++
++  # np.interp needs increasing xp; the model is already sorted but a stale/foreign message may not be
++  if np.any(np.diff(x) <= 0):
++    order = np.argsort(x, kind="stable")
++    x, y, z = x[order], y[order], z[order]
++    keep = np.concatenate([[True], np.diff(x) > 0])
++    x, y, z = x[keep], y[keep], z[keep]
++    if len(x) < 2:
++      return empty, empty.copy(), 0
++
++  y_g = np.interp(grid, x, y).astype(np.float32)
++  z_g = np.interp(grid, x, z).astype(np.float32)
++
++  # linear extrapolation behind the first sample instead of np.interp's clamp
++  behind = grid < x[0]
++  if behind.any():
++    slope_y = (y[1] - y[0]) / (x[1] - x[0])
++    slope_z = (z[1] - z[0]) / (x[1] - x[0])
++    d = (grid[behind] - x[0]).astype(np.float32)
++    y_g[behind] = y[0] + slope_y * d
++    z_g[behind] = z[0] + slope_z * d
++
++  n_valid = int(np.count_nonzero(grid <= x[-1]))
++  return y_g, z_g, n_valid
++
++
++def smoothstep(t: np.ndarray) -> np.ndarray:
++  """3t^2-2t^3 on [0,1]. Used for every fade so nothing has a visible kink."""
++  t = np.clip(t, 0.0, 1.0)
++  return (t * t * (3.0 - 2.0 * t)).astype(np.float32)
++
++
++def distance_fade(grid: np.ndarray, start: float, end: float) -> np.ndarray:
++  """1.0 out to `start`, smoothly to 0.0 by `end`.
++
++  This is the main tool for being honest about the model rather than decorative: the far field is
++  where lane predictions are noisiest, so dissolving it there stops the least trustworthy part of
++  the scene from being the most visually prominent.
++  """
++  return smoothstep((end - grid) / max(end - start, 1e-3))
++
++
+ def trim(x: np.ndarray, y: np.ndarray, z: np.ndarray, max_dist: float) -> tuple[np.ndarray, ...]:
+   """Drop points beyond max_dist ahead, and any non-finite rows the model may emit."""
+   n = min(len(x), len(y), len(z))
+@@ -147,6 +241,38 @@ def dashes(x: np.ndarray, y: np.ndarray, z: np.ndarray, width: float, z_lift: fl
+   return np.concatenate(out, axis=0) if out else np.zeros((0, 3, 3), dtype=np.float32)
+ 
+ 
++def dashes_on_grid(y: np.ndarray, z: np.ndarray, widths: np.ndarray, z_lift: float,
++                   phase: float = 0.0, dash: float = 3.0, gap: float = 6.0,
++                   n_valid: int | None = None) -> np.ndarray:
++  """Broken lane marking, built in one pass on DASH_S.
++
++  Replaces the old `dashes()`, which called `ribbon()` once per dash -- roughly 17 numpy geometry
++  builds per lane line, 68 per frame across four lines, each doing a gradient and a norm on a
++  2-4 point array. That is numpy overhead with essentially no numpy work in it.
++
++  Here the whole line becomes a single ribbon and the dashes are a boolean mask over its segments,
++  so the cost is one build regardless of how many dashes are visible.
++
++  `phase` scrolls the pattern. The old implementation anchored dashes to the polyline origin,
++  which is anchored to the car -- so they never moved, and the road looked static at 70 mph.
++  """
++  x = DASH_S
++  if n_valid is not None:
++    n = max(int(n_valid), 0)
++    if n < 2:
++      return np.zeros((0, 3, 3), dtype=np.float32)
++    x, y, z, widths = x[:n], y[:n], z[:n], widths[:n]
++  if len(x) < 2:
++    return np.zeros((0, 3, 3), dtype=np.float32)
++
++  tris = ribbon_varying(x, y, z, widths, z_lift)
++
++  # keep segments whose midpoint falls inside a painted stretch
++  mid = 0.5 * (x[:-1] + x[1:])
++  keep = ((mid + phase) % (dash + gap)) < dash
++  return tris[np.repeat(keep, 2)]
++
++
+ def quad(corners_car: np.ndarray) -> np.ndarray:
+   """4 car-frame corners (in order) -> (2,3,3) world triangles."""
+   w = car_to_world(np.asarray(corners_car, dtype=np.float32))
+diff --git a/openpilot/selfdrive/ui/sunnypilot/onroad/scene3d/renderer.py b/openpilot/selfdrive/ui/sunnypilot/onroad/scene3d/renderer.py
+index 889e479..bda9adf 100644
+--- a/openpilot/selfdrive/ui/sunnypilot/onroad/scene3d/renderer.py
++++ b/openpilot/selfdrive/ui/sunnypilot/onroad/scene3d/renderer.py
+@@ -10,10 +10,21 @@ from dataclasses import replace
+ import numpy as np
+ import pyray as rl
+ 
++from openpilot.common.filter_simple import FirstOrderFilter
+ from openpilot.selfdrive.ui.ui_state import ui_state
+ from openpilot.selfdrive.ui.sunnypilot.onroad.scene3d import geometry as geo
++from openpilot.selfdrive.ui.sunnypilot.onroad.scene3d import smoothing as sm
++from openpilot.selfdrive.ui.sunnypilot.onroad.scene3d import scene as sc
+ from openpilot.selfdrive.ui.sunnypilot.onroad.scene3d.scene import Scene3D, SceneState
+ 
++# A model message that never arrives is not the same as one that says "invalid". If the stream
++# stalls this long, glide out of it rather than easing toward stale geometry.
++STALE_FRAMES = 10
++
++# Fast attack so a warning can never appear late; slow release so a car hovering on the boundary
++# does not flicker. The boolean is never filtered -- only how strongly the zone is drawn.
++BS_ATTACK_RC, BS_RELEASE_RC = 0.05, 0.45
++
+ 
+ def _xyz(line) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+   return (
+@@ -28,41 +39,87 @@ class Scene3DRenderer:
+ 
+   Kept separate from Scene3D so the renderer itself stays importable and testable without
+   cereal, ui_state, or a running device.
++
++  All temporal filtering lives here rather than in the draw path. update() runs once per UI frame
++  but the model branch is gated on sm.updated, so geometry smoothing sees a constant 0.05 s step
++  regardless of whether the UI is running at 20 FPS (tizi) or 60 (tici). Filtering while drawing
++  would give the same constants three different time constants depending on hardware, and would
++  cost 3x as much on tici for no benefit.
+   """
+ 
+-  def __init__(self):
++  def __init__(self, fps: float = 20.0):
+     self._scene = Scene3D()
+     self._state = SceneState()
++    dt = 1.0 / max(fps, 1.0)
++
++    self._lane_y = [sm.GridSmoother(sm.ALPHAS, sm.SNAP_DEV, sm.SNAP_MASK) for _ in range(4)]
++    self._lane_z = [sm.GridSmoother(sm.ALPHAS, sm.SNAP_DEV, sm.SNAP_MASK) for _ in range(4)]
++    self._edge_y = [sm.GridSmoother(sm.ALPHAS, sm.SNAP_DEV, sm.SNAP_MASK) for _ in range(2)]
++    self._edge_z = [sm.GridSmoother(sm.ALPHAS, sm.SNAP_DEV, sm.SNAP_MASK) for _ in range(2)]
++    self._path_y = sm.GridSmoother(sm.PATH_ALPHAS, sm.SNAP_DEV, sm.PATH_SNAP_MASK)
++    self._path_z = sm.GridSmoother(sm.PATH_ALPHAS, sm.SNAP_DEV, sm.PATH_SNAP_MASK)
++    self._probs = sm.ScalarSmoother()
++
++    self._bs_l = FirstOrderFilter(0.0, BS_RELEASE_RC, dt)
++    self._bs_r = FirstOrderFilter(0.0, BS_RELEASE_RC, dt)
++    self._cam_x = FirstOrderFilter(0.0, sc.CAM_LEAD_RC, dt)
++    self._cam_z = FirstOrderFilter(-sc.CAM_TARGET_NEAR, sc.CAM_DEPTH_RC, dt)
++
++    self._dt = dt
++    self._dash_phase = 0.0
++    self._frame = 0
++    self._since_model = 0
++    self._was_valid = False
++    self._started_frame = -1
+ 
+   def unload(self):
+     self._scene.unload()
+ 
++  def _reset_smoothers(self):
++    """Snap, do not glide. Easing the scene into existence from stale geometry after the model
++    comes back would animate a lie."""
++    for f in (*self._lane_y, *self._lane_z, *self._edge_y, *self._edge_z,
++              self._path_y, self._path_z, self._probs):
++      f.reset()
++    self._cam_x.initialized = False
++    self._cam_z.initialized = False
++
+   def update(self) -> None:
+-    sm = ui_state.sm
+-    # modelV2 arrives at 20 Hz while the UI renders at 60 Hz. Preserve the immutable array
+-    # references between message updates instead of converting every model field to numpy three
+-    # times per model frame.
++    sm_ = ui_state.sm
++    self._frame += 1
++    # modelV2 arrives at 20 Hz while the UI may render faster. Preserve the array references
++    # between message updates instead of converting every model field to numpy on every frame.
+     state = replace(self._state, light_sensor=ui_state.light_sensor, is_metric=ui_state.is_metric)
+ 
+-    if sm.updated.get("carState"):
+-      cs = sm["carState"]
+-      state.left_blindspot = bool(cs.leftBlindspot)
+-      state.right_blindspot = bool(cs.rightBlindspot)
++    if sm_.updated.get("carState"):
++      cs = sm_["carState"]
++      raw_left, raw_right = bool(cs.leftBlindspot), bool(cs.rightBlindspot)
+       state.v_ego = float(cs.vEgo)
+     else:
+-      state.left_blindspot = self._state.left_blindspot
+-      state.right_blindspot = self._state.right_blindspot
++      raw_left, raw_right = self._raw_bs
+       state.v_ego = self._state.v_ego
+-
+-    model_valid = sm.valid.get("modelV2") and sm.recv_frame["modelV2"] >= ui_state.started_frame
+-    if model_valid and sm.updated.get("modelV2"):
+-      model = sm["modelV2"]
+-      state.lane_lines = [_xyz(line) for line in model.laneLines]
+-      state.lane_line_probs = [float(p) for p in model.laneLineProbs]
+-      state.road_edges = [_xyz(edge) for edge in model.roadEdges]
+-      state.path = _xyz(model.position)
++    self._raw_bs = (raw_left, raw_right)
++
++    model_valid = sm_.valid.get("modelV2") and sm_.recv_frame["modelV2"] >= ui_state.started_frame
++
++    # a new route, or the model coming back, must not be eased into
++    if (model_valid and not self._was_valid) or ui_state.started_frame != self._started_frame:
++      self._reset_smoothers()
++    self._was_valid = bool(model_valid)
++    self._started_frame = ui_state.started_frame
++
++    if model_valid and sm_.updated.get("modelV2"):
++      self._since_model = 0
++      model = sm_["modelV2"]
++      state.lane_lines = [self._grid_line(_xyz(line), geo.GRID_S, self._lane_y[i], self._lane_z[i])
++                          for i, line in enumerate(model.laneLines[:4])]
++      state.lane_line_probs = list(self._probs.update(np.asarray(model.laneLineProbs, dtype=np.float32)))
++      state.road_edges = [self._grid_line(_xyz(e), geo.GRID_S, self._edge_y[i], self._edge_z[i])
++                          for i, e in enumerate(model.roadEdges[:2])]
++      state.path = self._grid_line(_xyz(model.position), geo.PATH_GRID_S, self._path_y, self._path_z)
+       # planned longitudinal accel, used to colour the path the way the experimental-mode
+-      # overlay already does (onroad/model_renderer.py)
++      # overlay already does (onroad/model_renderer.py). Never smoothed: it communicates planned
++      # braking, and lagging that would misrepresent intent.
+       if len(model.acceleration.x):
+         state.accel = np.asarray(model.acceleration.x, dtype=np.float32)
+       # leadsV3, not radarState: radarState leads are gated on openpilotLongitudinalControl plus a
+@@ -71,9 +128,58 @@ class Scene3DRenderer:
+       state.valid = len(state.lane_lines) > 0
+     elif not model_valid:
+       state.valid = False
++    else:
++      self._since_model += 1
++      if self._since_model > STALE_FRAMES:
++        self._reset_smoothers()
++
++    # --- per-frame animation, at UI rate ---
++    state.blindspot_enabled = bool(ui_state.blindspot)
++    for filt, raw in ((self._bs_l, raw_left), (self._bs_r, raw_right)):
++      target = 1.0 if raw else 0.0
++      filt.update_alpha(BS_ATTACK_RC if target > filt.x else BS_RELEASE_RC)
++      filt.update(target)
++    state.left_blindspot = float(self._bs_l.x)
++    state.right_blindspot = float(self._bs_r.x)
++
++    # frame counter, not a wall clock: deterministic, testable, and time.time() is banned here
++    if raw_left or raw_right:
++      ph = 2.0 * np.pi * sc.BS_PULSE_HZ * self._frame * self._dt
++      state.pulse = float(1.0 - sc.BS_PULSE_DEPTH + sc.BS_PULSE_DEPTH * (0.5 + 0.5 * np.sin(ph)))
++    else:
++      state.pulse = 1.0
++
++    # dashes scroll at true road speed; held at a standstill so they do not creep
++    if state.v_ego > 0.5:
++      self._dash_phase = (self._dash_phase + state.v_ego * self._dt) % (sc.DASH_LEN + sc.DASH_GAP)
++    state.dash_phase = self._dash_phase
++
++    # Camera: aesthetics only, never driven by anything the driver acts on.
++    lean = 0.0
++    if state.valid and state.path is not None:
++      py, _pz, pn = state.path
++      if pn >= 2:
++        lean = float(np.interp(sc.CAM_LOOK_DIST, geo.PATH_GRID_S[:pn], py[:pn]))
++    self._cam_x.update(float(np.clip(sc.CAM_LEAD_K * lean, -sc.CAM_LEAD_MAX, sc.CAM_LEAD_MAX)))
++    self._cam_z.update(-(sc.CAM_TARGET_NEAR + sc.CAM_TARGET_K * state.v_ego))
++    state.cam_x = float(self._cam_x.x)
++    state.cam_target_z = float(self._cam_z.x)
+ 
+     self._state = state
+ 
++  _raw_bs: tuple[bool, bool] = (False, False)
++
++  @staticmethod
++  def _grid_line(xyz, grid, fy: sm.GridSmoother, fz: sm.GridSmoother):
++    """Resample onto the fixed grid, then filter per index.
++
++    Order matters and this way round is the cheap one: resampling first means the filter sees a
++    stable index->distance mapping (which is what makes per-index EMA meaningful at all), and it
++    runs over 19 values instead of the model's 33.
++    """
++    y, z, n = geo.resample_to_grid(*xyz, grid)
++    return fy.update(y), fz.update(z), n
++
+   def render(self, rect: rl.Rectangle) -> None:
+     """Caller must already be inside begin_scissor_mode for `rect`."""
+     self._scene.render(rect, self._state)
+diff --git a/openpilot/selfdrive/ui/sunnypilot/onroad/scene3d/scene.py b/openpilot/selfdrive/ui/sunnypilot/onroad/scene3d/scene.py
+index 244d9ce..6345909 100644
+--- a/openpilot/selfdrive/ui/sunnypilot/onroad/scene3d/scene.py
++++ b/openpilot/selfdrive/ui/sunnypilot/onroad/scene3d/scene.py
+@@ -13,45 +13,164 @@ import pyray as rl
+ from openpilot.selfdrive.ui.sunnypilot.onroad.scene3d import geometry as geo
+ from openpilot.selfdrive.ui.sunnypilot.onroad.scene3d import vehicles
+ from openpilot.selfdrive.ui.sunnypilot.onroad.scene3d.theme import Palette, ThemeSelector, path_color
+-from openpilot.selfdrive.ui.sunnypilot.onroad.scene3d.vehicles import CarShape
++from openpilot.selfdrive.ui.sunnypilot.onroad.scene3d.vehicles import CarShape, EGO_STYLE
+ 
+ MAX_DIST = 120.0
+-PATH_DIST = 70.0        # the path is a near-term intention; drawing it to the horizon is noise
+ LANE_WIDTH = 0.20
+ EDGE_WIDTH = 0.26
+ PATH_WIDTH_NEAR = 1.55  # tapers with distance, which reads as perspective rather than a flat strip
+ PATH_WIDTH_FAR = 0.55
++PATH_FADE_START = 40.0  # the path is a prediction; it should dissolve, not stop at a flat edge
++
++# Painted lines have a constant real width, but their jitter is angular: a far line wobbling by a
++# few centimetres moves by a sub-pixel amount that reads as shimmer. Widening with distance makes
++# the line cover enough pixels that the wobble stops being resolvable.
++LANE_TAPER_K = 0.90
+ 
+ Z_ROAD, Z_SHADOW, Z_PATH, Z_LANE = 0.010, 0.014, 0.020, 0.028
+ 
+ CAM_POS = (0.0, 9.6, 23.0)
+-CAM_TARGET = (0.0, 0.0, -30.0)
+ CAM_FOV = 38.0
+ 
++# The camera used to be bolted to the origin. Letting it drift into a curve and pull back with
++# speed makes the whole frame move coherently, and the eye then attributes the motion to the
++# camera rather than to the data -- which perceptually hides the jitter that survives smoothing.
++# Heavily damped, and never driven by anything the driver acts on.
++CAM_LEAD_K, CAM_LEAD_MAX = 0.25, 1.2
++CAM_LEAD_RC, CAM_DEPTH_RC = 0.50, 0.80
++CAM_TARGET_NEAR, CAM_TARGET_K = 25.0, 0.60
++CAM_LOOK_DIST = 40.0    # the lateral offset the camera leans toward
++
+ GROUND_AHEAD, GROUND_BEHIND, GROUND_SIDE = 600.0, 60.0, 200.0
++GROUND_BANDS = 5        # enough to read as a gradient into haze; still only 10 triangles
++
++# Far-field dissolve. Night fades much earlier and that is more truthful rather than less: the
++# headlights genuinely do not reach 120 m, so pretending to know the road out there is the
++# dishonest option.
++FADE_DAY_START, FADE_DAY_END = 55.0, 120.0
++FADE_NIGHT_START, FADE_NIGHT_END = 38.0, 85.0
++
++FADE_DAY = geo.distance_fade(geo.GRID_S, FADE_DAY_START, FADE_DAY_END)
++FADE_NIGHT = geo.distance_fade(geo.GRID_S, FADE_NIGHT_START, FADE_NIGHT_END)
++
++# Dashes stop well before the lines do. At 100 m a real painted dash is unresolvable to a real
++# driver too, so continuing them is inventing detail; beyond this the road edges and surface carry
++# the far field on their own.
++DASH_FADE = geo.distance_fade(geo.DASH_S, 28.0, geo.DASH_MAX_S)
++DASH_LEN, DASH_GAP = 3.0, 6.0
++
++# Confidence ramp, replacing a hard cutoff at 0.25 that made lines pop in and out.
++CONF_LO, CONF_HI = 0.15, 0.70
++LANE_MIN_S, LANE_CONF_S = 30.0, 90.0   # a low-confidence line is an honest short stub
+ 
+ LABEL_FONT_SIZE = 26
+ LABEL_SUB_SIZE = 20
+ 
++# ---- blind spot -------------------------------------------------------------------------------
++# Sized to where a car actually sits alongside, and no larger. At this camera angle the road
++# beside the ego occupies a lot of screen, so a zone drawn opaque enough to notice ends up
++# carpeting it. The area therefore stays a faint wash and the bright flank rail does the work of
++# catching the eye -- which is also how a real BSM lamp behaves: a small bright thing, not a glow
++# spread over the whole lane.
++BS_NEAR, BS_FAR = -5.5, 0.6
++BS_INNER, BS_OUTER = 1.05, 3.4
++BS_LAYERS = 2
++BS_PULSE_HZ, BS_PULSE_DEPTH = 1.4, 0.20
++BS_RAIL_W = 0.22      # bright strip hugging the flank; this is what the eye catches
++
++
++BS_LAYER_W = np.array([0.55, 1.00], dtype=np.float32)
++
++
++def _blindspot_mesh(sign: float) -> tuple[np.ndarray, np.ndarray]:
++  """Precompute one side at import: (ground wash, flank wall).
++
++  Two parts because they do different jobs. The ground wash says *where* the zone is and stays
++  deliberately faint -- amber over dark tarmac dominates at any opacity high enough to notice, and
++  at this camera angle the road beside the car is a large part of the frame, so a zone bright
++  enough to read ends up carpeting it.
++
++  The rail is what actually catches the eye: a bright, crisp strip hugging the flank, exactly
++  where a mirror-mounted BSM lamp would be pointing. Small and bright beats large and dim.
++
++  Two things were tried and rejected here. A per-triangle alpha grid: draw_triangle_3d takes one
++  colour per triangle, so any grid coarse enough to afford shows as visible blocks. And a low
++  vertical wall along the flank: the chase camera sits almost directly behind, so a wall running
++  fore-aft projects nearly edge-on and disappears to a sliver.
++  """
++  lift = -Z_LANE - 0.01
++  wash = []
++  for i in range(BS_LAYERS):
++    t = i / BS_LAYERS
++    outer = BS_OUTER - (BS_OUTER - BS_INNER) * t
++    near = BS_NEAR + (BS_FAR - BS_NEAR) * 0.10 * t     # ends pull in slightly per layer, so the
++    far = BS_FAR - (BS_FAR - BS_NEAR) * 0.06 * t       # zone tapers instead of stacking squarely
++    wash.append(geo.quad(np.array([
++      [near, sign * BS_INNER, lift], [far, sign * BS_INNER, lift],
++      [far, sign * outer, lift], [near, sign * outer, lift],
++    ], dtype=np.float32)))
++
++  rail = geo.quad(np.array([
++    [BS_NEAR, sign * BS_INNER, lift], [BS_FAR, sign * BS_INNER, lift],
++    [BS_FAR, sign * (BS_INNER + BS_RAIL_W), lift], [BS_NEAR, sign * (BS_INNER + BS_RAIL_W), lift],
++  ], dtype=np.float32))
++
++  return np.concatenate(wash, axis=0), rail
++
++
++_BS_L, _BS_RAIL_L = _blindspot_mesh(-1.0)   # model y is RIGHT, so left is negative y
++_BS_R, _BS_RAIL_R = _blindspot_mesh(1.0)
++
+ 
+ @dataclass
+ class SceneState:
+-  """Everything the scene draws. Plain arrays so this is testable without cereal."""
+-  lane_lines: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = field(default_factory=list)
++  """Everything the scene draws.
++
++  Polylines arrive already resampled onto the fixed render grids as (y, z, n_valid) -- x is the
++  grid itself. Doing it this way is what lets the renderer filter per index at the model rate; see
++  smoothing.py. Plain arrays, so this stays testable without cereal.
++  """
++  lane_lines: list[tuple[np.ndarray, np.ndarray, int]] = field(default_factory=list)  # on GRID_S
+   lane_line_probs: list[float] = field(default_factory=list)
+-  road_edges: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = field(default_factory=list)
+-  path: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
++  road_edges: list[tuple[np.ndarray, np.ndarray, int]] = field(default_factory=list)  # on GRID_S
++  path: tuple[np.ndarray, np.ndarray, int] | None = None                              # PATH_GRID_S
+   accel: np.ndarray | None = None          # planned longitudinal accel along the path
+   leads: list[tuple[float, float, float, float]] = field(default_factory=list)  # x, y, prob, v
+   v_ego: float = 0.0
+-  left_blindspot: bool = False
+-  right_blindspot: bool = False
++  left_blindspot: float = 0.0              # filtered 0..1 opacity, not the raw boolean
++  right_blindspot: float = 0.0
++  blindspot_enabled: bool = True
++  dash_phase: float = 0.0
++  cam_x: float = 0.0
++  cam_target_z: float = -CAM_TARGET_NEAR
++  pulse: float = 1.0
+   light_sensor: float = 0.0
+   is_metric: bool = False
+   valid: bool = False
+ 
++  @classmethod
++  def from_polylines(cls, lane_lines=None, road_edges=None, path=None, **kw) -> "SceneState":
++    """Build from raw model-shaped polylines by resampling onto the render grids.
+ 
+-def _tris(tris: np.ndarray, color: tuple[int, int, int, int]) -> None:
++    Convenience for the offline harness and tests. The live renderer resamples itself so it can
++    smooth in between; this is the same call sequence without the filter.
++    """
++    def grid(lines, g):
++      out = []
++      for x, y, z in lines or []:
++        gy, gz, n = geo.resample_to_grid(x, y, z, g)
++        out.append((gy, gz, n))
++      return out
++
++    p = None
++    if path is not None:
++      py, pz, pn = geo.resample_to_grid(*path, geo.PATH_GRID_S)
++      p = (py, pz, pn)
++    return cls(lane_lines=grid(lane_lines, geo.GRID_S),
++               road_edges=grid(road_edges, geo.GRID_S), path=p, **kw)
++
++
++def _tris(tris: np.ndarray, color) -> None:
+   # note: rl.Color is a cffi constructor, not a Python type, so it cannot be isinstance-checked
+   if tris.size == 0:
+     return
+@@ -65,7 +184,7 @@ def _tris(tris: np.ndarray, color: tuple[int, int, int, int]) -> None:
+     )
+ 
+ 
+-def _tris_colored(tris: np.ndarray, colors: list) -> None:
++def _tris_colored(tris: np.ndarray, colors) -> None:
+   """Per-segment colours; tris are interleaved two-per-segment by ribbon_varying."""
+   for i, t in enumerate(tris):
+     c = colors[min(i // 2, len(colors) - 1)]
+@@ -77,25 +196,73 @@ def _tris_colored(tris: np.ndarray, colors: list) -> None:
+     )
+ 
+ 
++def _tris_faded(tris: np.ndarray, color, weights: np.ndarray, scale: float = 1.0) -> None:
++  """One colour, per-triangle alpha. Triangles whose alpha rounds to nothing are skipped.
++
++  draw_triangle_3d takes a single colour per triangle, so a true per-vertex gradient would need
++  the rlgl batch path. Stepping the alpha across a fine enough mesh is visually equivalent here
++  and keeps the fallback simple.
++  """
++  if tris.size == 0:
++    return
++  r, g, b, a = color
++  for i, t in enumerate(tris):
++    alpha = int(a * weights[min(i, len(weights) - 1)] * scale)
++    if alpha <= 2:
++      continue
++    rl.draw_triangle_3d(
++      rl.Vector3(float(t[0][0]), float(t[0][1]), float(t[0][2])),
++      rl.Vector3(float(t[1][0]), float(t[1][1]), float(t[1][2])),
++      rl.Vector3(float(t[2][0]), float(t[2][1]), float(t[2][2])),
++      rl.Color(r, g, b, alpha),
++    )
++
++
++def _band(y_l, z_l, y_r, z_r, lift, n) -> np.ndarray:
++  """Triangles for a strip between two grid-sampled edges, from node 0 to n."""
++  if n < 2:
++    return np.zeros((0, 3, 3), dtype=np.float32)
++  x = geo.GRID_S[:n]
++  left = np.stack([x, y_l[:n], z_l[:n] - lift], axis=1).astype(np.float32)
++  right = np.stack([x, y_r[:n], z_r[:n] - lift], axis=1).astype(np.float32)
++  lw, rw = geo.car_to_world(left), geo.car_to_world(right)
++  a, b, c, d = lw[:-1], rw[:-1], lw[1:], rw[1:]
++  return np.concatenate([np.stack([a, c, b], axis=1), np.stack([b, c, d], axis=1)], axis=0)
++
++
+ class Scene3D:
+   def __init__(self):
+     self._car: CarShape | None = None
+     self._theme = ThemeSelector()
+     self._camera = rl.Camera3D(
+-      rl.Vector3(*CAM_POS), rl.Vector3(*CAM_TARGET), rl.Vector3(0.0, 1.0, 0.0),
++      rl.Vector3(*CAM_POS), rl.Vector3(0.0, 0.0, -CAM_TARGET_NEAR), rl.Vector3(0.0, 1.0, 0.0),
+       CAM_FOV, rl.CameraProjection.CAMERA_PERSPECTIVE,
+     )
+     self._font = None
++    self._measure = None
++    self._horizon: tuple[float, float, float] | None = None   # (w, h, screen y), camera is fixed
++    self._lead_ft: int | None = None
+ 
+   def _ensure_assets(self):
+     if self._car is None:
+-      self._car = CarShape()
++      self._car = vehicles.make_car()
+     if self._font is None:
+       try:
+         from openpilot.system.ui.lib.application import gui_app, FontWeight
+         self._font = gui_app.font(FontWeight.MEDIUM)
+       except Exception:
+         self._font = rl.get_font_default()   # headless harness has no gui_app
++    if self._measure is None:
++      # gui_app monkey-patches draw_text_ex to multiply font_size by FONT_SCALE, and
++      # measure_text_cached applies the same scale. Measuring with raw measure_text_ex therefore
++      # undersizes every label box by 16% and the text overflows its rounded rect.
++      # Imported lazily: text_measure pulls in application.py at module scope, which would break
++      # this module's headless importability that the offline harness depends on.
++      try:
++        from openpilot.system.ui.lib.text_measure import measure_text_cached
++        self._measure = measure_text_cached
++      except Exception:
++        self._measure = lambda f, t, s, sp=0: rl.measure_text_ex(f, t, s, sp)  # noqa: TID251
+ 
+   def unload(self):
+     if self._car is not None:
+@@ -105,6 +272,11 @@ class Scene3D:
+   def render(self, rect: rl.Rectangle, state: SceneState) -> None:
+     self._ensure_assets()
+     pal = self._theme.update(state.light_sensor)
++    fade = FADE_NIGHT if self._theme.night else FADE_DAY
++
++    self._camera.position.x = state.cam_x
++    self._camera.target.x = state.cam_x
++    self._camera.target.z = state.cam_target_z
+ 
+     # The CALLER must already be in scissor mode for `rect`. We deliberately do not open our own:
+     # rl.end_scissor_mode() disables the scissor test outright rather than restoring the previous
+@@ -125,8 +297,8 @@ class Scene3D:
+     rl.rl_disable_depth_test()
+     self._draw_ground(pal)
+     if state.valid:
+-      self._draw_road(pal, state)
+-      self._draw_ego_lane(pal, state)
++      self._draw_road(pal, state, fade)
++      self._draw_ego_lane(pal, state, fade)
+     self._draw_shadows(pal, state)
+     if state.valid:
+       self._draw_path(pal, state)
+@@ -134,11 +306,13 @@ class Scene3D:
+     self._draw_blindspots(pal, state)
+     rl.rl_draw_render_batch_active()
+ 
++    # Cars are closed solids, so the GPU can reject their back faces; the ground ribbons cannot,
++    # because their winding flips on curves.
+     rl.rl_enable_depth_test()
++    rl.rl_enable_backface_culling()
+     self._draw_ego(pal)
+     self._draw_leads(pal, state)
+ 
+-    rl.rl_enable_backface_culling()
+     rl.end_mode_3d()
+ 
+     self._draw_horizon_fade(rect, pal)
+@@ -154,103 +328,153 @@ class Scene3D:
+ 
+   def _draw_horizon_fade(self, rect: rl.Rectangle, pal: Palette):
+     """The model stops at MAX_DIST, so the road would otherwise end in a hard edge mid-scene.
+-    Fade the far field into the sky instead of pretending the world ends."""
+-    far = rl.get_world_to_screen_ex(
+-      rl.Vector3(0.0, 0.0, -MAX_DIST * 1.4), self._camera, int(rect.width), int(rect.height)
+-    )
++    Fade the far field into the sky instead of pretending the world ends.
++
++    The camera's pitch is fixed, so the projected horizon row only depends on the rect size --
++    cache it rather than projecting a point every frame.
++    """
++    if self._horizon is None or self._horizon[0] != rect.width or self._horizon[1] != rect.height:
++      far = rl.get_world_to_screen_ex(
++        rl.Vector3(0.0, 0.0, -MAX_DIST * 1.4), self._camera, int(rect.width), int(rect.height)
++      )
++      self._horizon = (rect.width, rect.height, far.y)
++
+     top = rect.y
+-    bottom = min(rect.y + rect.height, rect.y + far.y + rect.height * 0.12)
++    bottom = min(rect.y + rect.height, rect.y + self._horizon[2] + rect.height * 0.12)
+     if bottom <= top:
+       return
+     rl.draw_rectangle_gradient_v(
+       int(rect.x), int(top), int(rect.width), int(bottom - top),
+-      rl.Color(*pal.sky_bottom), rl.Color(pal.sky_bottom[0], pal.sky_bottom[1], pal.sky_bottom[2], 0),
++      rl.Color(*pal.haze), rl.Color(pal.haze[0], pal.haze[1], pal.haze[2], 0),
+     )
+ 
+   # --- ground --------------------------------------------------------------------------------
+ 
+   def _draw_ground(self, pal: Palette):
+-    _tris(geo.quad(np.array([
+-      [-GROUND_BEHIND, GROUND_SIDE, 0.0], [GROUND_AHEAD, GROUND_SIDE, 0.0],
+-      [GROUND_AHEAD, -GROUND_SIDE, 0.0], [-GROUND_BEHIND, -GROUND_SIDE, 0.0],
+-    ])), pal.ground)
++    """Banded so the ground can wash out into haze at the horizon.
+ 
+-  def _draw_road(self, pal: Palette, state: SceneState):
++    A flat fill to 600 m was the most video-game thing in the scene: real ground loses contrast
++    with distance, and without that the far field reads as a painted backdrop.
++    """
++    gr, gg, gb, ga = pal.ground
++    hr, hg, hb, _ = pal.haze
++    edges = np.linspace(-GROUND_BEHIND, GROUND_AHEAD, GROUND_BANDS + 1, dtype=np.float32)
++    for i in range(GROUND_BANDS):
++      t = (i + 0.5) / GROUND_BANDS
++      k = float(geo.smoothstep(np.array([t * 1.35], dtype=np.float32))[0])
++      col = (int(gr + (hr - gr) * k), int(gg + (hg - gg) * k), int(gb + (hb - gb) * k), ga)
++      _tris(geo.quad(np.array([
++        [edges[i], GROUND_SIDE, 0.0], [edges[i + 1], GROUND_SIDE, 0.0],
++        [edges[i + 1], -GROUND_SIDE, 0.0], [edges[i], -GROUND_SIDE, 0.0],
++      ], dtype=np.float32)), col)
++
++  def _draw_road(self, pal: Palette, state: SceneState, fade: np.ndarray):
+     if len(state.road_edges) < 2:
+       return
+ 
+-    lx, ly, lz = geo.extend_back(*geo.trim(*state.road_edges[0], MAX_DIST))
+-    rx, ry, rz = geo.extend_back(*geo.trim(*state.road_edges[-1], MAX_DIST))
+-    n = min(len(lx), len(rx))
++    ly, lz, ln = state.road_edges[0]
++    ry, rz, rn = state.road_edges[-1]
++    n = min(ln, rn)
+     if n < 2:
+       return
+ 
+     # a wider shoulder pass under the surface gives the road a lip instead of a paper edge
+     for pad, colour, lift in ((0.55, pal.road_shoulder, Z_ROAD), (0.0, pal.road, Z_ROAD + 0.002)):
+-      left = np.stack([lx[:n], ly[:n] - pad, lz[:n] - lift], axis=1).astype(np.float32)
+-      right = np.stack([rx[:n], ry[:n] + pad, rz[:n] - lift], axis=1).astype(np.float32)
+-      lw, rw = geo.car_to_world(left), geo.car_to_world(right)
+-      a, b, c, d = lw[:-1], rw[:-1], lw[1:], rw[1:]
+-      _tris(np.concatenate([np.stack([a, c, b], axis=1), np.stack([b, c, d], axis=1)], axis=0), colour)
++      _tris(_band(ly - pad, lz, ry + pad, rz, lift, n), colour)
+ 
+-    for edge in state.road_edges:
+-      ex, ey, ez = geo.extend_back(*geo.trim(*edge, MAX_DIST))
+-      _tris(geo.ribbon(ex, ey, ez, EDGE_WIDTH, Z_LANE), pal.road_edge)
++    for ey, ez, en in state.road_edges:
++      if en < 2:
++        continue
++      widths = EDGE_WIDTH * (1.0 + LANE_TAPER_K * np.clip(geo.GRID_S[:en] / 90.0, 0.0, 1.0))
++      tris = geo.ribbon_varying(geo.GRID_S[:en], ey[:en], ez[:en], widths, Z_LANE)
++      _tris_faded(tris, pal.road_edge, np.repeat(fade[:en - 1], 2))
+ 
+-  def _draw_ego_lane(self, pal: Palette, state: SceneState):
++  def _draw_ego_lane(self, pal: Palette, state: SceneState, fade: np.ndarray):
+     """Lightly fill the lane the car is in.
+ 
+     Costs two triangles per segment and does more for legibility than anything else here: it
+     separates 'my lane' from 'the road' at a glance, which is most of what the Tesla view is
+-    actually communicating.
++    actually communicating. Scaled by confidence, because it is also the scene's strongest claim.
+     """
+     if len(state.lane_lines) < 4:
+       return
+-
+-    lx, ly, lz = geo.extend_back(*geo.trim(*state.lane_lines[1], MAX_DIST))
+-    rx, ry, rz = geo.extend_back(*geo.trim(*state.lane_lines[2], MAX_DIST))
+-    n = min(len(lx), len(rx))
++    ly, lz, ln = state.lane_lines[1]
++    ry, rz, rn = state.lane_lines[2]
++    n = min(ln, rn)
+     if n < 2:
+       return
+ 
+-    left = np.stack([lx[:n], ly[:n], lz[:n] - Z_ROAD - 0.004], axis=1).astype(np.float32)
+-    right = np.stack([rx[:n], ry[:n], rz[:n] - Z_ROAD - 0.004], axis=1).astype(np.float32)
+-    lw, rw = geo.car_to_world(left), geo.car_to_world(right)
+-    a, b, c, d = lw[:-1], rw[:-1], lw[1:], rw[1:]
+-    _tris(np.concatenate([np.stack([a, c, b], axis=1), np.stack([b, c, d], axis=1)], axis=0),
+-          pal.ego_lane)
++    conf = min(self._conf(state, 1), self._conf(state, 2))
++    if conf <= 0.02:
++      return
++    tris = _band(ly, lz, ry, rz, Z_ROAD + 0.004, n)
++    _tris_faded(tris, pal.ego_lane, np.tile(fade[:n - 1], 2), conf)
++
++  @staticmethod
++  def _conf(state: SceneState, i: int) -> float:
++    p = state.lane_line_probs[i] if i < len(state.lane_line_probs) else 1.0
++    return float(geo.smoothstep(np.array([(p - CONF_LO) / (CONF_HI - CONF_LO)], dtype=np.float32))[0])
+ 
+   def _draw_lane_lines(self, pal: Palette, state: SceneState):
+-    for i, line in enumerate(state.lane_lines):
+-      prob = state.lane_line_probs[i] if i < len(state.lane_line_probs) else 1.0
+-      if prob < 0.25:
++    """Dashes only, fading out well before the horizon.
++
++    Real dividers are painted broken, and the phase scrolls with ego motion so the road reads as
++    moving. Length is gated on confidence: a barely-detected line becomes a short stub near the
++    car, which is an honest statement of what the model knows rather than a confident line drawn
++    through noise.
++    """
++    for i, (ly, lz, ln) in enumerate(state.lane_lines):
++      conf = self._conf(state, i)
++      if conf <= 0.02 or ln < 2:
++        continue
++
++      # resample the smoothed line onto the dash grid; even arc steps keep the dash pattern
++      # regular and the triangle count fixed
++      valid_s = geo.GRID_S[ln - 1]
++      reach = min(float(valid_s), LANE_MIN_S + LANE_CONF_S * conf, geo.DASH_MAX_S)
++      dy = np.interp(geo.DASH_S, geo.GRID_S[:ln], ly[:ln]).astype(np.float32)
++      dz = np.interp(geo.DASH_S, geo.GRID_S[:ln], lz[:ln]).astype(np.float32)
++      n = int(np.count_nonzero(geo.DASH_S <= reach))
++      if n < 2:
+         continue
+-      lx, ly, lz = geo.extend_back(*geo.trim(*line, MAX_DIST))
+-      r, g, b, a = pal.lane_line
+-      col = (r, g, b, int(a * min(prob * 1.4, 1.0)))
+-      # dividers are painted broken; the scrolling dashes also give a sense of speed
+-      _tris(geo.dashes(lx, ly, lz, LANE_WIDTH, Z_LANE), col)
++
++      widths = LANE_WIDTH * (1.0 + LANE_TAPER_K * np.clip(geo.DASH_S[:n] / 90.0, 0.0, 1.0))
++      tris = geo.dashes_on_grid(dy, dz, widths, Z_LANE, state.dash_phase,
++                               DASH_LEN, DASH_GAP, n_valid=n)
++      if tris.size == 0:
++        continue
++      # rebuild the per-triangle fade for exactly the segments that survived the dash mask
++      mid = 0.5 * (geo.DASH_S[:n - 1] + geo.DASH_S[1:n])
++      keep = ((mid + state.dash_phase) % (DASH_LEN + DASH_GAP)) < DASH_LEN
++      w = np.repeat(DASH_FADE[:n - 1][keep], 2)
++      _tris_faded(tris, pal.lane_line, w, conf)
+ 
+   def _draw_path(self, pal: Palette, state: SceneState):
+     if state.path is None:
+       return
+-    px, py, pz = geo.trim(*state.path, PATH_DIST)
+-    if len(px) < 2:
++    py, pz, pn = state.path
++    if pn < 2:
+       return
+-
+-    t = np.linspace(0.0, 1.0, len(px), dtype=np.float32)
++    x = geo.PATH_GRID_S[:pn]
++    t = np.clip(x / geo.PATH_GRID_S[-1], 0.0, 1.0)
+     widths = PATH_WIDTH_NEAR + (PATH_WIDTH_FAR - PATH_WIDTH_NEAR) * t
+ 
+     accel = state.accel
+     night = self._theme.night
+     if accel is not None and len(accel) >= 2:
+-      a = np.interp(np.linspace(0, len(accel) - 1, len(px)), np.arange(len(accel)), accel)
++      # accel is on the model's own time grid; resample onto the path's distance nodes
++      a = np.interp(np.linspace(0, len(accel) - 1, pn), np.arange(len(accel)), accel)
+       colors = [path_color(float(v), night) for v in a[:-1]]
+     else:
+-      colors = [path_color(0.0, night)] * max(len(px) - 1, 1)
++      colors = [path_color(0.0, night)] * max(pn - 1, 1)
+ 
+-    _tris_colored(geo.ribbon_varying(px, py, pz, widths, Z_PATH), colors)
+-    _tris(geo.ribbon_varying(px, py, pz, widths * 0.10, Z_PATH + 0.004), pal.path_edge)
++    # Dissolve the far end instead of stopping at a flat edge. The path is a prediction, and one
++    # that gets less certain the further out it goes, so it should not end with a hard boundary.
++    tail = geo.distance_fade(x[:-1], PATH_FADE_START, geo.PATH_GRID_S[-1])
++    colors = [(r, g, b, int(al * tail[i])) for i, (r, g, b, al) in enumerate(colors)]
++
++    # The separate outline ribbon is gone: it was a second coplanar strip for pure decoration.
++    _tris_colored(geo.ribbon_varying(x, py[:pn], pz[:pn], widths, Z_PATH), colors)
+ 
+   def _draw_shadows(self, pal: Palette, state: SceneState):
+     spots = [(0.0, 0.0)]
+@@ -266,31 +490,32 @@ class Scene3D:
+       _tris(np.stack([np.stack([c[0], c[2], c[1]]), np.stack([c[0], c[3], c[2]])]), pal.shadow)
+ 
+   def _draw_blindspots(self, pal: Palette, state: SceneState):
+-    """BSM is a lamp, not a position: draw the zone that is occupied, never a car in it."""
+-    for active, sign in ((state.left_blindspot, -1.0), (state.right_blindspot, 1.0)):
+-      if not active:
++    """BSM is a lamp, not a position: draw the zone that is occupied, never a car in it.
++
++    Opacity is filtered with a fast attack and a slow release, so a warning can never appear late
++    but also cannot flicker as a car drifts along the boundary. The boolean itself is never
++    filtered -- only how strongly the zone is drawn.
++    """
++    if not state.blindspot_enabled:
++      return
++    for level, wash, rail in ((state.left_blindspot, _BS_L, _BS_RAIL_L),
++                              (state.right_blindspot, _BS_R, _BS_RAIL_R)):
++      if level <= 0.01:
+         continue
+-      near, far = -5.5, 2.0
+-      inner, outer = sign * 1.6, sign * 4.5
+-      lift = np.array([0.0, 0.0, -Z_LANE - 0.01], dtype=np.float32)
+-      corners = np.array([[near, inner, 0.0], [far, inner, 0.0],
+-                          [far, outer, 0.0], [near, outer, 0.0]], dtype=np.float32) + lift
+-      _tris(geo.quad(corners), pal.blindspot)
+-      # a brighter rim keeps it reading as a marked zone rather than a stain on the road
+-      for i in range(4):
+-        a, b = corners[i], corners[(i + 1) % 4]
+-        _tris(geo.ribbon(np.array([a[0], b[0]]), np.array([a[1], b[1]]),
+-                         np.array([a[2], b[2]]), 0.16, 0.0), pal.blindspot_edge)
++      k = level * state.pulse
++      _tris_faded(wash, pal.blindspot, np.repeat(BS_LAYER_W, 2), k)
++      _tris_faded(rail, pal.blindspot_edge, np.ones(2, dtype=np.float32), k)
+ 
+   # --- solids --------------------------------------------------------------------------------
+ 
+   def _draw_ego(self, pal: Palette):
+-    self._car.draw(0.0, 0.0, pal.ego_body, pal.ego_cabin)
++    self._car.draw(0.0, 0.0, pal.ego_body, pal.ego_cabin, style=EGO_STYLE(pal))
+ 
+   def _draw_leads(self, pal: Palette, state: SceneState):
+     for lead_x, lead_y, _prob, _v in state.leads:
+       w = geo.car_to_world(np.array([[lead_x, lead_y, 0.0]], dtype=np.float32))[0]
+-      self._car.draw(float(w[0]), float(w[2]), pal.lead_body, pal.lead_cabin)
++      # leads stay generic: they are other traffic, not more Outbacks
++      self._car.draw(float(w[0]), float(w[2]), pal.lead_body, pal.lead_cabin, generic=True)
+ 
+   # --- readouts ------------------------------------------------------------------------------
+ 
+@@ -309,15 +534,16 @@ class Scene3D:
+       if not (0 <= p.x <= rect.width and 0 <= p.y <= rect.height):
+         continue
+ 
+-      if state.is_metric:
+-        main = f"{lead_x:.0f} m"
+-      else:
+-        main = f"{lead_x * 3.28084:.0f} ft"
++      # The driver acts on this number, so it is never filtered. Hysteretic rounding kills the
++      # flicker with zero latency instead: the value shown is always a rounding of the live one.
++      from openpilot.selfdrive.ui.sunnypilot.onroad.scene3d.smoothing import hysteretic_round
++      raw = lead_x if state.is_metric else lead_x * 3.28084
++      self._lead_ft = hysteretic_round(raw, self._lead_ft)
++      main = f"{self._lead_ft} m" if state.is_metric else f"{self._lead_ft} ft"
+ 
+       sub = ""
+       if state.v_ego > 2.0:
+         sub = f"{lead_x / state.v_ego:.1f} s"
+-      if state.v_ego > 2.0:
+         closing = lead_v - state.v_ego
+         if closing < -1.0:
+           sub += f"   -{abs(closing) * 2.23694:.0f}"
+@@ -326,8 +552,8 @@ class Scene3D:
+ 
+   def _label(self, rect: rl.Rectangle, sx: float, sy: float, main: str, sub: str, pal: Palette):
+     pad_x, pad_y = 14, 8
+-    m = rl.measure_text_ex(self._font, main, LABEL_FONT_SIZE, 0)
+-    s = rl.measure_text_ex(self._font, sub, LABEL_SUB_SIZE, 0) if sub else rl.Vector2(0, 0)
++    m = self._measure(self._font, main, LABEL_FONT_SIZE, 0)
++    s = self._measure(self._font, sub, LABEL_SUB_SIZE, 0) if sub else rl.Vector2(0, 0)
+ 
+     w = max(m.x, s.x) + pad_x * 2
+     h = m.y + (s.y + 2 if sub else 0) + pad_y * 2
+diff --git a/openpilot/selfdrive/ui/sunnypilot/onroad/scene3d/smoothing.py b/openpilot/selfdrive/ui/sunnypilot/onroad/scene3d/smoothing.py
+new file mode 100644
+index 0000000..8192686
+--- /dev/null
++++ b/openpilot/selfdrive/ui/sunnypilot/onroad/scene3d/smoothing.py
+@@ -0,0 +1,159 @@
++"""
++Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
++
++This file is part of sunnypilot and is licensed under the MIT License.
++See the LICENSE.md file in the root directory for more details.
++
++Temporal smoothing for the 3D scene.
++
++Deliberately free of pyray, cereal and ui_state imports: that is what lets the offline harness
++measure jitter and the unit tests assert the filter's behaviour without a GPU or a device.
++
++WHY PER-INDEX FILTERING IS CORRECT HERE
++
++Everything is resampled onto a fixed distance grid (geometry.GRID_S) first, so index k always
++means "the model's estimate at GRID_S[k] metres ahead". Filtering across frames therefore answers
++"what is the lateral offset of this line 75 m out?" -- a quantity that is genuinely constant on a
++straight and changes slowly on a curve.
++
++It does NOT smear with ego motion, because the grid is ego-relative and re-anchored by the model
++every frame. Filtering a world-fixed polyline would smear; this does not.
++
++WHAT IS DELIBERATELY NOT SMOOTHED
++
++Anything the driver acts on. `valid` (the model going invalid must show immediately), the planned
++acceleration that colours the path (lagging it would misrepresent planned braking), and the lead
++distance readout (which uses hysteretic rounding instead -- flicker-free with zero latency).
++"""
++
++import numpy as np
++
++from openpilot.selfdrive.ui.sunnypilot.onroad.scene3d.geometry import GRID_S, PATH_GRID_S
++
++# modelV2's period. NOT the UI frame time: the UI runs at 20 FPS on tizi but 60 on tici, and
++# filtering in the draw path would give the same code three different time constants depending on
++# hardware. Smoothing runs once per model message, where dt is this constant.
++DT = 0.05
++
++# Near points must stay fast: that is where the car actually is, and lag there reads as the render
++# sliding, which is worse than jitter. Far points are noisiest and are what we most want to calm.
++#
++# RC_NEAR is deliberately small. Model noise at the bumper is only ~3 cm, so there is almost
++# nothing to gain by smoothing it, and every millisecond of near-field lag makes the geometry feel
++# detached from the car. The measured step response at 3 m is ~64% tracked within two frames.
++RC_NEAR = 0.06
++RC_FAR = 0.55
++SMOOTH_REF_DIST = 90.0
++
++# Probabilities are display-only and have no safety coupling, so they can be smoothed harder;
++# prob noise is a large share of the flicker as lines fade in and out.
++PROB_RC = 0.35
++
++# A real lane change re-anchors which physical line laneLines[1] tracks, stepping a full lane
++# width (~3.7 m). Per-frame model noise inside 50 m is well under 0.15 m. 0.75 m sits in that gap,
++# so a genuine manoeuvre snaps on the next message and is never lagged, while noise never snaps.
++# Beyond 50 m the model's own noise can exceed the threshold, so it is not tested there.
++SNAP_DEV = 0.75
++SNAP_TEST_DIST = 50.0
++
++
++def alphas_for(grid: np.ndarray, rc_near: float = RC_NEAR, rc_far: float = RC_FAR) -> np.ndarray:
++  """Per-node EMA coefficient, smoothing harder with distance.
++
++  rc is a time constant in seconds, matching FirstOrderFilter's convention, so these constants
++  stay meaningful regardless of frame rate.
++  """
++  t = np.clip(grid / SMOOTH_REF_DIST, 0.0, 1.0)
++  rc = rc_near + (rc_far - rc_near) * t
++  return (DT / (rc + DT)).astype(np.float32)
++
++
++ALPHAS = alphas_for(GRID_S)
++PATH_ALPHAS = alphas_for(PATH_GRID_S)
++
++SNAP_MASK = GRID_S <= SNAP_TEST_DIST
++PATH_SNAP_MASK = PATH_GRID_S <= SNAP_TEST_DIST
++
++PROB_ALPHA = np.float32(DT / (PROB_RC + DT))
++
++
++class GridSmoother:
++  """Per-index EMA over a polyline sampled on a fixed grid.
++
++  Staleness and validity transitions are the caller's business: the renderer knows when modelV2
++  went invalid or when a new route started, and calls reset(). This class handles the cases it can
++  see for itself -- first update, shape change, non-finite input, and a genuine large manoeuvre.
++  """
++
++  def __init__(self, alphas: np.ndarray, snap_dev: float = SNAP_DEV,
++               snap_mask: np.ndarray | None = None):
++    self._alphas = np.asarray(alphas, dtype=np.float32)
++    self._snap_dev = float(snap_dev)
++    self._snap_mask = snap_mask if snap_mask is not None else np.ones(len(self._alphas), dtype=bool)
++    self._has_snap_region = bool(np.any(self._snap_mask))
++    self._x: np.ndarray | None = None
++
++  @property
++  def initialised(self) -> bool:
++    return self._x is not None
++
++  def reset(self) -> None:
++    """Next update() snaps instead of gliding."""
++    self._x = None
++
++  def update(self, y: np.ndarray) -> np.ndarray:
++    """Filter one frame. Returns a copy, so callers can never mutate the filter's state."""
++    y = np.asarray(y, dtype=np.float32)
++
++    # A bad sample must not poison the state; hold the last good output instead.
++    if not np.all(np.isfinite(y)):
++      return self._x.copy() if self._x is not None else np.zeros_like(y)
++
++    # snap: uninitialised, or the shape changed under us (a stale or foreign model message)
++    if self._x is None or self._x.shape != y.shape:
++      self._x = y.copy()
++      return self._x.copy()
++
++    # snap: a real manoeuvre, judged only where the model is trustworthy enough to judge it
++    if self._has_snap_region and self._snap_mask.shape == y.shape:
++      if float(np.max(np.abs(y - self._x)[self._snap_mask])) > self._snap_dev:
++        self._x = y.copy()
++        return self._x.copy()
++
++    self._x += self._alphas * (y - self._x)
++    return self._x.copy()
++
++
++class ScalarSmoother:
++  """EMA for a small fixed-length vector with no notion of distance, e.g. lane line probabilities."""
++
++  def __init__(self, alpha: float = PROB_ALPHA):
++    self._alpha = np.float32(alpha)
++    self._x: np.ndarray | None = None
++
++  def reset(self) -> None:
++    self._x = None
++
++  def update(self, y: np.ndarray) -> np.ndarray:
++    y = np.asarray(y, dtype=np.float32)
++    if not np.all(np.isfinite(y)):
++      return self._x.copy() if self._x is not None else np.zeros_like(y)
++    if self._x is None or self._x.shape != y.shape:
++      self._x = y.copy()
++      return self._x.copy()
++    self._x += self._alpha * (y - self._x)
++    return self._x.copy()
++
++
++def hysteretic_round(value: float, previous: int | None, margin: float = 0.6) -> int:
++  """Round to an integer that only changes once the value is clearly past the boundary.
++
++  For the lead distance readout. Filtering that number would put lag into something the driver
++  acts on; this kills the flicker with zero latency instead, because the displayed value is always
++  a rounding of the current raw measurement.
++  """
++  if previous is None:
++    return int(round(value))
++  if abs(value - previous) >= margin:
++    return int(round(value))
++  return previous
+diff --git a/openpilot/selfdrive/ui/sunnypilot/onroad/scene3d/theme.py b/openpilot/selfdrive/ui/sunnypilot/onroad/scene3d/theme.py
+index 56240cf..c9a50e0 100644
+--- a/openpilot/selfdrive/ui/sunnypilot/onroad/scene3d/theme.py
++++ b/openpilot/selfdrive/ui/sunnypilot/onroad/scene3d/theme.py
+@@ -22,12 +22,17 @@ class Palette:
+   ground: Rgba
+   road: Rgba
+   road_shoulder: Rgba    # darker lip at the road edge, gives the surface thickness
++  haze: Rgba             # what the ground and the far field wash out into at the horizon
+   ego_lane: Rgba         # subtle fill of the lane you're in
+   lane_line: Rgba
+   road_edge: Rgba
+   path_edge: Rgba
+-  ego_body: Rgba
++  ego_body: Rgba         # 2018 Outback, Wilderness Green Metallic (K4X)
+   ego_cabin: Rgba
++  ego_cladding: Rgba     # black lower body trim; second-strongest Outback cue after the rails
++  ego_rail: Rgba         # roof rails
++  ego_lamp: Rgba         # rear running lamps
++  mesh_tint: Rgba        # multiplies the mesh's baked vertex colours; near-white by day
+   lead_body: Rgba
+   lead_cabin: Rgba
+   blindspot: Rgba
+@@ -42,18 +47,26 @@ DAY = Palette(
+   sky_top=(150, 172, 205, 255),
+   sky_bottom=(214, 222, 233, 255),
+   ground=(163, 172, 168, 255),
++  haze=(206, 214, 226, 255),
+   road=(112, 118, 128, 255),
+   road_shoulder=(88, 94, 103, 255),
+   ego_lane=(255, 255, 255, 26),
+   lane_line=(250, 251, 253, 240),
+   road_edge=(228, 231, 236, 225),
+   path_edge=(178, 214, 255, 190),
+-  ego_body=(228, 233, 241, 255),
+-  ego_cabin=(58, 68, 84, 255),
++  # K4X is roughly #4A5644 as a paint chip. Lifted here for a metallic finish under sky light,
++  # and because the baked face tints darken every visible face further; a literal chip value
++  # renders as near-black on the rear, which is the only face the chase camera ever sees.
++  ego_body=(108, 126, 98, 255),
++  ego_cabin=(52, 62, 74, 255),
++  ego_cladding=(58, 60, 58, 255),
++  ego_rail=(168, 172, 174, 255),
++  ego_lamp=(178, 46, 40, 255),
++  mesh_tint=(255, 255, 255, 255),
+   lead_body=(72, 80, 95, 255),
+   lead_cabin=(26, 31, 40, 255),
+-  blindspot=(250, 176, 60, 70),
+-  blindspot_edge=(255, 196, 92, 190),
++  blindspot=(252, 170, 44, 22),
++  blindspot_edge=(255, 190, 78, 225),
+   shadow=(28, 32, 40, 70),
+   label_bg=(18, 22, 30, 165),
+   label_text=(245, 247, 250, 255),
+@@ -64,18 +77,23 @@ NIGHT = Palette(
+   sky_top=(8, 10, 16, 255),
+   sky_bottom=(28, 33, 45, 255),
+   ground=(22, 26, 30, 255),
++  haze=(15, 18, 26, 255),
+   road=(44, 48, 58, 255),
+   road_shoulder=(28, 31, 38, 255),
+   ego_lane=(150, 190, 255, 20),
+   lane_line=(214, 222, 236, 225),
+   road_edge=(150, 160, 178, 200),
+   path_edge=(120, 184, 255, 195),
+-  ego_body=(214, 221, 233, 255),
+-  ego_cabin=(44, 52, 66, 255),
++  ego_body=(104, 126, 94, 255),
++  ego_cabin=(38, 46, 58, 255),
++  ego_cladding=(34, 36, 38, 255),
++  ego_rail=(120, 126, 130, 255),
++  ego_lamp=(150, 34, 30, 255),
++  mesh_tint=(150, 160, 178, 255),
+   lead_body=(58, 65, 80, 255),
+   lead_cabin=(20, 24, 32, 255),
+-  blindspot=(250, 168, 48, 78),
+-  blindspot_edge=(255, 190, 84, 200),
++  blindspot=(252, 164, 36, 24),
++  blindspot_edge=(255, 186, 70, 235),
+   shadow=(0, 0, 0, 95),
+   label_bg=(10, 13, 20, 195),
+   label_text=(238, 242, 248, 255),
+diff --git a/openpilot/selfdrive/ui/sunnypilot/onroad/scene3d/vehicles.py b/openpilot/selfdrive/ui/sunnypilot/onroad/scene3d/vehicles.py
+index 7a38815..ef10183 100644
+--- a/openpilot/selfdrive/ui/sunnypilot/onroad/scene3d/vehicles.py
++++ b/openpilot/selfdrive/ui/sunnypilot/onroad/scene3d/vehicles.py
+@@ -5,33 +5,54 @@ This file is part of sunnypilot and is licensed under the MIT License.
+ See the LICENSE.md file in the root directory for more details.
+ """
+ 
++import os
++
+ import pyray as rl
+ 
+-# Low-poly cars from primitives: no external mesh assets, nothing to license or vendor.
+-#
+-# Faces are drawn individually with a per-face brightness rather than as a single flat-shaded
+-# cube. raylib has no lighting without a custom shader, and shaders mean GLSL version differences
+-# between the desktop and comma backends. Baking a fixed key light into face tints costs nothing,
+-# never breaks, and is what actually makes the shapes read as solid objects.
++from openpilot.selfdrive.ui.sunnypilot.onroad.scene3d import dimensions as dim
+ 
++# Light is baked in: per-face tints for the procedural car, per-vertex colours for the loaded
++# mesh. The face constants live in dimensions.py so they can be tested without pyray.
+ # world axes: +x right, +y up, -z forward
+-FACE_TOP, FACE_FRONT, FACE_REAR, FACE_LEFT, FACE_RIGHT = 1.0, 0.86, 0.58, 0.93, 0.70
++FACE_TOP = dim.FACE_TOP
++FACE_FRONT = dim.FACE_FRONT
++FACE_REAR = dim.FACE_REAR
++FACE_LEFT = dim.FACE_LEFT
++FACE_RIGHT = dim.FACE_RIGHT
++
++SHADOW_PAD = dim.SHADOW_PAD
++ASSET_DIR = os.path.join(os.path.dirname(__file__), "assets")
++
++TYRE = (16, 18, 22, 255)
++
++
++class CarStyle:
++  """Optional extra parts. Leads pass nothing and stay generic; only the ego car is an Outback."""
++
++  __slots__ = ("cladding", "rail", "lamp", "mesh_tint")
++
++  def __init__(self, cladding=None, rail=None, lamp=None, mesh_tint=None):
++    self.cladding = cladding
++    self.rail = rail
++    self.lamp = lamp
++    self.mesh_tint = mesh_tint
++
+ 
+-# rough Outback-ish proportions, metres
+-BODY_W, BODY_H, BODY_L = 1.86, 0.52, 4.62
+-SILL_W, SILL_H = 1.74, 0.26          # lower body, slightly tucked in
+-CABIN_W, CABIN_H, CABIN_L = 1.60, 0.58, 2.34
+-CABIN_Z = -0.18                       # cabin sits a little rearward
+-WHEEL_R, WHEEL_W, WHEEL_INSET = 0.33, 0.22, 0.06
+-SHADOW_PAD = 0.30
++def EGO_STYLE(pal) -> CarStyle:
++  return CarStyle(cladding=pal.ego_cladding, rail=pal.ego_rail, lamp=pal.ego_lamp,
++                  mesh_tint=pal.mesh_tint)
+ 
+ 
+-def _shade(color: tuple[int, int, int, int], k: float) -> rl.Color:
++def _shade(color, k: float) -> rl.Color:
+   return rl.Color(int(color[0] * k), int(color[1] * k), int(color[2] * k), color[3])
+ 
+ 
+ class CarShape:
+-  """Reusable unit cube, drawn as scaled per-face instances to build a car."""
++  """A car built from one reusable unit cube, drawn as scaled per-face instances.
++
++  No external assets, nothing to license or vendor. This is the fallback whenever the mesh is
++  missing, and it is what every lead vehicle uses.
++  """
+ 
+   def __init__(self):
+     self._cube = rl.load_model_from_mesh(rl.gen_mesh_cube(1.0, 1.0, 1.0))
+@@ -49,48 +70,121 @@ class CarShape:
+   def _shaded_box(self, cx, cy, cz, w, h, ln, color):
+     """A box built from thin slabs, each tinted for its facing direction.
+ 
+-    Cheaper and more robust than a shader, and the slight inset between slabs reads as a panel
+-    gap rather than an artifact.
++    The front face is omitted: the camera sits behind the ego car and behind every lead, so no
++    car's nose is ever visible. Three fewer draws per car, and nothing to see through because
++    seeing into the open front would require looking from in front.
+     """
+     t = 0.012
+-    # sides first, then the lid on top, so the brightest face wins where they meet
+     self._face(cx - w * 0.5 + t * 0.5, cy, cz, t, h, ln, _shade(color, FACE_LEFT))
+     self._face(cx + w * 0.5 - t * 0.5, cy, cz, t, h, ln, _shade(color, FACE_RIGHT))
+-    self._face(cx, cy, cz - ln * 0.5 + t * 0.5, w, h, t, _shade(color, FACE_FRONT))
+     self._face(cx, cy, cz + ln * 0.5 - t * 0.5, w, h, t, _shade(color, FACE_REAR))
+     self._face(cx, cy + h * 0.5 - t * 0.5, cz, w, t, ln, _shade(color, FACE_TOP))
+     # interior fill so nothing shows through at grazing angles
+     self._face(cx, cy, cz, w - t, h - t, ln - t, _shade(color, FACE_RIGHT))
+ 
+-  def draw(self, x: float, z: float, body: tuple, cabin: tuple, scale: float = 1.0):
++  def draw(self, x: float, z: float, body, cabin, scale: float = 1.0,
++           style: CarStyle | None = None, generic: bool = False):
+     """Draw a car centred at world (x, z), sitting on the ground plane."""
+-    bw, bh, bl = BODY_W * scale, BODY_H * scale, BODY_L * scale
+-    sw, sh = SILL_W * scale, SILL_H * scale
+-    cw, ch, cl = CABIN_W * scale, CABIN_H * scale, CABIN_L * scale
+-    wr, ww = WHEEL_R * scale, WHEEL_W * scale
++    s = scale
++    sill_h = (dim.SILL_Z1 - dim.SILL_Z0) * s
++    body_h = (dim.BODY_Z1 - dim.BODY_Z0) * s
++    cab_h = (dim.CABIN_Z1 - dim.CABIN_Z0) * s
+ 
+-    sill_y = wr * 0.72
+-    body_y = sill_y + sh * 0.5 + bh * 0.5
+-    cabin_y = body_y + bh * 0.5 + ch * 0.5
++    sill_y = (dim.SILL_Z0 + dim.SILL_Z1) * 0.5 * s
++    body_y = (dim.BODY_Z0 + dim.BODY_Z1) * 0.5 * s
++    cab_y = (dim.CABIN_Z0 + dim.CABIN_Z1) * 0.5 * s
+ 
+-    self._shaded_box(x, sill_y, z, sw, sh, bl * 0.98, body)
+-    self._shaded_box(x, body_y, z, bw, bh, bl, body)
+-    self._shaded_box(x, cabin_y, z + CABIN_Z * scale, cw, ch, cl, cabin)
++    cab_l = (dim.CABIN_L if not generic else dim.CABIN_L * 0.78) * s
++    cab_z = z + (dim.CABIN_OFFS if not generic else 0.0) * s
+ 
+-    tyre = (16, 18, 22, 255)
++    # The cladding is a free Outback cue: same triangles, different colour.
++    sill_col = style.cladding if (style and style.cladding) else body
++    self._shaded_box(x, sill_y, z, dim.SILL_W * s, sill_h, dim.BODY_L * 0.98 * s, sill_col)
++    self._shaded_box(x, body_y, z, dim.BODY_W * s, body_h, dim.BODY_L * s, body)
++    self._shaded_box(x, cab_y, cab_z, dim.CABIN_W * s, cab_h, cab_l, cabin)
++
++    wr, ww = dim.WHEEL_R * s, dim.WHEEL_W * s
+     for dx in (-1, 1):
+       for dz in (-1, 1):
+-        wx = x + dx * (bw * 0.5 - ww * 0.5 - WHEEL_INSET * scale)
+-        wz = z + dz * (bl * 0.31)
+-        self._face(wx, wr * 0.62, wz, ww, wr * 1.24, wr * 2.0, rl.Color(*tyre))
++        wx = x + dx * (dim.BODY_W * 0.5 * s - ww * 0.5 - dim.WHEEL_INSET * s)
++        wz = z + dz * dim.WHEEL_Z * s
++        self._face(wx, wr * 0.62, wz, ww, wr * 1.24, wr * 2.0, rl.Color(*TYRE))
++
++    if style is None:
++      return
++
++    if style.rail:
++      # roof rails: the single most recognisable Outback silhouette cue, two boxes
++      rail_y = (dim.RAIL_Z0 + dim.RAIL_Z1) * 0.5 * s
++      rail_h = (dim.RAIL_Z1 - dim.RAIL_Z0) * s
++      for dx in (-1, 1):
++        self._face(x + dx * dim.RAIL_X * s, rail_y, cab_z, dim.RAIL_W * s, rail_h,
++                   dim.RAIL_L * s, _shade(style.rail, FACE_TOP))
++
++    if style.lamp:
++      # Constant running lamps only. Never wired to brakePressed: openpilot does not control
++      # longitudinal on this car, and rendering a brake state invites reading the view as ground
++      # truth about the vehicle.
++      lz = z + dim.BODY_L * 0.5 * s
++      for dx in (-1, 1):
++        self._face(x + dx * dim.LAMP_X * s, dim.LAMP_Z * s, lz,
++                   dim.LAMP_W * s, dim.LAMP_H * s, 0.03 * s, rl.Color(*style.lamp))
++
++
++class MeshCarShape(CarShape):
++  """Ego car from a decimated real Outback mesh, with the generic car as the fallback.
++
++  Shading is baked into the mesh's vertex colours at build time (see tools/build_car_mesh.py), so
++  this still needs no shader. draw_model_ex's tint multiplies over those colours, which is what
++  lets the day/night palette shift the whole car without a second asset.
++
++  Inherits CarShape so leads -- and the ego car if the asset is missing -- still render.
++  """
++
++  def __init__(self, path: str):
++    super().__init__()
++    self._model = rl.load_model(path.encode())
++    # A model that failed to load comes back with no meshes; fall back rather than draw nothing.
++    self._have_mesh = self._model.meshCount > 0
++    self._mesh_path = path
++
++  def unload(self):
++    if self._have_mesh:
++      rl.unload_model(self._model)
++      self._have_mesh = False
++    super().unload()
++
++  def draw(self, x: float, z: float, body, cabin, scale: float = 1.0,
++           style: CarStyle | None = None, generic: bool = False):
++    if generic or not self._have_mesh:
++      super().draw(x, z, body, cabin, scale, style, generic)
++      return
++    # The mesh already carries its paint and its baked light in vertex colours, so the tint must
++    # be near-white -- passing the body colour here would multiply green by green and render a
++    # dark smear. The tint is what shifts the whole car between the day and night palettes.
++    tint = (style.mesh_tint if (style and style.mesh_tint) else (255, 255, 255, 255))
++    # authored nose-forward in the same frame the scene uses, so no rotation is needed
++    rl.draw_model_ex(self._model, rl.Vector3(x, 0.0, z), rl.Vector3(0.0, 1.0, 0.0), 0.0,
++                     rl.Vector3(scale, scale, scale), rl.Color(*tint))
++
++
++def make_car() -> CarShape:
++  """Mesh if it was vendored, procedural otherwise. Fails closed by construction."""
++  path = os.path.join(ASSET_DIR, dim.MESH_FILE)
++  if os.path.exists(path):
++    car = MeshCarShape(path)
++    if car._have_mesh:
++      return car
++    car.unload()
++  return CarShape()
+ 
+ 
+ def shadow_quad(x: float, z: float, scale: float = 1.0):
+   """Footprint for a car's contact shadow, in world space.
+ 
+-  Without this the cars look pasted onto the road rather than standing on it — the single
++  Without this the cars look pasted onto the road rather than standing on it -- the single
+   cheapest thing that sells the 3D.
+   """
+-  hw = (BODY_W * scale) * 0.5 + SHADOW_PAD
+-  hl = (BODY_L * scale) * 0.5 + SHADOW_PAD
++  hw = (dim.BODY_W * scale) * 0.5 + SHADOW_PAD
++  hl = (dim.BODY_L * scale) * 0.5 + SHADOW_PAD
+   return x - hw, x + hw, z - hl, z + hl
