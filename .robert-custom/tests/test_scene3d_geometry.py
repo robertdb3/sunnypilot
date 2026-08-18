@@ -20,9 +20,24 @@ REPO = os.environ.get("SUNNYPILOT",
 sys.path.insert(0, REPO)
 
 from openpilot.selfdrive.ui.sunnypilot.onroad.scene3d import geometry as geo  # noqa: E402
-from openpilot.selfdrive.ui.sunnypilot.onroad.scene3d import smoothing as sm  # noqa: E402
-from openpilot.selfdrive.ui.sunnypilot.onroad.scene3d import dimensions as dim  # noqa: E402
 from openpilot.selfdrive.ui.sunnypilot.onroad.scene3d import theme  # noqa: E402
+
+# `smoothing` and `dimensions` arrive with patch 0011, which is currently NOT applied by
+# apply_candidate.sh -- it was pulled back out after the capnp slice crash of 2026-08-18
+# (symptom 14). Skip rather than fail so the rest of this file still guards the coordinate
+# conversion, and so these tests come back automatically when 0011 is re-applied.
+try:  # noqa: E402
+  from openpilot.selfdrive.ui.sunnypilot.onroad.scene3d import smoothing as sm  # noqa: E402
+  from openpilot.selfdrive.ui.sunnypilot.onroad.scene3d import dimensions as dim  # noqa: E402
+  HAVE_0011 = True
+except ImportError:  # pragma: no cover - depends on whether 0011 is in the applied set
+  sm = dim = None
+  HAVE_0011 = False
+
+# 0011 also adds grid helpers to geometry.py; the module imports either way, so probe an attribute.
+HAVE_0011 = HAVE_0011 and hasattr(geo, "resample_to_grid")
+
+requires_0011 = unittest.skipUnless(HAVE_0011, "patch 0011 is not in the applied set")
 
 
 
@@ -184,6 +199,7 @@ class TestDashes(unittest.TestCase):
 
 
 
+@requires_0011
 class TestGrid(unittest.TestCase):
   """The render grid is the contract every other piece depends on."""
 
@@ -213,6 +229,7 @@ class TestGrid(unittest.TestCase):
     self.assertAlmostEqual(float(f[-1]), 0.0, places=5)
 
 
+@requires_0011
 class TestResample(unittest.TestCase):
   def test_returns_full_length(self):
     x = np.linspace(0.0, 150.0, 33, dtype=np.float32)
@@ -256,6 +273,7 @@ class TestResample(unittest.TestCase):
     self.assertEqual(len(gy), len(geo.GRID_S))
 
 
+@requires_0011
 class TestGridSmoother(unittest.TestCase):
   """The anti-jitter filter. Lag here is the dangerous failure, not noise."""
 
@@ -338,6 +356,7 @@ class TestGridSmoother(unittest.TestCase):
     self.assertTrue(np.all(np.isfinite(out)))
 
 
+@requires_0011
 class TestDashesOnGrid(unittest.TestCase):
   def _line(self):
     y = np.zeros(len(geo.DASH_S), dtype=np.float32)
@@ -369,6 +388,7 @@ class TestDashesOnGrid(unittest.TestCase):
     self.assertLess(len(short), len(long_))
 
 
+@requires_0011
 class TestCarDimensions(unittest.TestCase):
   """Published 2018 Outback figures, so a future edit cannot quietly make it a sedan again."""
 
@@ -397,6 +417,7 @@ class TestCarDimensions(unittest.TestCase):
     self.assertAlmostEqual(dim.CABIN_Z1, dim.RAIL_Z0, places=6)
 
 
+@requires_0011
 class TestPaletteReadability(unittest.TestCase):
   """The chase camera only ever sees a car's rear, so that face decides legibility."""
 
