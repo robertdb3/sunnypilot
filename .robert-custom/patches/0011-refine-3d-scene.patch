@@ -369,11 +369,11 @@ index 889e479..bda9adf 100644
 +    if model_valid and sm_.updated.get("modelV2"):
 +      self._since_model = 0
 +      model = sm_["modelV2"]
-+      state.lane_lines = [self._grid_line(_xyz(line), geo.GRID_S, self._lane_y[i], self._lane_z[i])
-+                          for i, line in enumerate(model.laneLines[:4])]
++      state.lane_lines = [self._grid_line(_xyz(model.laneLines[i]), geo.GRID_S, self._lane_y[i], self._lane_z[i])
++                          for i in range(min(4, len(model.laneLines)))]
 +      state.lane_line_probs = list(self._probs.update(np.asarray(model.laneLineProbs, dtype=np.float32)))
-+      state.road_edges = [self._grid_line(_xyz(e), geo.GRID_S, self._edge_y[i], self._edge_z[i])
-+                          for i, e in enumerate(model.roadEdges[:2])]
++      state.road_edges = [self._grid_line(_xyz(model.roadEdges[i]), geo.GRID_S, self._edge_y[i], self._edge_z[i])
++                          for i in range(min(2, len(model.roadEdges)))]
 +      state.path = self._grid_line(_xyz(model.position), geo.PATH_GRID_S, self._path_y, self._path_z)
        # planned longitudinal accel, used to colour the path the way the experimental-mode
 -      # overlay already does (onroad/model_renderer.py)

@@ -146,7 +146,7 @@ The patch order matters because later patches harden or correct earlier behavior
 | `0008` | Fail-closed ICBM and main-button arbitration | Prevents ICBM from following the 90 mph planner fallback and preserves a physical driver main press over the cancel it causes. |
 | `0009` | Move `radard` and `plannerd` to CPU 6 | Isolates the planning chain from the custom UI load that saturated CPU 5 and caused low communication-rate alerts. |
 | `0010` | Fix the mirrored 3D frame and developer UI crashes | Corrects Forward/Right/Down model coordinates, tolerates both cereal *service* names, and avoids redundant model-array conversions. Trimmed on 2026-08-16: the `liveValid` field fallback was removed once upstream fixed that read at the source (symptom 11). |
-| ~~`0011`~~ | ~~Refine the 3D scene~~ | **Quarantined 2026-08-18** after it crash-looped the UI on the device. The scene work is sound; the defect is a Cap'n Proto slice in `renderer.py`. Held in [`quarantine/`](../quarantine), not applied by the build. See symptom 14. |
+| `0011` | Refine the 3D scene | Temporal smoothing, far-field dissolve, scrolling dashes, redesigned blind spot, damped camera. Procedural ego car only (no vendored mesh). Slice defect fixed 2026-08-18; back in the build, **still awaiting on-device validation**. See symptom 14. |
 
 The canonical patch files live in [`patches/`](../patches). The prebuilt compatibility patch lives
 under [`ports/`](../ports).
@@ -587,11 +587,29 @@ installed and never driven.
 and fails safe. Then reboot offroad, or manually launch the UI as in "The reboot/recovery lesson".
 `card` and `controlsd` never dropped, so this was never the symptom-10 condition.
 
-**Resolution:** `0011` was pulled out of `apply_candidate.sh` and moved to `quarantine/`, which is
-required rather than cosmetic: `verify_candidate.py` demands that every file named in a patch under
-`patches/` appear in the candidate diff, so an unapplied patch cannot simply sit there. The
-0011-dependent tests are gated behind a capability probe instead of deleted, so they return
-automatically when the patch does.
+**Immediate resolution:** `0011` was pulled from `apply_candidate.sh` the same night and the next
+candidate rebuilt without it.
+
+**Fix, 2026-08-18:** both sites now use only operations a capnp reader supports—`len()` and integer
+indexing—and clamp instead of assuming a fixed count:
+
+```python
+state.lane_lines = [self._grid_line(_xyz(model.laneLines[i]), geo.GRID_S, self._lane_y[i], self._lane_z[i])
+                    for i in range(min(4, len(model.laneLines)))]
+```
+
+Behaviour is unchanged: the render harness reports the same 1712 triangles and the same per-scene
+counts before and after. Two guards were added in `tests/test_scene3d_capnp_access.py`—a stub that
+refuses exactly what pycapnp refuses (proving the old idiom raises and the new one does not), and
+an AST scan that fails if any scene3d source slices a model field. **The AST guard was confirmed to
+fail against the pre-fix patch text**, reporting `renderer.py:115`, the exact line from the
+traceback.
+
+**What could not be tested, and why it matters.** An end-to-end test against a real Cap'n Proto
+reader is impossible off-device: the prebuilt `msgq` extension is aarch64-Linux, so importing
+`cereal` fails on a laptop *and* on an x86 CI runner (`ipc_pyx.so: slice is not valid mach-o file`).
+No amount of offline testing closes this gap for cereal-reading code—only the device can. That is
+what `tools/check_ui_health.py` is for.
 
 **Lesson:** a test that never constructs the real object proves only that the code is
 self-consistent. This is the same defect as symptom 10—which crash-looped `card` for exactly the
@@ -752,6 +770,7 @@ The tools in [`tools/`](../tools) exist because each caught a real class of fail
 | `probe_cruise_button.py` | Confirm the car's real short/long cruise-button step behavior. |
 | `torque_status.py` | Inspect Self-Tune enablement, validity, learned values, bounds, and bucket progress. Reads either torque-parameter service name and normalizes the validity bit; exits cleanly on a stale cache (see trap 20). |
 | `calibrate_wheel_speed.py` | Derive a wheel-speed factor from a real steady highway drive; never guess it. |
+| `check_ui_health.py` | Post-install UI smoke check, run on the device. Reports UI/`card`/`controlsd` state, `Scene3D`, and any new crash log, then watches for a fresh crash while you exercise the render path. Exists because symptom 14 could not be caught offline at all. |
 | `preview_map_panel.py` / `render_scenes.py` / `render_reckless.py` | Exercise visual code off-device before risking the live UI. |
 
 Route segment names must be sorted numerically, not lexicographically: segment `10` otherwise
@@ -924,12 +943,12 @@ different times to communication rate and driving-model lag—two different prob
   (that panel is what `0010` touches and what crashed in symptom 7) and the model change validated
   on its own terms—`check_live_service_rates.py` for `modelV2`, and alert-free driving before it is
   trusted. Do not treat it as a routine customization refresh.
-- **Patch `0011`, quarantined:** installed 2026-08-18, crash-looped the UI within minutes, and was
-  pulled from the build the same night (symptom 14). The scene work is sound and measured; the
-  defect is two Cap'n Proto slices in `renderer.py`. Before it returns: fix both sites, add a
-  regression test that feeds a reader stub which rejects slicing *and confirm that test fails
-  against the current patch text*, then install offroad and survive an onroad transition with
-  Scene3D on, CPU baseline captured first.
+- **Patch `0011` on the device:** the slice defect is fixed and guarded, and the patch is back in
+  the build, but it has **still never run on the car**. The fix is well-founded but unproven where
+  it counts. Test it deliberately: install offroad with `Scene3D=0`, confirm the UI comes up, then
+  toggle Scene3D on **while parked with the engine running** and run `tools/check_ui_health.py`—the
+  crashing path only executes onroad. Capture the CPU baseline first (`analyze_proc_load.py`,
+  `check_live_service_rates.py`) and confirm `radarState` back at 20.00 Hz after.
 - **The device's tracking branch:** it follows `custompilot-staging`, so every green candidate
   installs without review. Either point it at `custompilot-stable` via the installer URL, or accept
   that the daily build is effectively a direct-to-car channel and treat every candidate as a
