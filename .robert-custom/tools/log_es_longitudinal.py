@@ -303,16 +303,35 @@ def analyse(rows: list[dict]) -> None:
           f"{pct(vals, 95):8.0f} {max(vals):8.0f}   {GLOBAL_CONSTANTS[gmin]}..{GLOBAL_CONSTANTS[gmax]}")
 
   # Real zero-acceleration throttle: what EyeSight holds while cruising flat.
-  steady = [r for r in eng if abs(float(r["a_ego"] or 0)) < 0.1 and float(r["v_ego"] or 0) > 8]
+  # THROTTLE_INACTIVE is not a constant on this platform: steady-state throttle rises with speed,
+  # 2135 at ~17 m/s to 2698 at ~32 m/s across the measured routes. Bucket by speed rather than
+  # reporting one median, which is what hid this at first.
+  steady = [r for r in eng if abs(float(r["a_ego"] or 0)) < 0.1 and float(r["v_ego"] or 0) > 2]
   if steady:
-    vals = [float(r["cam_dist_Cruise_Throttle"]) for r in steady]
-    print(f"\nsteady cruise (|a|<0.1, v>8 m/s, n={len(steady)}): Cruise_Throttle median "
-          f"{pct(vals, 50):.0f}   global THROTTLE_INACTIVE = {GLOBAL_CONSTANTS['THROTTLE_INACTIVE']}")
+    by_speed: dict[int, list[float]] = {}
+    for r in steady:
+      by_speed.setdefault(int(float(r["v_ego"]) // 5 * 5), []).append(float(r["cam_dist_Cruise_Throttle"]))
+    print(f"\nsteady cruise (|a|<0.1), Cruise_Throttle by speed -- global ships a single "
+          f"THROTTLE_INACTIVE = {GLOBAL_CONSTANTS['THROTTLE_INACTIVE']}:")
+    print(f"  {'v_ego m/s':>12}  {'n':>6}  {'median':>8}")
+    for k in sorted(by_speed):
+      v = by_speed[k]
+      if len(v) >= 20:
+        print(f"  {k:>5}-{k + 4:<6}  {len(v):>6}  {pct(v, 50):>8.0f}")
   else:
-    print("\nno steady-cruise samples -- need some flat cruising to pin THROTTLE_INACTIVE")
+    print("\nno steady-cruise samples -- need some flat cruising to pin the throttle curve")
 
   # Brake pressure vs measured deceleration: the BRAKE_LOOKUP the global port guesses at.
-  braking = [r for r in eng if float(r["cam_brake_Brake_Pressure"] or 0) > 0]
+  #
+  # Standstill MUST be excluded. EyeSight holds real brake pressure to keep the car stopped -- median
+  # 294 counts, measured -- at aEgo = 0. Leaving those in drags whole buckets to a median of 0.00 and
+  # destroys the relationship: route 0000000d had 320 such samples in the 250-299 bucket alone, which
+  # made the curve look non-monotonic and unusable. Driver braking is excluded for the same reason:
+  # what is wanted is EyeSight's own command authority.
+  braking = [r for r in eng
+             if float(r["cam_brake_Brake_Pressure"] or 0) > 0
+             and float(r["v_ego"] or 0) > 2.0
+             and r.get("brake_pressed") != 1]
   if braking:
     print(f"\nbraking samples: {len(braking)}")
     buckets: dict[int, list[float]] = {}
@@ -323,8 +342,9 @@ def analyse(rows: list[dict]) -> None:
     for b in sorted(buckets):
       v = buckets[b]
       print(f"  {b:>10}-{b + 49:<5}  {len(v):>5}  {pct(v, 50):>22.2f}")
-    print("\n  This is the real BRAKE_LOOKUP. Global assumes BRAKE_MAX=600 ~ -3.5 m/s^2; compare the\n"
-          "  deceleration actually reached at max observed pressure before believing that here.")
+    print("\n  This is the real BRAKE_LOOKUP, standstill excluded. Measured across three routes:\n"
+          "  aEgo = -0.00519 * pressure - 0.246, so -3.5 m/s^2 needs ~627 counts and global's\n"
+          "  BRAKE_MAX of 600 gives -3.36. Unlike the throttle constants, this one roughly transfers.")
   else:
     print("\nno braking samples -- need a drive where EyeSight actually slowed for a lead")
 

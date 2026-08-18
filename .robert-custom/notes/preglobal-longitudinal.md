@@ -158,60 +158,87 @@ dangerous: there, an untested assumption crashed the UI; here it would command t
 
 ### Measured, 2026-08-18
 
-Route `0000000b--12b500b38a`, 22 segments of highway driving at up to 31.7 m/s with EyeSight ACC
-engaged; 6,379 samples, 2,349 of them engaged. Read off bus 2, i.e. what EyeSight actually
-commanded.
+Four routes off the device: one highway (`0000000b`, 22 segments) and three with real braking and
+stops (`00000011` firmest braking at −2.98 m/s², `0000000d` city with 9 stops in 9 segments,
+`00000001` 40 segments with 22 stops). Roughly 28,000 samples, read off bus 2 — what EyeSight
+actually commanded.
 
-| Signal | measured min | p05 | median | p95 | max | global ships |
-|---|---|---|---|---|---|---|
-| `Cruise_Throttle` | 52 | 1818 | 2688 | 3559 | **4063** | 808 – 3400 |
-| `Cruise_RPM` | **1414** | 1574 | 2030 | 2217 | 3408 | 0 – 3600 |
-| `Brake_Pressure` | 0 | 0 | 0 | 0 | 134 | 0 – 600 |
+**Braking: global's constant roughly transfers.** With standstill excluded, the relationship is
+monotonic and consistent across all three braking routes:
 
-**The global constants do not transfer.** Three findings, in order of importance:
+| `Brake_Pressure` | n | median `aEgo` |
+|---|---|---|
+| 0–49 | 991 | −0.30 |
+| 100–149 | 168 | −0.98 |
+| 200–249 | 97 | −1.58 |
+| 300–349 | 18 | −1.99 |
+| 450–499 | 17 | −2.76 |
 
-1. **`THROTTLE_INACTIVE` is wrong by ~900 counts.** At steady cruise (|a| < 0.1 m/s², v > 8 m/s,
-   n = 1213) EyeSight holds `Cruise_Throttle` at a median of **2700**. Global ships **1818** as its
-   "zero acceleration" value. Anything built on the global constant would have commanded a large
-   spurious deceleration at cruise.
-2. **`THROTTLE_MAX` is too low.** Observed max is **4063**, above global's 3400 — and 4063 is close
-   to the 12-bit ceiling of 4095, so the usable range plausibly runs nearly the full field.
-3. **`Cruise_RPM` never goes near zero.** Measured minimum **1414**; global assumes `RPM_MIN = 0`
-   and `RPM_INACTIVE = 600`. Whatever this signal means on preglobal, it is not idling at zero.
+Linear fit **`aEgo = −0.00519 × pressure − 0.246`**. So −3.5 m/s² needs about **627** counts, and
+global's `BRAKE_MAX = 600` yields **−3.36 m/s²**. Within ~5% — **this constant is close enough to
+transfer**, which is worth knowing precisely because the throttle constants are not.
 
-**`Brake_Pressure` remains under-sampled and unresolved.** Only 56 braking samples, reaching a
-maximum of 134 with a median deceleration of about −0.71 m/s². Global assumes 600 ≈ −3.5 m/s².
-Extrapolating linearly from this data would put −3.5 m/s² far above 600, but 56 samples of gentle
-highway braking cannot support that, and the `[0|255]` DBC annotation adds doubt about the field's
-true scale. **This is the one number a real implementation most needs and the one this drive cannot
-provide.** It needs a route with firm braking — city or traffic, not open highway.
+**Throttle: `THROTTLE_INACTIVE` is not a constant here.** Steady-state throttle rises with speed, as
+drag would predict:
 
-### Two architectural facts confirmed while measuring
+| `v_ego` (m/s) | n | median `Cruise_Throttle` |
+|---|---|---|
+| 10–14 | 537 | 2151 |
+| 15–19 | 708 | 2135 |
+| 20–24 | 619 | 2484 |
+| 25–29 | 1081 | 2687 |
+| 30–34 | 261 | 2698 |
 
-- **`ES_Brake` is a bit-identical hardware forward.** 0 mismatches in 6,379 samples between the
-  camera's frame and the TX echo. openpilot never touches it today, exactly as §3 predicted.
-- **openpilot's `ES_Distance` trails the camera by up to 5 frames.** 39% of samples differ
-  instantaneously, but at full rate **99.8% of those resolve to a camera value within ±5 frames**
-  and none were zero. That is the carcontroller's `if self.frame % 5 == 0` retransmit cadence,
-  not a lossy rebuild.
+Global ships a single `THROTTLE_INACTIVE = 1818`, which is **below the entire observed range**. A
+port using it would command a large spurious deceleration at every speed. Observed `Cruise_Throttle`
+spans **2 – 4063**, against global's 808 – 3400: both ends are wrong, and the top is near the 12-bit
+ceiling of 4095.
 
-**A methodological trap worth recording.** The first run of this compared bus 2 against **bus 0**
-and produced a plausible-looking result. It was meaningless: on the `can` service, frames placed on
-the main bus are reported with the TX-echo flag set, i.e. `src = 0 | 0x80 = 128`, and **bus 0
-carries nothing**. Parsing bus 0 yields all-zero values forever, which imitates a *clean* comparison
-precisely when the true signal is also zero — so `ES_Brake` looked 99.1% consistent when in fact
-nothing was being compared at all. Verified by counting addresses per bus in the rlog:
+**`Cruise_RPM` spans 100 – 3408.** An earlier highway-only reading suggested a floor of 1414; city
+data disproves that. Global's `RPM_MIN = 0` / `RPM_INACTIVE = 600` is not obviously wrong, but what
+this signal *means* on preglobal is still unestablished.
+
+**Standstill hold: median 294 counts, max 311** (n=571). EyeSight applies real brake pressure to hold
+the car stopped. This is a distinct operating mode from deceleration and any implementation has to
+model it separately.
+
+### Two methodological traps, both caught only by real data
+
+**1. Bus 0 carries nothing.** The first run compared bus 2 against bus 0 and produced a
+plausible-looking result. On the `can` service, frames placed on the main bus are reported with the
+TX-echo flag — `src = 0 | 0x80 = 128` — and bus 0 itself is empty. Parsing it returns zeros forever,
+which imitates a *clean* comparison exactly when the true signal is also zero: `ES_Brake` looked
+99.1% consistent while nothing was being compared at all. Verified by counting addresses per bus:
 
 ```text
 service   message       bus    frames
 can       ES_Brake        2      1200
 can       ES_Brake      128      1200
-can       ES_Distance     2      1200
-can       ES_Distance   128      1195
 sendcan   ES_Distance     0      1196
 ```
 
-The tool now parses bus 128. Nothing off-device could have caught this.
+**2. Standstill destroys the brake curve.** EyeSight holds ~294 counts at a stop with `aEgo = 0`.
+Including those samples dragged whole buckets to a median of 0.00 — route `0000000d` had 320 of them
+in the 250–299 bucket alone — making the curve look non-monotonic and unusable. Excluding standstill
+and driver braking is what turned it into the clean fit above. Both the tool and this note now do so.
+
+### Confirmed while measuring
+
+- **`ES_Brake` is a bit-identical hardware forward** — 0 mismatches in 8,934 samples. openpilot never
+  touches it today, exactly as §3 predicted.
+- **openpilot's `ES_Distance` trails the camera by up to 5 frames.** 39% of samples differ
+  instantaneously, but at full rate **99.8% resolve to a camera value within ±5 frames** and none
+  were zero — the carcontroller's `if self.frame % 5 == 0` cadence, not a lossy rebuild.
+
+### What is now known, and what is not
+
+Known: the brake scale (and that global's is usable), the throttle range and its speed dependence,
+the standstill hold, and that the forwarding model behaves exactly as the code says.
+
+Not known: what `Cruise_RPM` actually does on preglobal; how the car responds to *commanded* rather
+than observed values — every number here is EyeSight driving, and nothing proves the ECU accepts the
+same values from openpilot; and whether EyeSight faults when its own `ES_Brake` is replaced. Those
+need transmission, which needs the safety work in §6.
 
 ## 6. The safety line — tradeoffs, no decision
 
