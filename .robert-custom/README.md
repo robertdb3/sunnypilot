@@ -33,8 +33,8 @@ as current so the daily updater does not create provenance-only churn.
 1. Fetches `sunnypilot/sunnypilot:staging`.
 2. Requires the upstream `prebuilt` marker used by installable comma 3X snapshots.
 3. Applies patches `0001` through `0006`, the narrow prebuilt Params compatibility port, then
-   patches `0008` through `0010`. (`0007` was retired once upstream fixed the same defect; see
-   symptom 12 in the runbook.)
+   patches `0008` through `0011`, then the active remote-command release stage. (`0007` was
+   retired once upstream fixed the same defect; see symptom 12 in the runbook.)
 4. Rejects patch conflicts and whitespace errors.
 5. Rejects changes to driver monitoring, excessive-actuation checks, `opendbc/safety/`, panda,
    AGNOS, upstream license files, or stock cereal schemas.
@@ -58,6 +58,20 @@ fields, manager arguments, and prebuilt Params metadata. The PR remains a manual
 - `scripts/`: additional fork-compliance checks.
 - `notes/device-journey-runbook.md`: authoritative history, rationale, traps, and recovery steps.
 - `tools/`: parked diagnostics and visualization helpers.
+
+## Remote-command release stages
+
+`.robert-custom/release-stage` is the explicit rollout gate:
+
+- `tailscale` applies patch `0012` only. It adds the pinned, fail-open private-network bootstrap;
+  this is the current stage.
+- `visual` additionally applies patch `0013`, the authenticated loopback command service and UI
+  controls.
+- `speed` additionally applies patch `0014`, the confirmed ICBM absolute-speed override.
+
+Advancing that one file creates a new candidate and must use the ordinary protected promotion PR.
+Do not skip a stage. The `/data/custompilot/commands.json` feature flags are a second, device-local
+gate and default to false after enrollment.
 
 ## Licensing and status
 

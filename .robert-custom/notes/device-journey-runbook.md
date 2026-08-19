@@ -915,6 +915,44 @@ different times to communication rate and driving-model lag—two different prob
     crashed processes. Turning the car off and on leaves the same manager PIDs and no UI. Only a
     manager restart, a reboot, or a manual launch recovers it.
 
+## Tailscale and Siri command architecture (2026-08-19)
+
+Remote access and voice control are maintained as patches `0012`–`0014`, but rollout is gated by
+`.robert-custom/release-stage`. The initial stage is **Tailscale only**; visual and speed source can
+be reviewed and tested without placing it on the install branch.
+
+The design deliberately preserves boundaries learned during this project:
+
+- Tailscale is a pinned official ARM64 static build under `/data/custompilot/tailscale`; it does
+  not alter AGNOS, use an OS package repository, or auto-update. Its launcher hook is asynchronous
+  and fail-open before manager, so networking failure cannot prevent openpilot startup.
+- `/dev/net/tun` selects native mode. Userspace mode is accepted only if private HTTPS Serve and
+  the explicit localhost-SSH TCP forward both validate. Hotspot/local OpenSSH remains the recovery
+  path. Tailscale SSH, routes, DNS acceptance, subnet routing, exit nodes, and Funnel stay off.
+- `commandd` binds only `127.0.0.1:8843`. Tailscale Serve is the only intended ingress, and the
+  backend checks both Serve's `Tailscale-User-Login` header and a mode-0600 256-bit bearer secret.
+  Missing/malformed files fail closed. Device configuration defaults both feature flags to false.
+- Visual commands reuse the already-working runtime Params (`OnroadScreenOffBrightness`,
+  `Scene3D`, `MapPanel`). There are no new Params keys, cereal fields, generated dataclass members,
+  panda changes, or AGNOS changes.
+- Absolute speed uses a local Unix datagram link between `commandd`, selfdrived's shared ICBM
+  controller, and Subaru's existing raw-button path. The confirmed voice target temporarily owns
+  ICBM's ordinary `vTarget`; Speed Limit Assist resumes after a physical button/readiness clear or
+  the explicit resume command. This avoids the exact prebuilt-schema trap that previously crashed
+  `card` and the UI.
+- Speed confirmation is single-use and expires in 10 seconds. Targets must be whole mph ending in
+  0/5, within live cruise bounds and ±20 mph, with ICBM and stock ACC engaged and no override or
+  button. Execution is limited to four proven coarse taps, observed cluster progress, 2.5 seconds
+  without progress, and 12 seconds overall.
+- Siri performs recognition and explicit confirmation on the iPhone. No on-comma ASR or audio
+  logging was added; `micd`/whisper experimentation remains deferred because this car already
+  experienced process-rate alerts.
+
+Operational details, least-privilege tailnet policy, and Shortcut blueprints are in
+`../remote-control/ROLLOUT.md`, `tailnet-policy.hujson`, and `SHORTCUTS.md`. Never advance
+`tailscale` → `visual` → `speed` without the preceding parked/drive checks and a separate protected
+stable promotion.
+
 ## What remains deliberately unresolved
 
 - **Decoupled steering while ACC remains on:** not implemented; requires verified button input and
@@ -927,6 +965,10 @@ different times to communication rate and driving-model lag—two different prob
   reverted. Redesign it without a prebuilt schema/dataclass change and add a real `card` smoke test.
 - **SCC-V/SCC-M through stock EyeSight:** not wired into ICBM. Displayed curve targets alone cannot
   command longitudinal control on this stock-longitudinal platform.
+- **Tailscale enrollment and iPhone Shortcut installation:** source is maintained, but the device
+  still requires a parked native/userspace probe, one-use tagged enrollment, tailnet policy, and
+  measured Stage 1 validation. The signed personal Shortcuts cannot be safely built with their
+  private URL/token until enrollment establishes them.
 - **Automatic UI crash restart:** not available in this manager generation. The known schema crash
   was prevented at its source instead. Revisit only after a branch update that supports the API.
 - **Driving-model lag:** the redundant UI work was reduced and the subsequent drive was clean, but

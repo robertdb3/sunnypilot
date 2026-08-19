@@ -1,0 +1,23 @@
+// Merge these entries into the existing tailnet policy; replace the email first.
+// There is intentionally no grant whose source is tag:comma.
+{
+  "groups": {
+    "group:custompilot-owner": ["REPLACE_WITH_OWNER_LOGIN"],
+  },
+  "tagOwners": {
+    "tag:comma": ["group:custompilot-owner"],
+  },
+  "grants": [
+    {
+      "src": ["group:custompilot-owner"],
+      "dst": ["tag:comma"],
+      "ip": ["tcp:22", "tcp:443", "tcp:2222"],
+    },
+  ],
+  "tests": [
+    {
+      "src": "REPLACE_WITH_OWNER_LOGIN",
+      "accept": ["tag:comma:22", "tag:comma:443", "tag:comma:2222"],
+    },
+  ],
+}

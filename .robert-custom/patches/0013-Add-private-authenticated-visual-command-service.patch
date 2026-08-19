@@ -1,0 +1,439 @@
+From 1ca34da1e0fad78b589e316c226bbabcbd4db2ad Mon Sep 17 00:00:00 2001
+From: robertdb3 <robertdb333@gmail.com>
+Date: Wed, 19 Aug 2026 12:39:11 -0400
+Subject: [PATCH 13/14] Add private authenticated visual command service
+
+Assisted-by: OpenAI Codex
+---
+ openpilot/sunnypilot/system/commandd.py    | 406 +++++++++++++++++++++
+ openpilot/system/manager/process_config.py |   1 +
+ 2 files changed, 407 insertions(+)
+ create mode 100644 openpilot/sunnypilot/system/commandd.py
+
+diff --git a/openpilot/sunnypilot/system/commandd.py b/openpilot/sunnypilot/system/commandd.py
+new file mode 100644
+index 0000000..6b2b21b
+--- /dev/null
++++ b/openpilot/sunnypilot/system/commandd.py
+@@ -0,0 +1,406 @@
++"""Private, Tailscale-fronted command service for Custompilot.
++
++The HTTP listener is loopback-only. Tailscale Serve supplies the authenticated identity header;
++this service additionally requires a device-local bearer token. Missing or malformed configuration
++keeps every mutating operation disabled.
++"""
++from __future__ import annotations
++
++import hmac
++import json
++import os
++import secrets
++import socket
++import stat
++import threading
++import time
++import uuid
++from dataclasses import dataclass
++from http import HTTPStatus
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++from pathlib import Path
++from urllib.parse import parse_qs, urlparse
++
++from openpilot.common.params import Params
++
++
++HOST = "127.0.0.1"
++PORT = 8843
++CONFIG_PATH = Path("/data/custompilot/commands.json")
++TOKEN_PATH = Path("/data/custompilot/commandd.token")
++COMMANDD_SOCKET = "/tmp/custompilot-commandd.sock"
++ICBM_SOCKET = "/tmp/custompilot-icbm.sock"
++MAX_BODY = 4096
++TELEMETRY_MAX_AGE = 0.75
++CONFIRM_TTL = 10.0
++
++BRIGHTNESS_VALUES = {"auto": 0, "auto-dark": 1, "screen-off": 2}
++
++
++def audit(command: str, outcome: str, target: int | None = None, reason: str = "") -> None:
++  """Emit only normalized fields to manager logs; secrets and request bodies never enter logs."""
++  event = {"command": command, "outcome": outcome}
++  if target is not None:
++    event["target_mph"] = target
++  if reason:
++    event["reason"] = reason
++  print("commandd " + json.dumps(event, separators=(",", ":"), sort_keys=True), flush=True)
++
++
++class CommandError(Exception):
++  def __init__(self, status: int, reason: str):
++    super().__init__(reason)
++    self.status = status
++    self.reason = reason
++
++
++@dataclass(frozen=True)
++class Config:
++  allowed_login: str
++  visual_enabled: bool
++  speed_enabled: bool
++  bearer_token: str
++
++  @staticmethod
++  def load(config_path: Path = CONFIG_PATH, token_path: Path = TOKEN_PATH) -> "Config":
++    for path in (config_path, token_path):
++      mode = stat.S_IMODE(path.stat().st_mode)
++      if mode != 0o600:
++        raise ValueError(f"{path} must have mode 0600")
++
++    raw = json.loads(config_path.read_text(encoding="utf-8"))
++    allowed_login = raw.get("allowed_login")
++    if not isinstance(allowed_login, str) or not allowed_login.strip():
++      raise ValueError("allowed_login is required")
++    for key in ("visual_enabled", "speed_enabled"):
++      if type(raw.get(key)) is not bool:
++        raise ValueError(f"{key} must be true or false")
++
++    token = token_path.read_text(encoding="utf-8").strip()
++    if len(token) < 32:
++      raise ValueError("bearer token is too short")
++    return Config(allowed_login.strip(), raw["visual_enabled"], raw["speed_enabled"], token)
++
++
++class VisualController:
++  def __init__(self, params: Params | None = None):
++    self.params = params or Params()
++
++  @staticmethod
++  def brightness_param(value: object) -> tuple[int, str]:
++    if isinstance(value, str):
++      normalized = value.strip().lower()
++      if normalized in BRIGHTNESS_VALUES:
++        return BRIGHTNESS_VALUES[normalized], normalized
++      if normalized.isdigit():
++        value = int(normalized)
++    if type(value) is not int or not 5 <= value <= 100 or value % 5:
++      raise CommandError(HTTPStatus.BAD_REQUEST, "brightness must be 5-100 in 5% steps, auto, auto-dark, or screen-off")
++    return value // 5 + 2, f"{value}%"
++
++  def apply(self, body: dict) -> dict:
++    supplied = [key for key in ("brightness", "view", "map") if key in body]
++    if len(supplied) != 1:
++      raise CommandError(HTTPStatus.BAD_REQUEST, "supply exactly one of brightness, view, or map")
++
++    key = supplied[0]
++    value = body[key]
++    if key == "brightness":
++      param_value, normalized = self.brightness_param(value)
++      self.params.put("OnroadScreenOffBrightness", str(param_value))
++    elif key == "view":
++      normalized = str(value).strip().lower()
++      if normalized not in ("camera", "3d"):
++        raise CommandError(HTTPStatus.BAD_REQUEST, "view must be camera or 3d")
++      self.params.put_bool("Scene3D", normalized == "3d")
++    else:
++      normalized = str(value).strip().lower()
++      if normalized not in ("on", "off"):
++        raise CommandError(HTTPStatus.BAD_REQUEST, "map must be on or off")
++      self.params.put_bool("MapPanel", normalized == "on")
++    return {"ok": True, "command": key, "value": normalized, "spoken": f"Comma {key} {normalized}"}
++
++  def status(self) -> dict:
++    raw_brightness = int(float(self.params.get("OnroadScreenOffBrightness", return_default=True)))
++    reverse = {value: name for name, value in BRIGHTNESS_VALUES.items()}
++    brightness = reverse.get(raw_brightness, f"{(raw_brightness - 2) * 5}%")
++    return {
++      "brightness": brightness,
++      "view": "3d" if self.params.get_bool("Scene3D") else "camera",
++      "map": "on" if self.params.get_bool("MapPanel") else "off",
++    }
++
++
++class SpeedCoordinator:
++  """Own the prepare/confirm handshake and the commandd side of the local datagram link."""
++  def __init__(self, bind_socket: bool = True, clock=time.monotonic):
++    self.clock = clock
++    self.lock = threading.Lock()
++    self.telemetry: dict = {}
++    self.telemetry_at = 0.0
++    self.pending: dict[str, dict] = {}
++    self.results: dict[str, dict] = {}
++    self.logged_outcomes: dict[str, str] = {}
++    self.sock: socket.socket | None = None
++    if bind_socket:
++      try:
++        os.unlink(COMMANDD_SOCKET)
++      except FileNotFoundError:
++        pass
++      self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
++      self.sock.bind(COMMANDD_SOCKET)
++      os.chmod(COMMANDD_SOCKET, 0o600)
++      threading.Thread(target=self._receive, name="commandd-icbm", daemon=True).start()
++
++  def _receive(self) -> None:
++    assert self.sock is not None
++    while True:
++      try:
++        payload = json.loads(self.sock.recv(4096).decode("utf-8"))
++        if payload.get("type") != "status":
++          continue
++        with self.lock:
++          self.telemetry = payload
++          self.telemetry_at = self.clock()
++          command_id = payload.get("command_id")
++          if command_id and payload.get("outcome"):
++            result = {
++              "id": command_id,
++              "outcome": payload["outcome"],
++              "reason": payload.get("reason", ""),
++              "current_mph": payload.get("current_mph"),
++              "target_mph": payload.get("target_mph"),
++            }
++            self.results[command_id] = result
++            if self.logged_outcomes.get(command_id) != result["outcome"]:
++              self.logged_outcomes[command_id] = result["outcome"]
++              audit("speed_execute", result["outcome"], result["target_mph"], result["reason"])
++      except (OSError, UnicodeDecodeError, json.JSONDecodeError):
++        time.sleep(0.1)
++
++  def inject_telemetry(self, payload: dict) -> None:
++    """Test seam; production telemetry arrives only through the Unix socket."""
++    with self.lock:
++      self.telemetry = {"type": "status", **payload}
++      self.telemetry_at = self.clock()
++
++  def _snapshot(self) -> dict:
++    with self.lock:
++      telemetry = dict(self.telemetry)
++      age = self.clock() - self.telemetry_at
++    if not telemetry or age > TELEMETRY_MAX_AGE:
++      raise CommandError(HTTPStatus.CONFLICT, "cruise state is unavailable or stale")
++    return telemetry
++
++  @staticmethod
++  def _validate_target(target: object, telemetry: dict, expected_current: int | None = None) -> int:
++    if type(target) is not int or target % 5 or target <= 0:
++      raise CommandError(HTTPStatus.BAD_REQUEST, "target must be a whole mph ending in 0 or 5")
++    required = ("ready", "icbm_enabled", "acc_engaged", "imperial")
++    if not all(telemetry.get(key) is True for key in required):
++      raise CommandError(HTTPStatus.CONFLICT, "ICBM and stock ACC must be engaged, ready, and using mph")
++    if telemetry.get("driver_override") or telemetry.get("button_active"):
++      raise CommandError(HTTPStatus.CONFLICT, "driver override or cruise button is active")
++    current = telemetry.get("current_mph")
++    if type(current) is not int or current <= 0:
++      raise CommandError(HTTPStatus.CONFLICT, "current cluster set speed is invalid")
++    if expected_current is not None and current != expected_current:
++      raise CommandError(HTTPStatus.CONFLICT, "cluster set speed changed before confirmation")
++    minimum, maximum = telemetry.get("minimum_mph"), telemetry.get("maximum_mph")
++    if type(minimum) is not int or type(maximum) is not int or not minimum <= target <= maximum:
++      raise CommandError(HTTPStatus.BAD_REQUEST, "target is outside the current cruise bounds")
++    if abs(target - current) > 20:
++      raise CommandError(HTTPStatus.BAD_REQUEST, "target may differ by at most 20 mph")
++    return current
++
++  def prepare(self, target: object) -> dict:
++    telemetry = self._snapshot()
++    current = self._validate_target(target, telemetry)
++    token = secrets.token_urlsafe(24)
++    with self.lock:
++      self.pending[token] = {"target": target, "current": current, "expires": self.clock() + CONFIRM_TTL}
++    return {"ok": True, "confirmation_token": token, "current_mph": current, "target_mph": target,
++            "expires_in_seconds": int(CONFIRM_TTL)}
++
++  def confirm(self, token: object) -> dict:
++    if not isinstance(token, str):
++      raise CommandError(HTTPStatus.BAD_REQUEST, "confirmation_token is required")
++    with self.lock:
++      prepared = self.pending.pop(token, None)
++    if prepared is None:
++      raise CommandError(HTTPStatus.CONFLICT, "confirmation token is invalid or already used")
++    if self.clock() > prepared["expires"]:
++      raise CommandError(HTTPStatus.CONFLICT, "confirmation token expired")
++    telemetry = self._snapshot()
++    self._validate_target(prepared["target"], telemetry, prepared["current"])
++    command_id = uuid.uuid4().hex
++    self._send({"type": "set_target", "id": command_id, "target_mph": prepared["target"],
++                "current_mph": prepared["current"]})
++    with self.lock:
++      self.results[command_id] = {"id": command_id, "outcome": "pending",
++                                  "current_mph": prepared["current"], "target_mph": prepared["target"]}
++    return {"ok": True, "command_id": command_id, "outcome": "pending"}
++
++  def resume_assist(self) -> dict:
++    self._send({"type": "resume_assist"})
++    return {"ok": True, "spoken": "Comma speed limit assist resumed"}
++
++  def _send(self, payload: dict) -> None:
++    if self.sock is None:
++      return
++    try:
++      self.sock.sendto(json.dumps(payload, separators=(",", ":")).encode("utf-8"), ICBM_SOCKET)
++    except OSError as exc:
++      raise CommandError(HTTPStatus.SERVICE_UNAVAILABLE, "ICBM command channel is unavailable") from exc
++
++  def result(self, command_id: str) -> dict:
++    with self.lock:
++      result = self.results.get(command_id)
++    if result is None:
++      raise CommandError(HTTPStatus.NOT_FOUND, "unknown command id")
++    return result
++
++  def status(self) -> dict:
++    try:
++      telemetry = self._snapshot()
++      return {"available": True, **telemetry}
++    except CommandError as exc:
++      return {"available": False, "reason": exc.reason}
++
++
++class CommandApplication:
++  def __init__(self, visual: VisualController | None = None, speed: SpeedCoordinator | None = None,
++               config_loader=Config.load):
++    self.visual = visual or VisualController()
++    self.speed = speed or SpeedCoordinator()
++    self.config_loader = config_loader
++
++  def authenticate(self, headers) -> Config:
++    try:
++      config = self.config_loader()
++    except (OSError, ValueError, json.JSONDecodeError) as exc:
++      raise CommandError(HTTPStatus.SERVICE_UNAVAILABLE, f"command service is not configured: {exc}") from exc
++    login = headers.get("Tailscale-User-Login", "")
++    authorization = headers.get("Authorization", "")
++    prefix = "Bearer "
++    token = authorization[len(prefix):] if authorization.startswith(prefix) else ""
++    if not hmac.compare_digest(login, config.allowed_login) or not hmac.compare_digest(token, config.bearer_token):
++      raise CommandError(HTTPStatus.UNAUTHORIZED, "authentication failed")
++    return config
++
++
++class Handler(BaseHTTPRequestHandler):
++  server_version = "custompilot-commandd/1"
++
++  @property
++  def app(self) -> CommandApplication:
++    return self.server.app  # type: ignore[attr-defined]
++
++  def log_message(self, format: str, *args) -> None:
++    # Avoid default request logging, which can accidentally retain query data. Mutating command
++    # outcomes are normalized and logged explicitly below without headers or tokens.
++    return
++
++  def _json_body(self) -> dict:
++    try:
++      length = int(self.headers.get("Content-Length", "0"))
++    except ValueError as exc:
++      raise CommandError(HTTPStatus.BAD_REQUEST, "invalid Content-Length") from exc
++    if not 0 < length <= MAX_BODY:
++      raise CommandError(HTTPStatus.BAD_REQUEST, "JSON body is required and must be at most 4096 bytes")
++    try:
++      body = json.loads(self.rfile.read(length).decode("utf-8"))
++    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
++      raise CommandError(HTTPStatus.BAD_REQUEST, "malformed JSON") from exc
++    if not isinstance(body, dict):
++      raise CommandError(HTTPStatus.BAD_REQUEST, "JSON body must be an object")
++    return body
++
++  def _send_json(self, status: int, payload: dict) -> None:
++    encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
++    self.send_response(status)
++    self.send_header("Content-Type", "application/json")
++    self.send_header("Content-Length", str(len(encoded)))
++    self.send_header("Cache-Control", "no-store")
++    self.end_headers()
++    self.wfile.write(encoded)
++
++  def _dispatch(self) -> tuple[int, dict]:
++    config = self.app.authenticate(self.headers)
++    parsed = urlparse(self.path)
++    if self.command == "GET" and parsed.path == "/v1/status":
++      return HTTPStatus.OK, {"ok": True, "visual_enabled": config.visual_enabled,
++                             "speed_enabled": config.speed_enabled,
++                             "visual": self.app.visual.status(), "speed": self.app.speed.status()}
++    if self.command == "GET" and parsed.path == "/v1/speed/status":
++      if not config.speed_enabled:
++        raise CommandError(HTTPStatus.FORBIDDEN, "speed commands are disabled")
++      command_id = parse_qs(parsed.query).get("id", [""])[0]
++      return HTTPStatus.OK, self.app.speed.result(command_id)
++    if self.command != "POST":
++      raise CommandError(HTTPStatus.NOT_FOUND, "unknown endpoint")
++
++    body = self._json_body()
++    if parsed.path == "/v1/visual":
++      supplied = [key for key in ("brightness", "view", "map") if key in body]
++      self.audit_command = f"visual_{supplied[0]}" if len(supplied) == 1 else "visual_invalid"
++      if not config.visual_enabled:
++        raise CommandError(HTTPStatus.FORBIDDEN, "visual commands are disabled")
++      return HTTPStatus.OK, self.app.visual.apply(body)
++    if parsed.path == "/v1/speed/prepare":
++      self.audit_command = "speed_prepare"
++      self.audit_target = body.get("target_mph") if type(body.get("target_mph")) is int else None
++      if not config.speed_enabled:
++        raise CommandError(HTTPStatus.FORBIDDEN, "speed commands are disabled")
++      return HTTPStatus.OK, self.app.speed.prepare(body.get("target_mph"))
++    if parsed.path == "/v1/speed/confirm":
++      self.audit_command = "speed_confirm"
++      if not config.speed_enabled:
++        raise CommandError(HTTPStatus.FORBIDDEN, "speed commands are disabled")
++      return HTTPStatus.ACCEPTED, self.app.speed.confirm(body.get("confirmation_token"))
++    if parsed.path == "/v1/speed/resume-assist":
++      self.audit_command = "speed_resume_assist"
++      if not config.speed_enabled:
++        raise CommandError(HTTPStatus.FORBIDDEN, "speed commands are disabled")
++      return HTTPStatus.OK, self.app.speed.resume_assist()
++    raise CommandError(HTTPStatus.NOT_FOUND, "unknown endpoint")
++
++  def _handle(self) -> None:
++    self.audit_command = None
++    self.audit_target = None
++    try:
++      status, payload = self._dispatch()
++    except CommandError as exc:
++      if self.audit_command:
++        audit(self.audit_command, "rejected", self.audit_target, exc.reason)
++      self._send_json(exc.status, {"ok": False, "reason": exc.reason})
++      return
++    except Exception:
++      if self.audit_command:
++        audit(self.audit_command, "failed", self.audit_target, "internal error")
++      self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "reason": "internal error"})
++      return
++    if self.audit_command:
++      audit(self.audit_command, "accepted", self.audit_target)
++    self._send_json(status, payload)
++
++  do_GET = _handle
++  do_POST = _handle
++
++
++class Server(ThreadingHTTPServer):
++  daemon_threads = True
++  allow_reuse_address = True
++
++  def __init__(self, address, handler, app: CommandApplication):
++    super().__init__(address, handler)
++    self.app = app
++
++
++def main() -> None:
++  server = Server((HOST, PORT), Handler, CommandApplication())
++  server.serve_forever(poll_interval=0.5)
++
++
++if __name__ == "__main__":
++  main()
+diff --git a/openpilot/system/manager/process_config.py b/openpilot/system/manager/process_config.py
+index c9e939c..1c93cd4 100644
+--- a/openpilot/system/manager/process_config.py
++++ b/openpilot/system/manager/process_config.py
+@@ -120,6 +120,7 @@ procs = [
+   NativeProcess("encoderd", "openpilot/system/loggerd", ["./encoderd"], only_onroad),
+   NativeProcess("stream_encoderd", "openpilot/system/loggerd", ["./encoderd", "--stream"], or_(and_(livestream, not_(iscar)), notcar)),
+   PythonProcess("logmessaged", "openpilot.system.logmessaged", always_run),
++  PythonProcess("commandd", "openpilot.sunnypilot.system.commandd", always_run),
+ 
+   NativeProcess("camerad", "openpilot/system/camerad", ["./camerad"], or_(driverview, livestream), enabled=not WEBCAM),
+   PythonProcess("webcamerad", "openpilot.system.camerad.webcam.camerad", driverview, enabled=WEBCAM),
+-- 
+2.50.1 (Apple Git-155)
+

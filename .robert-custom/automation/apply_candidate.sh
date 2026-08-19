@@ -50,5 +50,28 @@ for number in 0008 0009 0010 0011; do
   apply_one "$patch"
 done
 
+# Roll out independently reviewable safety stages. All source patches can be maintained and
+# tested on master while the install branch advances only when the preceding stage has passed its
+# parked and driving validation.
+stage=$(sed -n '1p' "$ASSETS/release-stage")
+case "$stage" in
+  tailscale) last_patch=0012 ;;
+  visual) last_patch=0013 ;;
+  speed) last_patch=0014 ;;
+  *) echo "error: unknown release stage: $stage" >&2; exit 2 ;;
+esac
+
+for number in 0012 0013 0014; do
+  if [ "$number" -gt "$last_patch" ]; then
+    continue
+  fi
+  patch=$(find "$ASSETS/patches" -maxdepth 1 -type f -name "$number-*.patch" -print)
+  if [ "$(printf '%s\n' "$patch" | grep -c .)" -ne 1 ]; then
+    echo "error: expected exactly one $number patch" >&2
+    exit 2
+  fi
+  apply_one "$patch"
+done
+
 git -C "$CANDIDATE" diff --check
 "$PYTHON_BIN" "$ASSETS/automation/prepare_candidate.py" "$CANDIDATE" "$ASSETS"
