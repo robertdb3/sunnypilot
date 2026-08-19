@@ -1,0 +1,266 @@
+From 604a351734e642e9974b6027cb4e10596d89326c Mon Sep 17 00:00:00 2001
+From: robertdb3 <robertdb333@gmail.com>
+Date: Wed, 19 Aug 2026 12:39:12 -0400
+Subject: [PATCH 14/14] Add confirmed voice cruise target override
+
+Assisted-by: OpenAI Codex
+---
+ .../opendbc/sunnypilot/car/subaru/icbm.py     |  19 +++
+ .../controller.py                             |  22 ++-
+ .../voice_override.py                         | 133 ++++++++++++++++++
+ 3 files changed, 173 insertions(+), 1 deletion(-)
+ create mode 100644 openpilot/sunnypilot/selfdrive/car/intelligent_cruise_button_management/voice_override.py
+
+diff --git a/opendbc_repo/opendbc/sunnypilot/car/subaru/icbm.py b/opendbc_repo/opendbc/sunnypilot/car/subaru/icbm.py
+index 3b31737..12c3782 100644
+--- a/opendbc_repo/opendbc/sunnypilot/car/subaru/icbm.py
++++ b/opendbc_repo/opendbc/sunnypilot/car/subaru/icbm.py
+@@ -5,7 +5,9 @@ This file is part of sunnypilot and is licensed under the MIT License.
+ See the LICENSE.md file in the root directory for more details.
+ """
+ 
++import json
+ import math
++import socket
+ 
+ from opendbc.car import structs, DT_CTRL
+ from opendbc.sunnypilot.car.intelligent_cruise_button_management_interface_base import \
+@@ -43,6 +45,17 @@ DRIVER_COOLDOWN = 1.0          # s to stay out of the way after the driver touch
+ # multiples of 5, so it lands exactly on the limit for any offset that is 0 or a multiple of 5.
+ # Flip this on once tools/probe_cruise_button.py shows the fine code working from a tap.
+ FINE_STEP_ENABLED = False
++VOICE_OVERRIDE_SOCKET = "/tmp/custompilot-icbm.sock"
++
++
++def _notify_voice_override(message_type: str, **values) -> None:
++  """Best-effort event link to selfdrived; failure must never affect CAN generation."""
++  payload = {"type": message_type, **values}
++  try:
++    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
++      sock.sendto(json.dumps(payload, separators=(",", ":")).encode("utf-8"), VOICE_OVERRIDE_SOCKET)
++  except OSError:
++    pass
+ 
+ 
+ def coarse_down(v: int) -> int:
+@@ -74,6 +87,7 @@ class IntelligentCruiseButtonManagementInterface(IntelligentCruiseButtonManageme
+     self.driver_active_frame = -10_000
+     self.pending_since_frame: int | None = None
+     self.cluster_at_press = 0
++    self.raw_button_active = False
+ 
+   def _candidates(self, v: int, increase: bool) -> list[tuple[int, int]]:
+     """(predicted set speed, button) in preference order: coarse to close, fine to land."""
+@@ -98,9 +112,13 @@ class IntelligentCruiseButtonManagementInterface(IntelligentCruiseButtonManageme
+     # "driver is pressing" check (controller.py:113) can never fire on this platform. Watch the
+     # raw relayed button instead and yield the bus while the driver is adjusting.
+     if CS.cruise_button != BUTTON_NONE:
++      if not self.raw_button_active:
++        _notify_voice_override("physical_button")
++      self.raw_button_active = True
+       self.driver_active_frame = frame
+       self.pending_since_frame = None
+       return BUTTON_NONE
++    self.raw_button_active = False
+ 
+     if (frame - self.driver_active_frame) * DT_CTRL < DRIVER_COOLDOWN:
+       return BUTTON_NONE
+@@ -129,6 +147,7 @@ class IntelligentCruiseButtonManagementInterface(IntelligentCruiseButtonManageme
+         self.pending_since_frame = frame
+         self.cluster_at_press = cluster
+         self.button_frame += 1
++        _notify_voice_override("synthetic_tap", cluster=cluster, button=button)
+         return button
+ 
+     # Nothing available gets us closer -- we are as near as this car's steps allow. The shared
+diff --git a/openpilot/sunnypilot/selfdrive/car/intelligent_cruise_button_management/controller.py b/openpilot/sunnypilot/selfdrive/car/intelligent_cruise_button_management/controller.py
+index 4d1a244..b577faf 100644
+--- a/openpilot/sunnypilot/selfdrive/car/intelligent_cruise_button_management/controller.py
++++ b/openpilot/sunnypilot/selfdrive/car/intelligent_cruise_button_management/controller.py
+@@ -12,6 +12,7 @@ from opendbc.car import structs, apply_hysteresis
+ from openpilot.common.constants import CV
+ from openpilot.common.realtime import DT_CTRL
+ from openpilot.sunnypilot.selfdrive.car.intelligent_cruise_button_management.helpers import get_minimum_set_speed
++from openpilot.sunnypilot.selfdrive.car.intelligent_cruise_button_management.voice_override import VoiceCruiseOverride
+ from openpilot.sunnypilot.selfdrive.car.cruise_ext import CRUISE_BUTTON_TIMER, update_manual_button_timers
+ 
+ LongitudinalPlanSource = custom.LongitudinalPlanSP.LongitudinalPlanSource
+@@ -49,6 +50,7 @@ class IntelligentCruiseButtonManagement:
+     self.is_metric = False
+ 
+     self.cruise_button_timers = CRUISE_BUTTON_TIMER
++    self.voice_override = VoiceCruiseOverride()
+ 
+   @property
+   def v_cruise_equal(self) -> bool:
+@@ -122,9 +124,27 @@ class IntelligentCruiseButtonManagement:
+   def update_readiness(self, CS: car.CarState, CC: car.CarControl) -> None:
+     update_manual_button_timers(CS, self.cruise_button_timers)
+ 
+-    ready = CC.enabled and not CC.cruiseControl.override and not CC.cruiseControl.cancel and not CC.cruiseControl.resume
++    ready = (CC.enabled and CS.cruiseState.available and CS.cruiseState.enabled and
++             not CC.cruiseControl.override and not CC.cruiseControl.cancel and not CC.cruiseControl.resume)
+     button_pressed = any(self.cruise_button_timers[k] > 0 for k in self.cruise_button_timers)
+ 
++    voice_target = self.voice_override.update(
++      self.v_cruise_cluster,
++      self.v_cruise_min,
++      145 if self.is_metric else 90,
++      ready and not button_pressed,
++      not self.CP_SP.pcmCruiseSpeed,
++      CS.cruiseState.enabled,
++      not self.is_metric,
++      CC.cruiseControl.override,
++      button_pressed,
++    )
++    if voice_target is not None:
++      # A confirmed voice target temporarily owns ICBM's existing target path. This changes no
++      # cereal fields: carcontroller still receives the ordinary vTarget/sendButton pair.
++      self.v_target = voice_target
++      self.target_valid = True
++
+     self.is_ready = ready and self.target_valid and not button_pressed
+ 
+   def run(self, CS: car.CarState, CC: car.CarControl, LP_SP: custom.LongitudinalPlanSP, is_metric: bool) -> None:
+diff --git a/openpilot/sunnypilot/selfdrive/car/intelligent_cruise_button_management/voice_override.py b/openpilot/sunnypilot/selfdrive/car/intelligent_cruise_button_management/voice_override.py
+new file mode 100644
+index 0000000..2c76227
+--- /dev/null
++++ b/openpilot/sunnypilot/selfdrive/car/intelligent_cruise_button_management/voice_override.py
+@@ -0,0 +1,133 @@
++"""Fail-closed absolute-speed override transported outside cereal over local datagrams."""
++from __future__ import annotations
++
++import json
++import os
++import socket
++import time
++
++
++COMMANDD_SOCKET = "/tmp/custompilot-commandd.sock"
++ICBM_SOCKET = "/tmp/custompilot-icbm.sock"
++MAX_DELTA_MPH = 20
++MAX_TAPS = 4
++COMMAND_TIMEOUT = 12.0
++PROGRESS_TIMEOUT = 2.5
++STATUS_INTERVAL = 0.1
++
++
++class VoiceCruiseOverride:
++  def __init__(self, bind_socket: bool = True, clock=time.monotonic):
++    self.clock = clock
++    self.sock: socket.socket | None = None
++    self.target_mph: int | None = None
++    self.command_id: str | None = None
++    self.outcome = "idle"
++    self.reason = ""
++    self.deadline = 0.0
++    self.progress_deadline = 0.0
++    self.last_cluster = 0
++    self.taps = 0
++    self.last_status = 0.0
++    if bind_socket:
++      try:
++        os.unlink(ICBM_SOCKET)
++      except FileNotFoundError:
++        pass
++      self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
++      self.sock.setblocking(False)
++      self.sock.bind(ICBM_SOCKET)
++      os.chmod(ICBM_SOCKET, 0o600)
++
++  def _clear(self, outcome: str, reason: str) -> None:
++    self.target_mph = None
++    self.outcome = outcome
++    self.reason = reason
++
++  def _accept(self, message: dict, current: int, minimum: int, maximum: int, ready: bool) -> None:
++    target = message.get("target_mph")
++    expected = message.get("current_mph")
++    command_id = message.get("id")
++    # A newly confirmed request supersedes any previous voice target, even if it is rejected.
++    self._clear("rejected", "invalid request")
++    self.command_id = command_id if isinstance(command_id, str) else None
++    if (type(target) is not int or target <= 0 or target % 5 or type(expected) is not int or
++        not self.command_id):
++      self.reason = "invalid target"
++      return
++    if not ready or current != expected:
++      self.reason = "readiness or current speed changed"
++      return
++    if not minimum <= target <= maximum or abs(target - current) > MAX_DELTA_MPH:
++      self.reason = "target outside bounds"
++      return
++    now = self.clock()
++    self.target_mph = target
++    self.outcome = "holding" if target == current else "running"
++    self.reason = ""
++    self.deadline = now + COMMAND_TIMEOUT
++    self.progress_deadline = now + PROGRESS_TIMEOUT
++    self.last_cluster = current
++    self.taps = 0
++
++  def _drain(self, current: int, minimum: int, maximum: int, ready: bool) -> None:
++    if self.sock is None:
++      return
++    while True:
++      try:
++        message = json.loads(self.sock.recv(4096).decode("utf-8"))
++      except BlockingIOError:
++        return
++      except (OSError, UnicodeDecodeError, json.JSONDecodeError):
++        continue
++      msg_type = message.get("type")
++      if msg_type == "set_target":
++        self._accept(message, current, minimum, maximum, ready)
++      elif msg_type == "resume_assist":
++        self.command_id = None
++        self._clear("cleared", "speed limit assist resumed")
++      elif msg_type == "physical_button":
++        self._clear("cleared", "physical cruise button")
++      elif msg_type == "synthetic_tap" and self.target_mph is not None:
++        self.taps += 1
++        if self.taps > MAX_TAPS:
++          self._clear("aborted", "synthetic tap limit")
++
++  def update(self, current: int, minimum: int, maximum: int, ready: bool, icbm_enabled: bool,
++             acc_engaged: bool, imperial: bool, driver_override: bool = False,
++             button_active: bool = False) -> int | None:
++    effective_ready = ready and icbm_enabled and acc_engaged and imperial and not driver_override and not button_active
++    self._drain(current, minimum, maximum, effective_ready)
++    now = self.clock()
++
++    if self.target_mph is not None:
++      if not effective_ready:
++        self._clear("cleared", "cruise readiness changed")
++      elif current != self.last_cluster:
++        self.last_cluster = current
++        self.progress_deadline = now + PROGRESS_TIMEOUT
++      if self.target_mph is not None and current == self.target_mph:
++        self.outcome = "holding"
++      elif self.target_mph is not None and (now > self.deadline or now > self.progress_deadline):
++        self._clear("aborted", "command timeout" if now > self.deadline else "no cluster progress")
++
++    self._send_status(current, minimum, maximum, effective_ready, icbm_enabled, acc_engaged,
++                      imperial, driver_override, button_active)
++    return self.target_mph
++
++  def _send_status(self, current: int, minimum: int, maximum: int, ready: bool, icbm_enabled: bool,
++                   acc_engaged: bool, imperial: bool, driver_override: bool, button_active: bool) -> None:
++    if self.sock is None or self.clock() - self.last_status < STATUS_INTERVAL:
++      return
++    self.last_status = self.clock()
++    payload = {
++      "type": "status", "ready": ready, "icbm_enabled": icbm_enabled,
++      "acc_engaged": acc_engaged, "imperial": imperial, "driver_override": driver_override,
++      "button_active": button_active, "current_mph": current, "minimum_mph": minimum,
++      "maximum_mph": maximum, "target_mph": self.target_mph, "command_id": self.command_id,
++      "outcome": self.outcome, "reason": self.reason, "taps": self.taps,
++    }
++    try:
++      self.sock.sendto(json.dumps(payload, separators=(",", ":")).encode("utf-8"), COMMANDD_SOCKET)
++    except OSError:
++      pass
+-- 
+2.50.1 (Apple Git-155)
+

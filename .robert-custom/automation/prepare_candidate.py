@@ -40,6 +40,9 @@ def customization_digest(assets: Path) -> str:
       data = path.read_bytes()
       digest.update(len(data).to_bytes(8, "big"))
       digest.update(data)
+  stage_data = (assets / "release-stage").read_bytes()
+  digest.update(b"release-stage")
+  digest.update(stage_data)
   return digest.hexdigest()
 
 
@@ -66,6 +69,7 @@ def main() -> int:
 
   manifest = {
     "schema": 1,
+    "release_stage": (assets / "release-stage").read_text(encoding="utf-8").strip(),
     "upstream": {
       "repository": "https://github.com/sunnypilot/sunnypilot",
       "branch": "staging",

@@ -45,9 +45,21 @@ def main() -> int:
   changed = set(filter(None, git(checkout, "diff", "--name-only", base).splitlines()))
   changed.update(filter(None, git(checkout, "ls-files", "--others", "--exclude-standard").splitlines()))
 
+  stage = (assets / "release-stage").read_text(encoding="utf-8").strip()
+  stage_last_patch = {"tailscale": 12, "visual": 13, "speed": 14}
+  if stage not in stage_last_patch:
+    fail(f"unknown release stage: {stage}")
+
   expected = set()
   for patch_root in (assets / "patches", assets / "ports"):
     for patch in patch_root.rglob("*.patch"):
+      if patch_root.name == "patches":
+        try:
+          patch_number = int(patch.name.split("-", 1)[0])
+        except ValueError:
+          fail(f"patch has no numeric prefix: {patch.name}")
+        if patch_number > stage_last_patch[stage]:
+          continue
       for line in patch.read_text(encoding="utf-8").splitlines():
         if line.startswith("diff --git a/"):
           expected.add(line.split()[2].removeprefix("a/"))
@@ -85,6 +97,8 @@ def main() -> int:
 
   manifest_path = checkout / "CUSTOM_FORK_MANIFEST.json"
   manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+  if manifest.get("release_stage") != stage:
+    fail("manifest release stage does not match maintenance assets")
   if manifest.get("upstream", {}).get("commit") != base:
     fail("manifest upstream commit does not match candidate base")
   digest = manifest.get("customization_sha256", "")

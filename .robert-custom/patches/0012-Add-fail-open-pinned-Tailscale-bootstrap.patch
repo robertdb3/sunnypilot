@@ -1,0 +1,203 @@
+From 4728754df26e327eace93f3bf195ed0eda7da170 Mon Sep 17 00:00:00 2001
+From: robertdb3 <robertdb333@gmail.com>
+Date: Wed, 19 Aug 2026 12:39:11 -0400
+Subject: [PATCH 12/14] Add fail-open pinned Tailscale bootstrap
+
+Assisted-by: OpenAI Codex
+---
+ launch_chffrplus.sh                           |  6 ++
+ .../sunnypilot/system/tailscale/bootstrap.sh  | 47 +++++++++++++++
+ .../sunnypilot/system/tailscale/enroll.sh     | 60 +++++++++++++++++++
+ .../sunnypilot/system/tailscale/install.sh    | 42 +++++++++++++
+ 4 files changed, 155 insertions(+)
+ create mode 100755 openpilot/sunnypilot/system/tailscale/bootstrap.sh
+ create mode 100755 openpilot/sunnypilot/system/tailscale/enroll.sh
+ create mode 100755 openpilot/sunnypilot/system/tailscale/install.sh
+
+diff --git a/launch_chffrplus.sh b/launch_chffrplus.sh
+index 62ebffd..7b4ee5b 100755
+--- a/launch_chffrplus.sh
++++ b/launch_chffrplus.sh
+@@ -4,6 +4,12 @@ DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null && pwd )"
+ 
+ source "$DIR/launch_env.sh"
+ 
++# Custompilot's private maintenance access starts independently of manager. This launcher hook is
++# deliberately asynchronous and fail-open: a missing binary, bad state file, or offline tailnet
++# must never delay openpilot startup.
++"$DIR/openpilot/sunnypilot/system/tailscale/bootstrap.sh" \
++  > /tmp/custompilot-tailscale-bootstrap.log 2>&1 &
++
+ function agnos_init {
+   # TODO: move this to agnos
+   sudo rm -f /data/etc/NetworkManager/system-connections/*.nmmeta
+diff --git a/openpilot/sunnypilot/system/tailscale/bootstrap.sh b/openpilot/sunnypilot/system/tailscale/bootstrap.sh
+new file mode 100755
+index 0000000..befb55e
+--- /dev/null
++++ b/openpilot/sunnypilot/system/tailscale/bootstrap.sh
+@@ -0,0 +1,47 @@
++#!/usr/bin/env bash
++# Start the pinned, separately provisioned Tailscale daemon without ever blocking openpilot.
++set -u
++
++ROOT=/data/custompilot/tailscale
++BIN="$ROOT/bin/tailscaled"
++STATE="$ROOT/state/tailscaled.state"
++SOCKET="$ROOT/run/tailscaled.sock"
++PIDFILE="$ROOT/run/tailscaled.pid"
++LOG="$ROOT/tailscaled.log"
++MODE_FILE="$ROOT/mode"
++
++[ -x "$BIN" ] || exit 0
++[ -f "$MODE_FILE" ] || exit 0
++
++mode=$(sed -n '1p' "$MODE_FILE" 2>/dev/null)
++case "$mode" in
++  native) tun_args=() ;;
++  userspace) tun_args=(--tun=userspace-networking) ;;
++  *) exit 0 ;;
++esac
++
++mkdir -p "$ROOT/run" "$ROOT/state" || exit 0
++chmod 700 "$ROOT" "$ROOT/run" "$ROOT/state" 2>/dev/null || true
++
++if [ -r "$PIDFILE" ]; then
++  pid=$(sed -n '1p' "$PIDFILE" 2>/dev/null)
++  case "$pid" in
++    ''|*[!0-9]*) ;;
++    *) kill -0 "$pid" 2>/dev/null && exit 0 ;;
++  esac
++fi
++
++# mkdir is the portable, atomic duplicate-start guard available on AGNOS.
++if ! mkdir "$ROOT/run/start.lock" 2>/dev/null; then
++  exit 0
++fi
++trap 'rmdir "$ROOT/run/start.lock" 2>/dev/null || true' EXIT
++
++nohup "$BIN" \
++  --state="$STATE" \
++  --socket="$SOCKET" \
++  --port=41641 \
++  "${tun_args[@]}" >>"$LOG" 2>&1 &
++pid=$!
++printf '%s\n' "$pid" >"$PIDFILE"
++exit 0
+diff --git a/openpilot/sunnypilot/system/tailscale/enroll.sh b/openpilot/sunnypilot/system/tailscale/enroll.sh
+new file mode 100755
+index 0000000..a604c2a
+--- /dev/null
++++ b/openpilot/sunnypilot/system/tailscale/enroll.sh
+@@ -0,0 +1,60 @@
++#!/usr/bin/env bash
++# One-time parked enrollment. The caller supplies a mode-0600 one-use auth-key file.
++set -euo pipefail
++
++if [ "$#" -ne 2 ]; then
++  echo "usage: $0 <expected-user-login> <one-use-auth-key-file>" >&2
++  exit 2
++fi
++
++EXPECTED_LOGIN=$1
++KEY_FILE=$2
++ROOT=/data/custompilot/tailscale
++TS="$ROOT/bin/tailscale"
++SOCKET="$ROOT/run/tailscaled.sock"
++CONFIG=/data/custompilot/commands.json
++TOKEN=/data/custompilot/commandd.token
++
++test -x "$TS"
++test -S "$SOCKET"
++test -f "$KEY_FILE"
++if [ "$(stat -c '%a' "$KEY_FILE")" != 600 ]; then
++  echo "error: auth-key file must have mode 0600" >&2
++  exit 2
++fi
++
++"$TS" --socket="$SOCKET" up \
++  --auth-key="file:$KEY_FILE" \
++  --hostname=comma3x \
++  --advertise-tags=tag:comma \
++  --accept-routes=false \
++  --accept-dns=false \
++  --ssh=false
++
++# The one-use enrollment secret is intentionally destroyed after successful enrollment.
++rm -f -- "$KEY_FILE"
++
++install -d -m 0700 /data/custompilot
++if [ ! -f "$TOKEN" ]; then
++  umask 077
++  head -c 32 /dev/urandom | base64 >"$TOKEN"
++fi
++chmod 0600 "$TOKEN"
++
++if [ ! -f "$CONFIG" ]; then
++  umask 077
++  printf '{\n  "allowed_login": "%s",\n  "visual_enabled": false,\n  "speed_enabled": false\n}\n' \
++    "$EXPECTED_LOGIN" >"$CONFIG"
++fi
++chmod 0600 "$CONFIG"
++
++# HTTPS is tailnet-only. Funnel is never enabled. In userspace mode SSH must be explicitly
++# forwarded because there is no kernel tailnet interface; native mode keeps ordinary port 22.
++"$TS" --socket="$SOCKET" serve --bg --https=443 http://127.0.0.1:8843
++if [ "$(sed -n '1p' "$ROOT/mode")" = userspace ]; then
++  "$TS" --socket="$SOCKET" serve --bg --tcp=2222 tcp://127.0.0.1:22
++fi
++
++"$TS" --socket="$SOCKET" status
++"$TS" --socket="$SOCKET" serve status
++echo "enrolled; visual and speed commands remain disabled in $CONFIG"
+diff --git a/openpilot/sunnypilot/system/tailscale/install.sh b/openpilot/sunnypilot/system/tailscale/install.sh
+new file mode 100755
+index 0000000..60a9608
+--- /dev/null
++++ b/openpilot/sunnypilot/system/tailscale/install.sh
+@@ -0,0 +1,42 @@
++#!/usr/bin/env bash
++# Parked/offroad installer for the pinned official ARM64 static Tailscale build.
++set -euo pipefail
++
++VERSION=1.98.9
++ARCHIVE="tailscale_${VERSION}_arm64.tgz"
++EXPECTED_SHA256=fa554ee808d7d07ee8e3ebbc0215ea087157e2a0abbf408e6e18ea7532554db6
++URL="https://pkgs.tailscale.com/stable/$ARCHIVE"
++ROOT=/data/custompilot/tailscale
++
++if [ "$(uname -m)" != "aarch64" ]; then
++  echo "error: expected aarch64, found $(uname -m)" >&2
++  exit 2
++fi
++
++tmp=$(mktemp -d /tmp/custompilot-tailscale.XXXXXX)
++trap 'rm -rf "$tmp"' EXIT
++curl -fL --retry 3 --output "$tmp/$ARCHIVE" "$URL"
++actual=$(sha256sum "$tmp/$ARCHIVE" | awk '{print $1}')
++if [ "$actual" != "$EXPECTED_SHA256" ]; then
++  echo "error: checksum mismatch for $ARCHIVE" >&2
++  exit 1
++fi
++
++tar -xzf "$tmp/$ARCHIVE" -C "$tmp"
++source_dir="$tmp/tailscale_${VERSION}_arm64"
++test -x "$source_dir/tailscale"
++test -x "$source_dir/tailscaled"
++
++install -d -m 0700 "$ROOT/bin" "$ROOT/run" "$ROOT/state"
++install -m 0755 "$source_dir/tailscale" "$ROOT/bin/tailscale"
++install -m 0755 "$source_dir/tailscaled" "$ROOT/bin/tailscaled"
++printf '%s\n' "$VERSION" >"$ROOT/version"
++chmod 0600 "$ROOT/version"
++
++if [ -c /dev/net/tun ]; then
++  printf '%s\n' native >"$ROOT/mode"
++else
++  printf '%s\n' userspace >"$ROOT/mode"
++fi
++chmod 0600 "$ROOT/mode"
++echo "installed Tailscale $VERSION ($(sed -n '1p' "$ROOT/mode") mode); enrollment is still required"
+-- 
+2.50.1 (Apple Git-155)
+
