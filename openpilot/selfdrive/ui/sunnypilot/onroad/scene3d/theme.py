@@ -6,13 +6,23 @@ See the LICENSE.md file in the root directory for more details.
 """
 
 from dataclasses import dataclass
+from enum import IntEnum
 
-# ui_state.light_sensor is 0..100, derived from camera exposure (ui_state.py:156) where 100 is
-# darkest. Switch with hysteresis so passing under a bridge doesn't strobe the whole scene.
-NIGHT_ENTER = 68.0
-NIGHT_EXIT = 55.0
+# ui_state.light_sensor is 0..100, derived from inverse camera exposure (ui_state.py), so larger
+# values mean more ambient light. Smooth that noisy camera signal before applying a wide hysteresis
+# band: brief shadows (including bridges) should not restyle the whole scene.
+NIGHT_ENTER = 32.0
+NIGHT_EXIT = 45.0
+SENSOR_FILTER_RC = 12.0
+PALETTE_FADE_RC = 4.0
 
 Rgba = tuple[int, int, int, int]
+
+
+class ThemeMode(IntEnum):
+  AUTO = 0
+  LIGHT = 1
+  DARK = 2
 
 
 @dataclass(frozen=True)
@@ -101,6 +111,15 @@ NIGHT = Palette(
 )
 
 
+def blend_palette(day: Palette, night: Palette, amount: float) -> Palette:
+  """Blend every palette channel so a theme change is a fade rather than a flash."""
+  amount = max(0.0, min(1.0, amount))
+  colors = []
+  for day_color, night_color in zip(day.__dict__.values(), night.__dict__.values(), strict=True):
+    colors.append(tuple(round(d + (n - d) * amount) for d, n in zip(day_color, night_color, strict=True)))
+  return Palette(*colors)
+
+
 def path_color(accel: float, night: bool) -> Rgba:
   """Colour the planned path by planned longitudinal acceleration.
 
@@ -124,15 +143,48 @@ def path_color(accel: float, night: bool) -> Rgba:
 
 
 class ThemeSelector:
-  def __init__(self, night: bool = False):
+  def __init__(self, night: bool = False, dt: float = 1.0 / 20.0):
     self.night = night
+    self._dt = max(dt, 0.001)
+    self._filtered_light: float | None = None
+    self._night_amount = float(night)
 
-  def update(self, light_sensor: float) -> Palette:
-    # light_sensor is -1 when there is no camera state yet; hold whatever we had
+  @staticmethod
+  def _mode(value: int) -> ThemeMode:
+    try:
+      return ThemeMode(value)
+    except ValueError:
+      return ThemeMode.AUTO
+
+  def update(self, light_sensor: float, mode: int = ThemeMode.AUTO) -> Palette:
+    mode = self._mode(mode)
+    first_sample = self._filtered_light is None and light_sensor >= 0
+
+    # light_sensor is -1 when there is no camera state yet; retain the last filtered value.
     if light_sensor >= 0:
-      if self.night and light_sensor < NIGHT_EXIT:
+      if first_sample:
+        self._filtered_light = light_sensor
+      else:
+        assert self._filtered_light is not None
+        sensor_alpha = self._dt / (SENSOR_FILTER_RC + self._dt)
+        self._filtered_light += sensor_alpha * (light_sensor - self._filtered_light)
+
+    if mode == ThemeMode.LIGHT:
+      self.night = False
+    elif mode == ThemeMode.DARK:
+      self.night = True
+    elif self._filtered_light is not None:
+      if self.night and self._filtered_light > NIGHT_EXIT:
         self.night = False
-      elif not self.night and light_sensor > NIGHT_ENTER:
+      elif not self.night and self._filtered_light < NIGHT_ENTER:
         self.night = True
 
-    return NIGHT if self.night else DAY
+    target = float(self.night)
+    if first_sample and mode == ThemeMode.AUTO:
+      # Start in the correct theme without showing a several-second flash at renderer startup.
+      self._night_amount = target
+    else:
+      fade_alpha = self._dt / (PALETTE_FADE_RC + self._dt)
+      self._night_amount += fade_alpha * (target - self._night_amount)
+
+    return blend_palette(DAY, NIGHT, self._night_amount)

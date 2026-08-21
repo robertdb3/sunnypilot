@@ -106,6 +106,7 @@ CPP_2_PYTHON = {
 CUSTOM_PARAM_SPECS = {
   b"MapPanel": (ParamKeyType.BOOL, b"0", ParamKeyFlag.PERSISTENT | ParamKeyFlag.BACKUP),
   b"Scene3D": (ParamKeyType.BOOL, b"0", ParamKeyFlag.PERSISTENT | ParamKeyFlag.BACKUP),
+  b"Scene3DTheme": (ParamKeyType.INT, b"0", ParamKeyFlag.PERSISTENT | ParamKeyFlag.BACKUP),
   b"RecklessWatch": (ParamKeyType.BOOL, b"0", ParamKeyFlag.PERSISTENT | ParamKeyFlag.BACKUP),
   b"RecklessWatchThresholdMph": (ParamKeyType.INT, b"82", ParamKeyFlag.PERSISTENT | ParamKeyFlag.BACKUP),
   b"MapPanelZoom": (ParamKeyType.INT, b"1", ParamKeyFlag.PERSISTENT | ParamKeyFlag.BACKUP),

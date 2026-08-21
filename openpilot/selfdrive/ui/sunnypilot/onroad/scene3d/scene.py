@@ -145,6 +145,7 @@ class SceneState:
   cam_target_z: float = -CAM_TARGET_NEAR
   pulse: float = 1.0
   light_sensor: float = 0.0
+  theme_mode: int = 0
   is_metric: bool = False
   valid: bool = False
 
@@ -231,9 +232,9 @@ def _band(y_l, z_l, y_r, z_r, lift, n) -> np.ndarray:
 
 
 class Scene3D:
-  def __init__(self):
+  def __init__(self, fps: float = 20.0):
     self._car: CarShape | None = None
-    self._theme = ThemeSelector()
+    self._theme = ThemeSelector(dt=1.0 / max(fps, 1.0))
     self._camera = rl.Camera3D(
       rl.Vector3(*CAM_POS), rl.Vector3(0.0, 0.0, -CAM_TARGET_NEAR), rl.Vector3(0.0, 1.0, 0.0),
       CAM_FOV, rl.CameraProjection.CAMERA_PERSPECTIVE,
@@ -271,7 +272,7 @@ class Scene3D:
 
   def render(self, rect: rl.Rectangle, state: SceneState) -> None:
     self._ensure_assets()
-    pal = self._theme.update(state.light_sensor)
+    pal = self._theme.update(state.light_sensor, state.theme_mode)
     fade = FADE_NIGHT if self._theme.night else FADE_DAY
 
     self._camera.position.x = state.cam_x

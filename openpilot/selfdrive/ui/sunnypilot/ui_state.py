@@ -55,6 +55,7 @@ class UIStateSP:
     self.onroad_brightness_timer_param: int = 0
     self.rainbow_path: bool = False
     self.scene_3d: bool = False
+    self.scene_3d_theme: int = 0
     self.reckless_over: bool = False
     self.road_name_toggle: bool = False
     self.rocket_fuel: bool = False
@@ -164,6 +165,7 @@ class UIStateSP:
     self.hide_v_ego_ui = self.params.get_bool("HideVEgoUI")
     self.map_panel = self.params.get_bool("MapPanel")
     self.scene_3d = self.params.get_bool("Scene3D")
+    self.scene_3d_theme = self.params.get("Scene3DTheme", return_default=True)
     self.map_panel_zoom = self.params.get("MapPanelZoom", return_default=True)
     self.onroad_brightness = int(float(self.params.get("OnroadScreenOffBrightness", return_default=True)))
     self.onroad_brightness_timer_param = self.params.get("OnroadScreenOffTimer", return_default=True)

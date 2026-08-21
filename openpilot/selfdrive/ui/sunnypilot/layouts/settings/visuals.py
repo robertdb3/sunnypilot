@@ -165,10 +165,20 @@ class VisualsLayout(Widget):
       inline=False
     )
 
+    self._scene_3d_theme = multiple_button_item_sp(
+      title=lambda: tr("3D Scene Appearance"),
+      description=lambda: tr("Use ambient light to switch automatically, or keep the 3D driving scene light or dark."),
+      buttons=[lambda: tr("Auto"), lambda: tr("Always Light"), lambda: tr("Always Dark")],
+      param="Scene3DTheme",
+      button_width=350,
+      inline=False
+    )
+
     items = list(self._toggles.values()) + [
       self._reckless_threshold,
       self._chevron_info,
       self._dev_ui_info,
+      self._scene_3d_theme,
       self._map_panel_zoom,
     ]
     return items
@@ -180,6 +190,7 @@ class VisualsLayout(Widget):
       self._toggles[param].action_item.set_state(self._params.get_bool(param))
 
     self._dev_ui_info.action_item.set_selected_button(ui_state.params.get("DevUIInfo", return_default=True))
+    self._scene_3d_theme.action_item.set_selected_button(ui_state.params.get("Scene3DTheme", return_default=True))
 
     if ui_state.has_longitudinal_control:
       self._chevron_info.set_description(tr(CHEVRON_INFO_DESCRIPTION["enabled"]))

@@ -48,7 +48,7 @@ class Scene3DRenderer:
   """
 
   def __init__(self, fps: float = 20.0):
-    self._scene = Scene3D()
+    self._scene = Scene3D(fps)
     self._state = SceneState()
     dt = 1.0 / max(fps, 1.0)
 
@@ -89,7 +89,8 @@ class Scene3DRenderer:
     self._frame += 1
     # modelV2 arrives at 20 Hz while the UI may render faster. Preserve the array references
     # between message updates instead of converting every model field to numpy on every frame.
-    state = replace(self._state, light_sensor=ui_state.light_sensor, is_metric=ui_state.is_metric)
+    state = replace(self._state, light_sensor=ui_state.light_sensor, theme_mode=ui_state.scene_3d_theme,
+                    is_metric=ui_state.is_metric)
 
     if sm_.updated.get("carState"):
       cs = sm_["carState"]
