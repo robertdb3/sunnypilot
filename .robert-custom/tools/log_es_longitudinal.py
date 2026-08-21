@@ -1,0 +1,394 @@
+#!/usr/bin/env python3
+"""Capture what EyeSight actually commands longitudinally, on this preglobal Outback.
+
+READ-ONLY. This subscribes and parses; it never constructs a publisher and never sends a CAN
+frame. That property is the whole reason it is safe to run while driving, so keep it: there is no
+`PubMaster`, no `pub_sock`, and no `can_list_to_can_capnp` anywhere in this file, and there should
+never be.
+
+Why this exists
+---------------
+`openpilotLongitudinalControl` is false on this platform, so the runbook's whole longitudinal story
+is workarounds around EyeSight. But the preglobal platform *does* carry a full longitudinal command
+surface -- ES_Brake/ES_Distance/ES_Status, structurally identical to the global platform that
+openpilot longitudinal already drives:
+
+    ES_Brake    0x160   Brake_Pressure (16-bit), Cruise_Brake_Active, Cruise_Activated
+    ES_Distance 0x161   Cruise_Throttle (12-bit), Car_Follow, Close_Distance, Standstill
+    ES_Status   0x162   Cruise_RPM (16-bit), Cruise_Activated
+
+What is *not* known is the scaling. `CarControllerParams` ships THROTTLE_INACTIVE=1818,
+THROTTLE_MAX=3400, BRAKE_MAX=600 (~-3.5 m/s^2), RPM_MAX=3600 -- all derived from **global** cars.
+Whether any of that transfers to preglobal is unmeasured, and guessing it is exactly the kind of
+thing that goes wrong quietly. This tool measures it from EyeSight's own behaviour.
+
+The bus split is the useful part
+--------------------------------
+Panda marks ES_Distance and ES_LKAS `check_relay`, so the camera's copies are statically blocked and
+openpilot's replace them. ES_Brake and ES_Status are *not* in the preglobal TX list, so they are
+forwarded from the camera untouched. Therefore:
+
+  * bus 2   (camera)  = what EyeSight *wants* -- ground truth for the command scaling
+  * bus 128 (TX echo) = what was actually placed on the main bus, forwarded or openpilot-generated
+
+Bus 128 is 0 | 0x80: the panda reports frames it transmitted with the echo flag set. Bus 0 itself
+carries nothing on the `can` service, so parsing it returns zeros forever -- which mimics a clean
+comparison whenever the real signal is also zero.
+
+For ES_Brake the two should agree (pure forward). For ES_Distance they will differ in Cruise_Button
+whenever ICBM or a driver press is active. A disagreement anywhere else is worth understanding
+before anyone writes a line of longitudinal control.
+
+Usage
+-----
+Offline, against a route already on the device (no driving needed -- start here)::
+
+    PYTHONPATH=/data/openpilot /usr/local/venv/bin/python log_es_longitudinal.py \
+        --route-glob '/data/media/0/realdata/00000017--c0343146c1--*/rlog.zst' --csv /tmp/es.csv
+
+Live, parked or with a passenger operating it, EyeSight ACC engaged::
+
+    PYTHONPATH=/data/openpilot /usr/local/venv/bin/python log_es_longitudinal.py \
+        --seconds 300 --csv /tmp/es.csv
+
+Either way it prints an analysis at the end comparing the measured ranges against the global-derived
+constants openpilot ships.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import glob
+import os
+import re
+import sys
+import time
+
+# Signals we care about, per message. Kept explicit so a DBC rename is a loud KeyError rather than a
+# column of silent zeros.
+ES_BRAKE_SIGNALS = ("Brake_Pressure", "Cruise_Brake_Active", "Cruise_Activated", "Cruise_Brake_Lights", "Cruise_Fault")
+ES_DISTANCE_SIGNALS = ("Cruise_Throttle", "Car_Follow", "Close_Distance", "Standstill", "Cruise_Fault", "Cruise_Button")
+ES_STATUS_SIGNALS = ("Cruise_RPM", "Cruise_Activated", "Brake")
+
+# What opendbc ships for Subaru longitudinal. All derived from GLOBAL cars; this tool exists to find
+# out whether any of it is true here. See opendbc/car/subaru/values.py CarControllerParams.
+GLOBAL_CONSTANTS = {
+  "THROTTLE_MIN": 808,
+  "THROTTLE_INACTIVE": 1818,
+  "THROTTLE_MAX": 3400,
+  "RPM_MIN": 0,
+  "RPM_INACTIVE": 600,
+  "RPM_MAX": 3600,
+  "BRAKE_MIN": 0,
+  "BRAKE_MAX": 600,  # about -3.5 m/s^2 on global, per the opendbc comment
+}
+
+CAM_BUS = 2
+# NOT bus 0. Frames openpilot/panda put onto the main bus are reported back on the `can` service
+# with the TX-echo flag set, i.e. src = 0 | 0x80 = 128; bus 0 itself carries nothing in `can`.
+# Parsing bus 0 silently yields all-zero values forever, which looks like a clean comparison
+# precisely when the real signal is also zero -- verified on route 0000000b--12b500b38a.
+MAIN_TX_ECHO_BUS = 128
+
+
+def segment_key(path: str):
+  """Sort route segments numerically.
+
+  Lexicographic sorting puts segment 10 before segment 2, which silently reorders a drive. The
+  runbook calls this out; analyze_last_drive.py still uses a plain sorted().
+  """
+  name = os.path.basename(os.path.dirname(path))
+  m = re.search(r"--(\d+)$", name)
+  return (name.rsplit("--", 1)[0], int(m.group(1)) if m else -1)
+
+
+def build_parsers(fingerprint: str):
+  from opendbc.car.subaru.values import DBC
+  from opendbc.car import Bus
+  from opendbc.can.parser import CANParser
+
+  dbc = DBC[fingerprint][Bus.pt]
+  # Empty message list parses everything in the DBC, matching carstate.get_can_parsers().
+  return dbc, CANParser(dbc, [], CAM_BUS), CANParser(dbc, [], MAIN_TX_ECHO_BUS)
+
+
+def read_row(cp_cam, cp_main, state: dict) -> dict:
+  """One sample: EyeSight's command (bus 2) beside what reached the car (bus 0)."""
+  row = {"t": round(state.get("t", 0.0), 3)}
+
+  for sig in ES_BRAKE_SIGNALS:
+    row[f"cam_brake_{sig}"] = cp_cam.vl["ES_Brake"][sig]
+  for sig in ES_DISTANCE_SIGNALS:
+    row[f"cam_dist_{sig}"] = cp_cam.vl["ES_Distance"][sig]
+  for sig in ES_STATUS_SIGNALS:
+    row[f"cam_status_{sig}"] = cp_cam.vl["ES_Status"][sig]
+
+  # Only the signals whose TX-echo value is genuinely informative: brake should be a pure forward,
+  # throttle should be a verbatim copy, button is where openpilot legitimately differs.
+  row["tx_brake_Brake_Pressure"] = cp_main.vl["ES_Brake"]["Brake_Pressure"]
+  row["tx_dist_Cruise_Throttle"] = cp_main.vl["ES_Distance"]["Cruise_Throttle"]
+  row["tx_dist_Cruise_Button"] = cp_main.vl["ES_Distance"]["Cruise_Button"]
+
+  for k in ("v_ego", "a_ego", "standstill", "cruise_enabled", "cruise_speed", "brake_pressed", "gas_pressed"):
+    row[k] = state.get(k, "")
+  return row
+
+
+def collect_route(route_glob: str, decimate: int) -> list[dict]:
+  from openpilot.tools.lib.logreader import _LogFileReader
+  from openpilot.selfdrive.pandad import can_capnp_to_list
+
+  files = sorted(glob.glob(route_glob), key=segment_key)
+  if not files:
+    print(f"no segments matched {route_glob}", file=sys.stderr)
+    return []
+  print(f"segments {len(files)}: " + " ".join(os.path.basename(os.path.dirname(f)) for f in files))
+
+  fingerprint = None
+  for fn in files:
+    for m in _LogFileReader(fn):
+      if m.which() == "carParams":
+        fingerprint = m.carParams.carFingerprint
+        break
+    if fingerprint:
+      break
+  if fingerprint is None:
+    print("no carParams in route; cannot pick a DBC", file=sys.stderr)
+    return []
+  print(f"carFingerprint: {fingerprint}")
+
+  dbc, cp_cam, cp_main = build_parsers(fingerprint)
+  print(f"dbc: {dbc}")
+
+  rows: list[dict] = []
+  state: dict = {}
+  pending: list[bytes] = []
+  n_can = 0
+  t0 = None
+
+  def flush():
+    if not pending:
+      return
+    packets = can_capnp_to_list(pending)
+    cp_cam.update(packets)
+    cp_main.update(packets)
+    pending.clear()
+
+  for fn in files:
+    for m in _LogFileReader(fn):
+      which = m.which()
+      if which == "carState":
+        cs = m.carState
+        state.update(v_ego=round(cs.vEgo, 4), a_ego=round(cs.aEgo, 4), standstill=int(cs.standstill),
+                     cruise_enabled=int(cs.cruiseState.enabled), cruise_speed=round(cs.cruiseState.speed, 3),
+                     brake_pressed=int(cs.brakePressed), gas_pressed=int(cs.gasPressed))
+      elif which == "can":
+        if t0 is None:
+          t0 = m.logMonoTime
+        state["t"] = (m.logMonoTime - t0) / 1e9
+        pending.append(m.as_builder().to_bytes())
+        n_can += 1
+        if len(pending) >= 16:
+          flush()
+        if n_can % decimate == 0:
+          flush()  # must precede the sample, or the row reflects parser state up to 15 events stale
+          try:
+            rows.append(read_row(cp_cam, cp_main, state))
+          except KeyError as e:
+            print(f"signal missing from DBC: {e}. The DBC mapping is wrong; stop here.", file=sys.stderr)
+            return rows
+  flush()
+  return rows
+
+
+def collect_live(seconds: float, decimate: int) -> list[dict]:
+  import cereal.messaging as messaging
+  from openpilot.selfdrive.pandad import can_capnp_to_list
+
+  # Read the fingerprint off carParams rather than decoding the cached CarParamsCache blob.
+  sm = messaging.SubMaster(["carState", "carParams"])
+  can_sock = messaging.sub_sock("can", conflate=False, timeout=100)
+
+  # carParams is published by `card`, which is only_onroad -- offroad this never arrives, so bound
+  # the wait rather than hanging forever on a parked car with the ignition off.
+  print("waiting for carParams (needs ignition on) ...")
+  deadline = time.monotonic() + 15.0
+  while not sm.updated["carParams"]:
+    if time.monotonic() > deadline:
+      print("no carParams after 15s. `card` only runs onroad, so turn the ignition on -- or use\n"
+            "--route-glob to analyse a drive that already happened.", file=sys.stderr)
+      return []
+    sm.update(100)
+  fingerprint = sm["carParams"].carFingerprint
+  print(f"carFingerprint: {fingerprint}")
+
+  dbc, cp_cam, cp_main = build_parsers(fingerprint)
+  print(f"dbc: {dbc}")
+  print(f"read-only capture for {seconds:.0f}s -- engage EyeSight ACC and drive normally\n")
+
+  rows: list[dict] = []
+  state: dict = {}
+  start = time.monotonic()
+  n = 0
+  next_sample = decimate
+  while time.monotonic() - start < seconds:
+    sm.update(0)
+    if sm.updated["carState"]:
+      cs = sm["carState"]
+      state.update(v_ego=round(cs.vEgo, 4), a_ego=round(cs.aEgo, 4), standstill=int(cs.standstill),
+                   cruise_enabled=int(cs.cruiseState.enabled), cruise_speed=round(cs.cruiseState.speed, 3),
+                   brake_pressed=int(cs.brakePressed), gas_pressed=int(cs.gasPressed))
+
+    # wait_for_one blocks on the socket (100 ms timeout) instead of spinning. This matters: the tool
+    # is meant to run while driving, and symptom 6 was a takeover caused by CPU saturation. A busy
+    # loop here would be the same class of mistake the runbook already paid for once.
+    can_strs = messaging.drain_sock_raw(can_sock, wait_for_one=True)
+    if can_strs:
+      packets = can_capnp_to_list(can_strs)
+      cp_cam.update(packets)
+      cp_main.update(packets)
+      # count CAN events, not drain batches, so --decimate means the same thing in both modes
+      n += len(packets)
+      state["t"] = time.monotonic() - start
+      if n >= next_sample:
+        next_sample = n + decimate
+        try:
+          rows.append(read_row(cp_cam, cp_main, state))
+        except KeyError as e:
+          print(f"signal missing from DBC: {e}", file=sys.stderr)
+          return rows
+        if len(rows) % 40 == 0:
+          r = rows[-1]
+          # carState fields are "" until the first carState arrives -- and stay "" for the whole run
+          # if `card` is dead, which is precisely when this tool is most worth running (symptom 10).
+          # Formatting a str with %f raises, so coerce.
+          def num(key, default=float("nan")):
+            v = r.get(key, "")
+            return float(v) if v != "" else default
+          print(f"  t={num('t', 0.0):6.1f}  v={num('v_ego'):5.1f}  a={num('a_ego'):6.2f}  "
+                f"thr={num('cam_dist_Cruise_Throttle'):6.0f}  rpm={num('cam_status_Cruise_RPM'):6.0f}  "
+                f"brk={num('cam_brake_Brake_Pressure'):5.0f}  act={num('cam_brake_Cruise_Brake_Active'):.0f}")
+  return rows
+
+
+def pct(values: list[float], p: float) -> float:
+  if not values:
+    return float("nan")
+  s = sorted(values)
+  return s[min(len(s) - 1, int(p / 100.0 * len(s)))]
+
+
+def analyse(rows: list[dict]) -> None:
+  if not rows:
+    print("\nno samples captured")
+    return
+
+  eng = [r for r in rows if r.get("cruise_enabled") == 1]
+  print(f"\n{'=' * 78}\n{len(rows)} samples, {len(eng)} with stock cruise engaged\n{'=' * 78}")
+  if not eng:
+    print("No engaged samples -- the interesting signals only move under EyeSight ACC. Re-run with\n"
+          "cruise actually engaged, or point --route-glob at a drive where it was.")
+    return
+
+  thr = [float(r["cam_dist_Cruise_Throttle"]) for r in eng]
+  rpm = [float(r["cam_status_Cruise_RPM"]) for r in eng]
+  brk = [float(r["cam_brake_Brake_Pressure"]) for r in eng]
+
+  print(f"\n{'signal':<22} {'min':>8} {'p05':>8} {'median':>8} {'p95':>8} {'max':>8}   global ships")
+  for name, vals, gmin, gmax in (("Cruise_Throttle", thr, "THROTTLE_MIN", "THROTTLE_MAX"),
+                                 ("Cruise_RPM", rpm, "RPM_MIN", "RPM_MAX"),
+                                 ("Brake_Pressure", brk, "BRAKE_MIN", "BRAKE_MAX")):
+    print(f"{name:<22} {min(vals):8.0f} {pct(vals, 5):8.0f} {pct(vals, 50):8.0f} "
+          f"{pct(vals, 95):8.0f} {max(vals):8.0f}   {GLOBAL_CONSTANTS[gmin]}..{GLOBAL_CONSTANTS[gmax]}")
+
+  # Real zero-acceleration throttle: what EyeSight holds while cruising flat.
+  # THROTTLE_INACTIVE is not a constant on this platform: steady-state throttle rises with speed,
+  # 2135 at ~17 m/s to 2698 at ~32 m/s across the measured routes. Bucket by speed rather than
+  # reporting one median, which is what hid this at first.
+  steady = [r for r in eng if abs(float(r["a_ego"] or 0)) < 0.1 and float(r["v_ego"] or 0) > 2]
+  if steady:
+    by_speed: dict[int, list[float]] = {}
+    for r in steady:
+      by_speed.setdefault(int(float(r["v_ego"]) // 5 * 5), []).append(float(r["cam_dist_Cruise_Throttle"]))
+    print(f"\nsteady cruise (|a|<0.1), Cruise_Throttle by speed -- global ships a single "
+          f"THROTTLE_INACTIVE = {GLOBAL_CONSTANTS['THROTTLE_INACTIVE']}:")
+    print(f"  {'v_ego m/s':>12}  {'n':>6}  {'median':>8}")
+    for k in sorted(by_speed):
+      v = by_speed[k]
+      if len(v) >= 20:
+        print(f"  {k:>5}-{k + 4:<6}  {len(v):>6}  {pct(v, 50):>8.0f}")
+  else:
+    print("\nno steady-cruise samples -- need some flat cruising to pin the throttle curve")
+
+  # Brake pressure vs measured deceleration: the BRAKE_LOOKUP the global port guesses at.
+  #
+  # Standstill MUST be excluded. EyeSight holds real brake pressure to keep the car stopped -- median
+  # 294 counts, measured -- at aEgo = 0. Leaving those in drags whole buckets to a median of 0.00 and
+  # destroys the relationship: route 0000000d had 320 such samples in the 250-299 bucket alone, which
+  # made the curve look non-monotonic and unusable. Driver braking is excluded for the same reason:
+  # what is wanted is EyeSight's own command authority.
+  braking = [r for r in eng
+             if float(r["cam_brake_Brake_Pressure"] or 0) > 0
+             and float(r["v_ego"] or 0) > 2.0
+             and r.get("brake_pressed") != 1]
+  if braking:
+    print(f"\nbraking samples: {len(braking)}")
+    buckets: dict[int, list[float]] = {}
+    for r in braking:
+      b = int(float(r["cam_brake_Brake_Pressure"]) // 50 * 50)
+      buckets.setdefault(b, []).append(float(r["a_ego"] or 0))
+    print(f"  {'Brake_Pressure':>16}  {'n':>5}  {'median a_ego (m/s^2)':>22}")
+    for b in sorted(buckets):
+      v = buckets[b]
+      print(f"  {b:>10}-{b + 49:<5}  {len(v):>5}  {pct(v, 50):>22.2f}")
+    print("\n  This is the real BRAKE_LOOKUP, standstill excluded. Measured across three routes:\n"
+          "  aEgo = -0.00519 * pressure - 0.246, so -3.5 m/s^2 needs ~627 counts and global's\n"
+          "  BRAKE_MAX of 600 gives -3.36. Unlike the throttle constants, this one roughly transfers.")
+  else:
+    print("\nno braking samples -- need a drive where EyeSight actually slowed for a lead")
+
+  # Forwarding sanity: ES_Brake should be identical on both buses today.
+  mismatch = [r for r in rows
+              if float(r["cam_brake_Brake_Pressure"] or 0) != float(r["tx_brake_Brake_Pressure"] or 0)]
+  print(f"\nES_Brake camera vs TX-echo mismatches: {len(mismatch)} / {len(rows)}")
+  if mismatch:
+    print("  Unexpected -- ES_Brake is not in the preglobal TX list, so the panda forwards it in\n"
+          "  hardware and the echo should be bit-identical. Measured 0/6379 on route 0000000b.\n"
+          "  Understand any nonzero count before trusting the numbers above.")
+
+  thr_mismatch = [r for r in rows
+                  if float(r["cam_dist_Cruise_Throttle"] or 0) != float(r["tx_dist_Cruise_Throttle"] or 0)]
+  print(f"ES_Distance Cruise_Throttle camera vs TX-echo mismatches: {len(thr_mismatch)} / {len(rows)}")
+  print("  A high rate here is EXPECTED and is not corruption. openpilot rebuilds ES_Distance only\n"
+        "  every 5th frame (carcontroller: `if self.frame % 5 == 0`) from the latest camera snapshot,\n"
+        "  so its copy trails by up to 5 frames while Cruise_Throttle is moving. Measured on route\n"
+        "  0000000b at full rate: 39% instantaneous mismatch, of which 99.8% match a camera value\n"
+        "  within +/-5 frames and none were zero. What would be alarming is a mismatch that does NOT\n"
+        "  resolve to a recent camera value -- that would mean the rebuild is lossy.")
+
+
+def main() -> int:
+  ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+  ap.add_argument("--route-glob", help="parse an existing rlog instead of running live")
+  ap.add_argument("--seconds", type=float, default=300.0, help="live capture duration")
+  ap.add_argument("--decimate", type=int, default=5, help="emit one row per N can updates")
+  ap.add_argument("--csv", help="write samples here")
+  args = ap.parse_args()
+
+  rows = collect_route(args.route_glob, args.decimate) if args.route_glob \
+      else collect_live(args.seconds, args.decimate)
+
+  if args.csv and rows:
+    with open(args.csv, "w", newline="") as f:
+      w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+      w.writeheader()
+      w.writerows(rows)
+    print(f"\nwrote {len(rows)} rows to {args.csv}")
+
+  analyse(rows)
+  return 0
+
+
+if __name__ == "__main__":
+  sys.exit(main())
