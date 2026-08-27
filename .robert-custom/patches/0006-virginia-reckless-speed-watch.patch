@@ -291,7 +291,7 @@ index 0000000..2a51ff5
 +    rl.draw_rectangle(x, y + b, b, h - 2 * b, color)
 +    rl.draw_rectangle(x + w - b, y + b, b, h - 2 * b, color)
 diff --git a/openpilot/selfdrive/ui/sunnypilot/ui_state.py b/openpilot/selfdrive/ui/sunnypilot/ui_state.py
-index 6880472..0129de5 100644
+index 9bed533..4b42c28 100644
 --- a/openpilot/selfdrive/ui/sunnypilot/ui_state.py
 +++ b/openpilot/selfdrive/ui/sunnypilot/ui_state.py
 @@ -55,6 +55,7 @@ class UIStateSP:
@@ -302,7 +302,7 @@ index 6880472..0129de5 100644
      self.road_name_toggle: bool = False
      self.rocket_fuel: bool = False
      self.speed_limit_mode = None
-@@ -151,6 +152,8 @@ class UIStateSP:
+@@ -150,6 +151,8 @@ def update_params(self) -> None:
      if CP_SP_bytes is not None:
        self.CP_SP = messaging.log_from_bytes(CP_SP_bytes, custom.CarParamsSP)
        self.has_icbm = self.CP_SP.intelligentCruiseButtonManagementAvailable and self.params.get_bool("IntelligentCruiseButtonManagement")
@@ -310,7 +310,7 @@ index 6880472..0129de5 100644
 +      self.reckless_over = bool(self.sm['selfdriveStateSP'].recklessWatch.over)
  
      self._enforce_constraints()
-     self.active_bundle = self.params.get("ModelManager_ActiveBundle")
+     source = get_active_source(usbgpu=self.usbgpu, usbgpu_active=self.usbgpu_active,
 diff --git a/openpilot/sunnypilot/selfdrive/reckless_watch/__init__.py b/openpilot/sunnypilot/selfdrive/reckless_watch/__init__.py
 new file mode 100644
 index 0000000..2b444e0
