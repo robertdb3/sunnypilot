@@ -43,24 +43,20 @@ index a8ecb5f..c636b2d 100644
      lat_active = sm['carControl'].latActive
      steer_override = sm['carState'].steeringPressed
  
-@@ -250,7 +266,7 @@ class FrictionCoefficientElement:
+@@ -250,5 +266,5 @@ class FrictionCoefficientElement:
      if ui_state.enforce_torque_control and ui_state.custom_torque_params and ui_state.torque_override_enabled:
        return UiElement(f"{ui_state.torque_override_friction:.3f}", "FRIC.", self.unit, rl.WHITE)
  
 -    ltp = sm['lateralTorqueParameters']
 +    ltp = _torque_params(sm)
      value = f"{ltp.frictionCoefficientFiltered:.3f}"
-     color = rl.Color(0, 255, 0, 255) if ltp.valid else rl.WHITE
-     return UiElement(value, "FRIC.", self.unit, color)
-@@ -264,7 +280,7 @@ class LatAccelFactorElement:
+@@ -264,5 +280,5 @@ class LatAccelFactorElement:
      if ui_state.enforce_torque_control and ui_state.custom_torque_params and ui_state.torque_override_enabled:
        return UiElement(f"{ui_state.torque_override_lat_accel_factor:.3f}", "L.A.F.", self.unit, rl.WHITE)
  
 -    ltp = sm['lateralTorqueParameters']
 +    ltp = _torque_params(sm)
      value = f"{ltp.latAccelFactorFiltered:.3f}"
-     color = rl.Color(0, 255, 0, 255) if ltp.valid else rl.WHITE
-     return UiElement(value, "L.A.F.", self.unit, color)
 diff --git a/openpilot/selfdrive/ui/sunnypilot/onroad/scene3d/geometry.py b/openpilot/selfdrive/ui/sunnypilot/onroad/scene3d/geometry.py
 index f05c5e9..a2e7d3f 100644
 --- a/openpilot/selfdrive/ui/sunnypilot/onroad/scene3d/geometry.py

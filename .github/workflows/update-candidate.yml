@@ -41,6 +41,21 @@ jobs:
       - name: Preserve maintenance assets
         run: cp -R .robert-custom "$RUNNER_TEMP/robert-custom"
 
+      - name: Check patch context drift
+        continue-on-error: true
+        run: |
+          git checkout -B custompilot-staging upstream/staging
+          # The root of custompilot-staging is the last pristine upstream snapshot we still
+          # reference; upstream staging itself is force-pushed and keeps no history.
+          baseline=$(git rev-list --max-parents=0 origin/custompilot-staging 2>/dev/null | tail -1 || true)
+          if [ -n "$baseline" ]; then
+            python3 "$RUNNER_TEMP/robert-custom/automation/check_patch_context.py" \
+              "$GITHUB_WORKSPACE" "$RUNNER_TEMP/robert-custom" --baseline "$baseline"
+          else
+            python3 "$RUNNER_TEMP/robert-custom/automation/check_patch_context.py" \
+              "$GITHUB_WORKSPACE" "$RUNNER_TEMP/robert-custom"
+          fi
+
       - name: Build and validate candidate
         run: |
           git checkout -B custompilot-staging upstream/staging
