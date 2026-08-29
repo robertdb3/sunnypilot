@@ -111,6 +111,10 @@ def changed_lines(repo: Path, baseline: str, path: str) -> set[int]:
 
 def analyse(checkout: Path, assets: Path, baseline: str | None, near: int) -> list[dict]:
   tree: dict[str, list[str]] = {}
+  # Parallel to tree[path]: each simulated line's 1-based number in the checkout, or None for
+  # a line one of our own patches inserted. Earlier patches shift the simulated file, so a
+  # context line has to be mapped back before it can be compared against upstream's diff.
+  origin: dict[str, list[int | None]] = {}
   findings: list[dict] = []
   # Lines our own earlier patches insert. They show up as context in later patches, but they
   # are ours, not upstream's, so upstream churn cannot strand them.
@@ -122,6 +126,7 @@ def analyse(checkout: Path, assets: Path, baseline: str | None, near: int) -> li
       if not target.exists():
         return None
       tree[path] = target.read_text().split("\n")
+      origin[path] = list(range(1, len(tree[path]) + 1))
     return tree[path]
 
   for tag, patch in patch_files(assets):
@@ -132,6 +137,14 @@ def analyse(checkout: Path, assets: Path, baseline: str | None, near: int) -> li
         continue
       preimage = [c for t, c in body if t in " -"]
       spots = locate(current, preimage)
+      # Where this hunk sits, and where each of its lines sits within it. Without this a
+      # context line gets measured against the nearest identical text anywhere in the file.
+      anchor = spots[0] if len(spots) == 1 else None
+      preimage_at, seen = {}, 0
+      for i, (marker, _line) in enumerate(body):
+        if marker in " -":
+          preimage_at[i] = seen
+          seen += 1
 
       first = next((i for i, (t, _) in enumerate(body) if t != " "), None)
       last = next((i for i in range(len(body) - 1, -1, -1) if body[i][0] != " "), None)
@@ -179,22 +192,32 @@ def analyse(checkout: Path, assets: Path, baseline: str | None, near: int) -> li
             findings.append({"kind": "churned-context", "patch": tag, "path": path,
                              "hunk": header, "where": where, "line": text_line.strip()[:100],
                              "detail": "upstream changed this exact context line since the baseline"})
-          elif touched:
-            at = [i + 1 for i, x in enumerate(current) if x == text_line]
-            gap = min((min(abs(i - t) for t in touched) for i in at), default=None)
+          elif touched and anchor is not None:
+            at = origin[path][anchor + preimage_at[index]]
+            gap = min((abs(at - t) for t in touched), default=None) if at else None
             if gap is not None and gap <= near:
               findings.append({"kind": "near-churn", "patch": tag, "path": path, "hunk": header,
                                "where": where, "line": text_line.strip()[:100],
                                "detail": f"{gap} line(s) from code upstream changed since the baseline"})
 
-      if len(spots) == 1:                      # keep the simulated tree in step
-        start = spots[0]
-        tree[path] = current[:start] + [c for t, c in body if t in " +"] + \
-                     current[start + len(preimage):]
+      if anchor is not None:                   # keep the simulated tree and its map in step
+        omap, rebuilt, cursor = origin[path], [], anchor
+        for marker, _line in body:
+          if marker == " ":
+            rebuilt.append(omap[cursor])
+            cursor += 1
+          elif marker == "-":
+            cursor += 1
+          else:
+            rebuilt.append(None)
+        tree[path] = current[:anchor] + [c for t, c in body if t in " +"] + \
+                     current[anchor + len(preimage):]
+        origin[path] = omap[:anchor] + rebuilt + omap[anchor + len(preimage):]
 
     for path, _header, body in parse_hunks(text):   # register files this patch creates
       if path not in tree and not (checkout / path).exists():
         tree[path] = [c for t, c in body if t in " +"]
+        origin[path] = [None] * len(tree[path])
       for marker, text_line in body:
         if marker == "+":
           ours.add(text_line)
