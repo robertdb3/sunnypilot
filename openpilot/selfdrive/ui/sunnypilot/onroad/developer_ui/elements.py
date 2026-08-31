@@ -21,10 +21,10 @@ def _roll(sm) -> float:
 
 
 def _torque_params(sm):
-  """Read torque learning across the liveTorqueParameters rename."""
+  """Read torque learning across the lateralTorqueParameters/liveTorqueParameters rename."""
   for service in ("lateralTorqueParameters", "liveTorqueParameters"):
     if service in sm.valid:
-      return sm[service], bool(sm.valid[service])
+      return sm[service]
   raise KeyError("no torque-parameter service subscribed")
 
 
@@ -266,11 +266,9 @@ class FrictionCoefficientElement:
     if ui_state.enforce_torque_control and ui_state.custom_torque_params and ui_state.torque_override_enabled:
       return UiElement(f"{ui_state.torque_override_friction:.3f}", "FRIC.", self.unit, rl.WHITE)
 
-    ltp, service_valid = _torque_params(sm)
+    ltp = _torque_params(sm)
     value = f"{ltp.frictionCoefficientFiltered:.3f}"
-    # The older lateralTorqueParameters schema has valid instead of liveValid.
-    learned_valid = getattr(ltp, "liveValid", getattr(ltp, "valid", service_valid))
-    color = rl.Color(0, 255, 0, 255) if learned_valid else rl.WHITE
+    color = rl.Color(0, 255, 0, 255) if ltp.valid else rl.WHITE
     return UiElement(value, "FRIC.", self.unit, color)
 
 
@@ -282,10 +280,9 @@ class LatAccelFactorElement:
     if ui_state.enforce_torque_control and ui_state.custom_torque_params and ui_state.torque_override_enabled:
       return UiElement(f"{ui_state.torque_override_lat_accel_factor:.3f}", "L.A.F.", self.unit, rl.WHITE)
 
-    ltp, service_valid = _torque_params(sm)
+    ltp = _torque_params(sm)
     value = f"{ltp.latAccelFactorFiltered:.3f}"
-    learned_valid = getattr(ltp, "liveValid", getattr(ltp, "valid", service_valid))
-    color = rl.Color(0, 255, 0, 255) if learned_valid else rl.WHITE
+    color = rl.Color(0, 255, 0, 255) if ltp.valid else rl.WHITE
     return UiElement(value, "L.A.F.", self.unit, color)
 
 
