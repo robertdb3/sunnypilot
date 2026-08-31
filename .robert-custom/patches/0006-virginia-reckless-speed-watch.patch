@@ -30,12 +30,13 @@ index a10db6f..086d1f3 100644
  
    enum AudibleAlert {
      none @0;
-@@ -356,6 +372,8 @@ struct OnroadEventSP @0xda96579883444c35 {
+@@ -356,7 +372,9 @@ struct OnroadEventSP @0xda96579883444c35 {
      speedLimitPending @22;
      e2eChime @23;
      laneChangeRoadEdge @24;
-+    enteredVirginia @25;
-+    recklessSpeed @26;
+     bigModelReady @25;
++    enteredVirginia @26;
++    recklessSpeed @27;
    }
  }
  
