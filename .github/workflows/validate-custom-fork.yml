@@ -25,6 +25,12 @@ jobs:
           ref: master
           path: controller
 
+      - name: Fetch manifest-pinned upstream base
+        working-directory: candidate
+        run: |
+          upstream_sha=$(python3 -c 'import json; print(json.load(open("CUSTOM_FORK_MANIFEST.json"))["upstream"]["commit"])')
+          git fetch --no-tags --depth=1 https://github.com/sunnypilot/sunnypilot.git "$upstream_sha"
+
       - name: Install test dependencies
         run: python3 -m pip install --disable-pip-version-check numpy pycapnp raylib
 
