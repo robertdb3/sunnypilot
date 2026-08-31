@@ -39,7 +39,9 @@ class AugmentedRoadViewSP:
     if self._scene_3d is None:
       # imported lazily so devices with the toggle off never build the meshes
       from openpilot.selfdrive.ui.sunnypilot.onroad.scene3d.renderer import Scene3DRenderer
-      self._scene_3d = Scene3DRenderer()
+      # the blind-spot fade and camera damping are specified as time constants, so the
+      # renderer needs the real frame rate: 20 on tizi, 60 elsewhere
+      self._scene_3d = Scene3DRenderer(gui_app.target_fps)
 
     self._scene_3d.update()
     self._scene_3d.render(content_rect)

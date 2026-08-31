@@ -4,7 +4,6 @@ from openpilot.sunnypilot.models.tinygrad_ref import get_tinygrad_ref
 from openpilot.sunnypilot.models.fetcher import ModelFetcher
 from openpilot.common.test import OpenpilotTestCase
 
-
 def fetch_tinygrad_ref():
   response = requests.get(ModelFetcher.MODEL_URL, timeout=10)
   response.raise_for_status()

@@ -151,6 +151,7 @@ struct ModelManagerSP @0xaedffd8f31e7b55d {
     downloaded @2;
     cached @3;
     failed @4;
+    verifying @5;
   }
 
   struct DownloadProgress {
@@ -372,8 +373,9 @@ struct OnroadEventSP @0xda96579883444c35 {
     speedLimitPending @22;
     e2eChime @23;
     laneChangeRoadEdge @24;
-    enteredVirginia @25;
-    recklessSpeed @26;
+    bigModelReady @25;
+    enteredVirginia @26;
+    recklessSpeed @27;
   }
 }
 
