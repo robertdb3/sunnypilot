@@ -134,29 +134,36 @@ class TestRibbon(unittest.TestCase):
 
 
 class _Lead:
-  def __init__(self, prob, x, y, v=0.0):
-    self.prob, self.x, self.y, self.v = prob, [x], [y], [v]
+  def __init__(self, prob, x, y, v=0.0, prob_time=0.0):
+    self.prob, self.x, self.y, self.v, self.probTime = prob, [x], [y], [v], prob_time
+
+
+def _leads_v3(*entries):
+  """modelV2.leadsV3 shape: one entry per horizon, probTime 0, 2, 4 s."""
+  return [_Lead(*e, prob_time=t) for e, t in zip(entries, (0.0, 2.0, 4.0))]
 
 
 class TestLeadPositions(unittest.TestCase):
   def test_filters_low_probability(self):
-    leads = [_Lead(0.9, 20.0, 0.0), _Lead(0.1, 40.0, 0.0)]
-    self.assertEqual(len(geo.lead_positions(leads)), 1)
+    self.assertEqual(geo.lead_positions(_leads_v3((0.1, 20.0, 0.0))), [])
 
-  def test_sorted_by_distance_and_capped(self):
-    leads = [_Lead(0.9, 60.0, 0.0), _Lead(0.9, 20.0, 0.0), _Lead(0.9, 40.0, 0.0)]
-    got = geo.lead_positions(leads, max_count=2)
-    self.assertEqual([g[0] for g in got], [20.0, 40.0])
+  def test_future_horizons_are_not_extra_cars(self):
+    """Symptom 16: the 2 s / 4 s entries were drawn as a second, phantom car off to the side."""
+    leads = _leads_v3((0.9, 20.0, 0.0), (0.9, 18.0, -3.5), (0.9, 25.0, -3.5))
+    got = geo.lead_positions(leads)
+    self.assertEqual([(g[0], g[1]) for g in got], [(20.0, 0.0)])
+
+  def test_predicted_cut_in_does_not_appear_before_it_happens(self):
+    leads = _leads_v3((0.2, 20.0, 0.0), (0.9, 15.0, -3.5), (0.9, 15.0, -3.5))
+    self.assertEqual(geo.lead_positions(leads), [])
 
   def test_handles_none_and_empty(self):
     self.assertEqual(geo.lead_positions(None), [])
     self.assertEqual(geo.lead_positions([]), [])
 
-  def test_speed_stays_with_its_lead_after_sorting(self):
-    """Results are distance-sorted, so speed must travel in the tuple, not a parallel list."""
-    leads = [_Lead(0.9, 60.0, 0.0, v=31.0), _Lead(0.9, 20.0, 0.0, v=12.0)]
-    got = geo.lead_positions(leads)
-    self.assertEqual([(g[0], g[3]) for g in got], [(20.0, 12.0), (60.0, 31.0)])
+  def test_speed_travels_with_the_lead(self):
+    got = geo.lead_positions(_leads_v3((0.9, 20.0, 0.0, 12.0), (0.9, 60.0, 0.0, 31.0)))
+    self.assertEqual([(g[0], g[3]) for g in got], [(20.0, 12.0)])
 
 
 class TestRibbonVarying(unittest.TestCase):
