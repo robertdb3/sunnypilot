@@ -617,6 +617,22 @@ same reason, a prebuilt runtime object the tests never built—and the runbook a
 rule that would have caught both: *if a change reads a cereal message, one test must feed it a real
 capnp reader, or the change is unvalidated no matter how many tests are green.*
 
+### 15. The 3D scene drew night in daylight and day at night
+
+**Cause:** `scene3d/theme.py` treated `ui_state.light_sensor` as "100 is darkest". It is the
+opposite: `ui_state.py` sets it to `100 - exposureValPercent` and uses it directly as screen
+brightness, so 100 is brightest (and `-1` means no camera state yet). The thresholds were applied
+the wrong way up, and every offline render fed the same inverted values, so the previews looked
+right while the car was wrong.
+
+**Fix (`0015`):** night is the low end (`< 30`), day returns above `48`. The reading is also
+low-passed (5 s) and a switch is refused for 45 s after the previous one, so dusk, which lingers in
+the dead band for minutes, no longer strobes the scene. The first real reading classifies
+immediately. `tools/render_*.py` now use bright-high values too.
+
+**Unverified:** the 30/48 thresholds are the old 68/55 mirrored and widened, not calibrated on the
+car. If the switch lands too early or late, tune `NIGHT_ENTER` and `DAY_ENTER`.
+
 ## The reboot/recovery lesson
 
 During the final recovery, the UI process had crashed and the installed manager did not

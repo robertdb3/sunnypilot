@@ -37,7 +37,7 @@ from pathlib import Path
 
 # Same order apply_candidate.sh replays them in; the ports patch slots in after 0006.
 PATCH_ORDER = ("0001", "0002", "0003", "0004", "0005", "0006",
-               "PORT", "0008", "0009", "0010", "0011")
+               "PORT", "0008", "0009", "0010", "0011", "0015")
 
 # git apply rejects a hunk that ends with no trailing context, so one line is the floor.
 MIN_EDGE_CONTEXT = 1
