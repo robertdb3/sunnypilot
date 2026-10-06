@@ -56,7 +56,7 @@ def scene_state(night=False):
     road_edges=edges, path=path,
     accel=np.full(33, 0.3, dtype=np.float32),
     leads=[(46.0, 0.8, 0.95, 39.0)],
-    v_ego=38.0, light_sensor=95.0 if night else 8.0, valid=True,
+    v_ego=38.0, light_sensor=5.0 if night else 92.0, valid=True,
   )
 
 

@@ -104,7 +104,7 @@ def scenario_straight_day():
     road_edges=edges, path=path_on_t_idxs(27.0),
     accel=np.full(33, 0.9, dtype=np.float32),
     leads=[(41.0, 0.3, 0.95, 29.0)], v_ego=27.0,
-    light_sensor=10.0, valid=True,
+    light_sensor=90.0, valid=True,
   )
 
 
@@ -115,7 +115,7 @@ def scenario_curve_day():
     road_edges=edges, path=path_on_t_idxs(24.0, 0.0016),
     accel=np.linspace(0.4, -2.2, 33).astype(np.float32),
     leads=[(24.0, 1.4, 0.98, 19.5), (63.0, 3.9, 0.7, 26.0)], v_ego=24.0,
-    light_sensor=6.0, valid=True,
+    light_sensor=94.0, valid=True,
   )
 
 
@@ -127,7 +127,7 @@ def scenario_night_blindspot():
     accel=np.full(33, -0.3, dtype=np.float32),
     leads=[(33.0, -0.6, 0.93, 25.0)], v_ego=25.5,
     left_blindspot=1.0,
-    light_sensor=95.0, valid=True,
+    light_sensor=5.0, valid=True,
   )
 
 
@@ -139,7 +139,7 @@ def scenario_low_confidence():
     road_edges=edges, path=path_on_t_idxs(18.0, 0.0004),
     accel=np.full(33, 0.2, dtype=np.float32),
     leads=[], v_ego=18.0,
-    light_sensor=12.0, valid=True,
+    light_sensor=88.0, valid=True,
   )
 
 
@@ -151,12 +151,12 @@ def scenario_low_speed():
     road_edges=edges, path=path_on_t_idxs(6.0),
     accel=np.full(33, 0.1, dtype=np.float32),
     leads=[(12.0, 0.1, 0.99, 4.0)], v_ego=6.0,
-    light_sensor=10.0, valid=True,
+    light_sensor=90.0, valid=True,
   )
 
 
 def scenario_no_model():
-  return SceneState(light_sensor=10.0, valid=False)
+  return SceneState(light_sensor=90.0, valid=False)
 
 
 SCENARIOS = [

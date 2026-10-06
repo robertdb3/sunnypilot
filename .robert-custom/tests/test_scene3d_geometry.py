@@ -450,5 +450,85 @@ class TestPaletteReadability(unittest.TestCase):
     hi = self._luma(theme.NIGHT.sky_bottom[:3])
     self.assertTrue(lo <= self._luma(theme.NIGHT.haze[:3]) <= hi)
 
+class TestThemeSelector(unittest.TestCase):
+  """light_sensor is 100 - exposureValPercent: HIGH is BRIGHT. The first version had it backwards
+  and drew the night scene in full sun, so the polarity is pinned here."""
+
+  def _run(self, sel, samples, step=1.0, t0=1000.0):
+    """Feed (level, seconds) segments at `step` cadence; return the list of night flags."""
+    out, t = [], t0
+    for level, seconds in samples:
+      for _ in range(int(seconds / step)):
+        sel.update(level, now=t)
+        out.append(sel.night)
+        t += step
+    return out
+
+  def test_bright_reading_is_day(self):
+    sel = theme.ThemeSelector()
+    self.assertIs(sel.update(90.0, now=0.0), theme.DAY)
+    self.assertFalse(sel.night)
+
+  def test_dark_reading_is_night(self):
+    sel = theme.ThemeSelector()
+    self.assertIs(sel.update(5.0, now=0.0), theme.NIGHT)
+    self.assertTrue(sel.night)
+
+  def test_no_camera_state_holds_current_theme(self):
+    sel = theme.ThemeSelector()
+    sel.update(5.0, now=0.0)
+    self.assertIs(sel.update(-1.0, now=1.0), theme.NIGHT)
+    fresh = theme.ThemeSelector()
+    self.assertIs(fresh.update(-1.0, now=0.0), theme.DAY)
+
+  def test_startup_does_not_wait_for_the_dwell(self):
+    sel = theme.ThemeSelector()
+    sel.update(5.0, now=0.0)
+    self.assertTrue(sel.night, "first real reading must classify immediately")
+
+  def test_sunset_switches_to_night_and_sunrise_back(self):
+    sel = theme.ThemeSelector()
+    flags = self._run(sel, [(90.0, 60), (5.0, 120), (90.0, 120)])
+    self.assertFalse(flags[59])
+    self.assertTrue(flags[60 + 119])
+    self.assertFalse(flags[-1])
+
+  def test_dusk_wobble_inside_the_dead_band_never_flips(self):
+    sel = theme.ThemeSelector()
+    mid = (theme.NIGHT_ENTER + theme.DAY_ENTER) / 2.0
+    sel.update(90.0, now=0.0)
+    flags = self._run(sel, [(mid - 5.0, 3), (mid + 5.0, 3)] * 100, t0=1.0)
+    self.assertFalse(any(flags))
+
+  def test_noisy_dusk_crossing_flips_at_most_once(self):
+    """Sensor wanders across both thresholds every few seconds; the scene must not strobe."""
+    sel = theme.ThemeSelector()
+    sel.update(90.0, now=0.0)
+    levels = [20.0, 60.0, 25.0, 55.0, 15.0, 70.0, 22.0, 58.0] * 40
+    flags = self._run(sel, [(v, 2) for v in levels], t0=1.0)
+    flips = sum(1 for a, b in zip(flags, flags[1:]) if a != b)
+    self.assertLessEqual(flips, 1)
+
+  def test_brief_dark_spell_is_ignored(self):
+    """A bridge or tunnel mouth is a few seconds, not dusk."""
+    sel = theme.ThemeSelector()
+    flags = self._run(sel, [(90.0, 60), (3.0, 3), (90.0, 60)])
+    self.assertFalse(any(flags))
+
+  def test_cannot_flip_twice_inside_the_dwell(self):
+    sel = theme.ThemeSelector()
+    sel.update(90.0, now=0.0)
+    flags = self._run(sel, [(3.0, 60)], t0=1.0)
+    self.assertTrue(flags[-1])
+    switched_at = 1.0 + flags.index(True)
+    sel.update(95.0, now=switched_at + 1.0)
+    for dt in range(2, int(theme.MIN_DWELL_S) - 1):
+      sel.update(95.0, now=switched_at + dt)
+      self.assertTrue(sel.night, f"flipped back after only {dt}s")
+
+  def test_dead_band_is_wide_enough_to_matter(self):
+    self.assertGreaterEqual(theme.DAY_ENTER - theme.NIGHT_ENTER, 10.0)
+
+
 if __name__ == "__main__":
   unittest.main(verbosity=2)
