@@ -633,6 +633,17 @@ immediately. `tools/render_*.py` now use bright-high values too.
 **Unverified:** the 30/48 thresholds are the old 68/55 mirrored and widened, not calibrated on the
 car. If the switch lands too early or late, tune `NIGHT_ENTER` and `DAY_ENTER`.
 
+### 16. A phantom car sat ahead and to the left in the 3D view
+
+**Cause:** `geometry.lead_positions` treated `modelV2.leadsV3` as a list of cars and drew the two
+most probable. It is one lead asked at three horizons: `probTime` 0, 2 and 4 s ("which car will be
+my lead then?"). Entries 1 and 2 are the current lead again or a car predicted to cut in, so the
+scene drew traffic that was not there yet, offset into the next lane. Seen after the `81d7957`
+upstream bump. The 3D code was unchanged, so whatever surfaced it came from the model side.
+
+**Fix (`0016`):** only the `probTime == 0` entry is drawn. At most one lead, and none when that
+entry is below `0.5`.
+
 ## The reboot/recovery lesson
 
 During the final recovery, the UI process had crashed and the installed manager did not
