@@ -5,12 +5,20 @@ This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 """
 
+import math
+import time
 from dataclasses import dataclass
 
-# ui_state.light_sensor is 0..100, derived from camera exposure (ui_state.py:156) where 100 is
-# darkest. Switch with hysteresis so passing under a bridge doesn't strobe the whole scene.
-NIGHT_ENTER = 68.0
-NIGHT_EXIT = 55.0
+# ui_state.light_sensor is 0..100 and HIGH MEANS BRIGHT: ui_state.py sets it to
+# 100 - exposureValPercent and feeds it straight into screen brightness. It is -1 until the
+# camera reports. Night is the low end; these thresholds were previously applied the other way up.
+NIGHT_ENTER = 30.0   # smoothed reading must fall below this to go dark
+DAY_ENTER = 48.0     # and rise above this to come back; the gap is the dusk dead band
+
+# Dusk sits inside the dead band for many minutes and the raw reading wanders (shadows, signs,
+# headlights), so also low-pass it and refuse to flip again right after a flip.
+SMOOTHING_TAU_S = 5.0
+MIN_DWELL_S = 45.0
 
 Rgba = tuple[int, int, int, int]
 
@@ -126,13 +134,33 @@ def path_color(accel: float, night: bool) -> Rgba:
 class ThemeSelector:
   def __init__(self, night: bool = False):
     self.night = night
+    self._level: float | None = None
+    self._last_t: float | None = None
+    self._last_switch_t: float | None = None
 
-  def update(self, light_sensor: float) -> Palette:
+  def update(self, light_sensor: float, now: float | None = None) -> Palette:
     # light_sensor is -1 when there is no camera state yet; hold whatever we had
     if light_sensor >= 0:
-      if self.night and light_sensor < NIGHT_EXIT:
-        self.night = False
-      elif not self.night and light_sensor > NIGHT_ENTER:
-        self.night = True
+      t = time.monotonic() if now is None else now
+
+      if self._level is None or self._last_t is None:
+        # First real reading: classify immediately so startup is not wrong for half a minute.
+        self._level = light_sensor
+        self.night = light_sensor < (NIGHT_ENTER + DAY_ENTER) / 2.0
+        self._last_switch_t = t
+      else:
+        dt = max(t - self._last_t, 0.0)
+        self._level += (light_sensor - self._level) * (1.0 - math.exp(-dt / SMOOTHING_TAU_S))
+
+        settled = self._last_switch_t is None or t - self._last_switch_t >= MIN_DWELL_S
+        if settled:
+          if not self.night and self._level < NIGHT_ENTER:
+            self.night = True
+            self._last_switch_t = t
+          elif self.night and self._level > DAY_ENTER:
+            self.night = False
+            self._last_switch_t = t
+
+      self._last_t = t
 
     return NIGHT if self.night else DAY

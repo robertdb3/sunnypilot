@@ -282,24 +282,25 @@ def quad(corners_car: np.ndarray) -> np.ndarray:
   ]).astype(np.float32)
 
 
-def lead_positions(leads, max_count: int = 2, min_prob: float = 0.5) -> list[tuple[float, float, float, float]]:
-  """Extract (x, y, prob, v) for the most probable leads from modelV2.leadsV3.
+def lead_positions(leads, min_prob: float = 0.5) -> list[tuple[float, float, float, float]]:
+  """Extract (x, y, prob, v) for the current lead from modelV2.leadsV3, as a 0- or 1-item list.
 
-  Speed travels with the lead rather than in a parallel list: the results are sorted by distance,
-  so a separate array indexed against the original order would pair speeds to the wrong cars.
+  leadsV3 is NOT a list of cars. Its three entries ask one question at three horizons (probTime 0,
+  2 and 4 s: "which car will be my lead then?"), so entries 1 and 2 are the current lead again or a
+  car the model expects to cut in. Drawing them as extra traffic put a phantom car ahead and off to
+  the side. Only the probTime == 0 entry is a car that is actually there now.
 
   Deliberately reads leadsV3 and not radarState: radarState leads are gated on
   openpilotLongitudinalControl and a radar, and this car (Subaru, radarUnavailable) has neither,
   so radarState would render nothing.
   """
-  out: list[tuple[float, float, float, float]] = []
   for lead in leads or []:
+    if float(getattr(lead, "probTime", 0.0)) > 0.0:
+      continue
     prob = float(getattr(lead, "prob", 0.0))
     xs, ys = getattr(lead, "x", None), getattr(lead, "y", None)
     if prob < min_prob or not xs or not ys:
-      continue
+      return []
     vs = getattr(lead, "v", None)
-    out.append((float(xs[0]), float(ys[0]), prob, float(vs[0]) if vs else 0.0))
-
-  out.sort(key=lambda t: t[0])
-  return out[:max_count]
+    return [(float(xs[0]), float(ys[0]), prob, float(vs[0]) if vs else 0.0)]
+  return []
