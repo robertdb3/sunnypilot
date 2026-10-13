@@ -1,0 +1,67 @@
+diff --git a/openpilot/selfdrive/ui/soundd.py b/openpilot/selfdrive/ui/soundd.py
+index a61e26b..ad8eadb 100644
+--- a/openpilot/selfdrive/ui/soundd.py
++++ b/openpilot/selfdrive/ui/soundd.py
+@@ -168,12 +168,17 @@ class Soundd(QuietMode):
+     volume = ((weighted_db - AMBIENT_DB) / DB_SCALE) * (MAX_VOLUME - MIN_VOLUME) + MIN_VOLUME
+     return math.pow(VOLUME_BASE, (np.clip(volume, MIN_VOLUME, MAX_VOLUME) - 1))
+ 
+-  @retry(attempts=10, delay=3)
++  @retry(attempts=micd.STREAM_OPEN_ATTEMPTS, delay=micd.STREAM_OPEN_DELAY)
+   def get_stream(self, sd):
+-    # reload sounddevice to reinitialize portaudio
+-    sd._terminate()
+-    sd._initialize()
+-    return sd.OutputStream(channels=1, samplerate=SAMPLE_RATE, callback=self.callback, blocksize=SAMPLE_BUFFER)
++    try:
++      # reload sounddevice to reinitialize portaudio
++      sd._terminate()
++      sd._initialize()
++      return sd.OutputStream(channels=1, samplerate=SAMPLE_RATE, callback=self.callback, blocksize=SAMPLE_BUFFER)
++    except Exception:
++      # retry() only prints, so log the actual cause
++      cloudlog.exception("soundd failed to open output stream")
++      raise
+ 
+   def soundd_thread(self):
+     # sounddevice must be imported after forking processes
+diff --git a/openpilot/system/micd.py b/openpilot/system/micd.py
+index 7167aad..7742790 100755
+--- a/openpilot/system/micd.py
++++ b/openpilot/system/micd.py
+@@ -14,6 +14,12 @@ REFERENCE_SPL = 2e-5  # newtons/m^2
+ SAMPLE_RATE = 16000
+ SAMPLE_BUFFER = 800  # 50ms
+ 
++# On the first drive after boot the audio device can stay unopenable for ~30s after onroad
++# starts, which outlasted 10 x 3s and left micd and soundd dead for the whole drive.
++# Shared with soundd.
++STREAM_OPEN_ATTEMPTS = 40
++STREAM_OPEN_DELAY = 3  # seconds
++
+ 
+ def patch_sounddevice(sd):
+   # TODO: remove once sounddevice uses np.reshape internally.
+@@ -102,12 +108,17 @@ class Mic:
+ 
+         self.measurements = self.measurements[FFT_SAMPLES:]
+ 
+-  @retry(attempts=10, delay=3)
++  @retry(attempts=STREAM_OPEN_ATTEMPTS, delay=STREAM_OPEN_DELAY)
+   def get_stream(self, sd):
+-    # reload sounddevice to reinitialize portaudio
+-    sd._terminate()
+-    sd._initialize()
+-    return sd.InputStream(channels=1, samplerate=SAMPLE_RATE, callback=self.callback, blocksize=SAMPLE_BUFFER)
++    try:
++      # reload sounddevice to reinitialize portaudio
++      sd._terminate()
++      sd._initialize()
++      return sd.InputStream(channels=1, samplerate=SAMPLE_RATE, callback=self.callback, blocksize=SAMPLE_BUFFER)
++    except Exception:
++      # retry() only prints, so log the actual cause
++      cloudlog.exception("micd failed to open input stream")
++      raise
+ 
+   def micd_thread(self):
+     # sounddevice must be imported after forking processes
