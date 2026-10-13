@@ -644,6 +644,23 @@ upstream bump. The 3D code was unchanged, so whatever surfaced it came from the 
 **Fix (`0016`):** only the `probTime == 0` entry is drawn. At most one lead, and none when that
 entry is below `0.5`.
 
+### 17. `micd`/`soundd` not running blocked engagement on the first drive after a boot
+
+**Cause:** only the first onroad after a boot was affected. The car came on about 21 s after boot.
+For the next ~30 s, neither process could open the audio device. Both use `@retry(attempts=10,
+delay=3)`, so they gave up with `get_stream failed after retry`. Manager does not restart a dead
+process until the next offroad→onroad transition, so `selfdrived` reported `process_not_running`
+for the whole drive. An ignition cycle cleared it. Failing routes: `af`, `b0`, `b2`. `sound.service`
+had finished by about 9 s each boot, and nothing else held the device. Upstream has identical code,
+and boots that got lucky opened audio on the tenth attempt, about 50 s after boot. The PortAudio
+error itself was never recorded, because `retry()` only `print`s, and rlogs on this build carry no
+kernel log.
+
+**Fix (`0017`):** both retry for 40 × 3 s (shared constants in `micd.py`). Each failed open is
+`cloudlog.exception`ed, so the next occurrence leaves the real cause in swaglog
+(`grep "failed to open" /data/log/swaglog.*`). While soundd is still retrying it counts as running
+but plays nothing. That was already true for the first 30 s.
+
 ## The reboot/recovery lesson
 
 During the final recovery, the UI process had crashed and the installed manager did not
