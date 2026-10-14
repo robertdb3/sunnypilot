@@ -4,7 +4,8 @@
     SUNNYPILOT=<built tree> python tests/test_audio_stream_retry.py
 
 On the first drive after a boot both crashed with `get_stream failed after retry` (10 x 3s) and
-selfdrived blocked engagement for the whole drive. See runbook symptom 17.
+selfdrived blocked engagement for the whole drive. See runbook symptom 17. Each failed open also logs
+a snapshot of every audio layer (0018), because PortAudio's own error doesn't say which one refused.
 """
 import ast
 import importlib.util
@@ -96,6 +97,60 @@ class TestMicdStreamRetry(unittest.TestCase):
     self.assertEqual(sd.opens, self.micd.STREAM_OPEN_ATTEMPTS)
 
 
+class TestAudioOpenDiagnostics(unittest.TestCase):
+  KEYS = {"uptime", "dmesg_audio", "groups", "cards", "card0_state", "node_controlC0", "alsa_default", "alsa_hw:0,0",
+          "portaudio_devices", "portaudio_default", "dev_snd_holders"}
+
+  def setUp(self):
+    self.micd = MICD
+    self.micd.cloudlog.reset_mock()
+    patcher = mock.patch.object(UTILS.time, "sleep")
+    patcher.start()
+    self.addCleanup(patcher.stop)
+    self.mic = self.micd.Mic.__new__(self.micd.Mic)
+    self.mic.callback = None
+
+  def test_every_failed_open_logs_a_snapshot(self):
+    # FlakySoundDevice has no query_devices and this host has no sound card, so most probes fail.
+    sd = FlakySoundDevice(failures=3)
+    self.assertEqual(self.mic.get_stream(sd), "stream")
+    events = self.micd.cloudlog.event.call_args_list
+    self.assertEqual(len(events), 3)
+    for call in events:
+      self.assertEqual(call.args, ("micd audio open diagnostics",))
+      self.assertTrue(call.kwargs["error"])
+      self.assertLessEqual(self.KEYS | {"node_pcmC0D0c"}, set(call.kwargs))
+
+  def test_a_failing_probe_is_recorded_not_raised(self):
+    with mock.patch.object(self.micd.os, "getgroups", side_effect=PermissionError("nope")):
+      diag = self.micd.audio_open_diagnostics(FlakySoundDevice(0), capture=True)
+    self.assertEqual(diag["groups"], "PermissionError: nope")
+
+  def test_only_probes_its_own_direction(self):
+    # Opening the other direction's PCM could collide with the other daemon's retry.
+    capture = self.micd.audio_open_diagnostics(FlakySoundDevice(0), capture=True)
+    playback = self.micd.audio_open_diagnostics(FlakySoundDevice(0), capture=False)
+    self.assertIn("node_pcmC0D0c", capture)
+    self.assertNotIn("node_pcmC0D0p", capture)
+    self.assertIn("node_pcmC0D0p", playback)
+    self.assertNotIn("node_pcmC0D0c", playback)
+
+  def test_dmesg_collapses_repeated_open_noise(self):
+    out = "\n".join([
+      "[    9.373120] sdm845-asoc-snd soc:sound-tavil: Sound card sdm845-tavil-snd-card registered",
+      "[   40.005296] R0: [cds_mc_thread] wlan: [38919:I :HDD] hdd_local_unsafe_channel_updated",
+      "[   50.000001] __q6asm_cmd: DSP returned error[ADSP_EFAILED] opcode 68557",
+      "[   50.000002] usb 1-1: new device",
+      "[   53.000001] __q6asm_cmd: DSP returned error[ADSP_EFAILED] opcode 68557",
+    ])
+    with mock.patch.object(self.micd.subprocess, "run", return_value=types.SimpleNamespace(stdout=out)):
+      lines = self.micd._dmesg_audio()
+    self.assertEqual(lines, [
+      "[    9.373120] sdm845-asoc-snd soc:sound-tavil: Sound card sdm845-tavil-snd-card registered",
+      "[   53.000001] __q6asm_cmd: DSP returned error[ADSP_EFAILED] opcode 68557 (x2)",
+    ])
+
+
 class TestSounddUsesSharedWindow(unittest.TestCase):
   def setUp(self):
     tree = ast.parse((ROOT / "selfdrive/ui/soundd.py").read_text())
@@ -111,7 +166,13 @@ class TestSounddUsesSharedWindow(unittest.TestCase):
     self.assertEqual(len(handlers), 1)
     calls = {ast.unparse(c.func) for c in ast.walk(handlers[0]) if isinstance(c, ast.Call)}
     self.assertIn("cloudlog.exception", calls)
+    self.assertIn("cloudlog.event", calls)
+    self.assertIn("micd.audio_open_diagnostics", calls)
     self.assertIsInstance(handlers[0].body[-1], ast.Raise)
+
+  def test_diagnostics_probe_playback(self):
+    diag = next(c for c in ast.walk(self.fn) if isinstance(c, ast.Call) and ast.unparse(c.func) == "micd.audio_open_diagnostics")
+    self.assertEqual({k.arg: ast.unparse(k.value) for k in diag.keywords}, {"capture": "False"})
 
 
 if __name__ == "__main__":
