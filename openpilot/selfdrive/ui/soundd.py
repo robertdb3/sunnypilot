@@ -168,12 +168,18 @@ class Soundd(QuietMode):
     volume = ((weighted_db - AMBIENT_DB) / DB_SCALE) * (MAX_VOLUME - MIN_VOLUME) + MIN_VOLUME
     return math.pow(VOLUME_BASE, (np.clip(volume, MIN_VOLUME, MAX_VOLUME) - 1))
 
-  @retry(attempts=10, delay=3)
+  @retry(attempts=micd.STREAM_OPEN_ATTEMPTS, delay=micd.STREAM_OPEN_DELAY)
   def get_stream(self, sd):
-    # reload sounddevice to reinitialize portaudio
-    sd._terminate()
-    sd._initialize()
-    return sd.OutputStream(channels=1, samplerate=SAMPLE_RATE, callback=self.callback, blocksize=SAMPLE_BUFFER)
+    try:
+      # reload sounddevice to reinitialize portaudio
+      sd._terminate()
+      sd._initialize()
+      return sd.OutputStream(channels=1, samplerate=SAMPLE_RATE, callback=self.callback, blocksize=SAMPLE_BUFFER)
+    except Exception:
+      # retry() only prints, so log the actual cause
+      cloudlog.exception("soundd failed to open output stream")
+      cloudlog.event("soundd audio open diagnostics", error=True, **micd.audio_open_diagnostics(sd, capture=False))
+      raise
 
   def soundd_thread(self):
     # sounddevice must be imported after forking processes
