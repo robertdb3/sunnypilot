@@ -661,6 +661,20 @@ kernel log.
 (`grep "failed to open" /data/log/swaglog.*`). While soundd is still retrying it counts as running
 but plays nothing. That was already true for the first 30 s.
 
+**First capture (route `b5`, 2026-10-14):** every failed open is `PortAudioError: Error querying
+device -1`, meaning PortAudio sees no usable device at all, not even ALSA `default`. Each attempt fails
+within milliseconds. The car came on at ~28 s; audio opened on attempt 9 at ~55 s after boot (old
+failing boots gave up at ~51 s), so the device becomes usable at a fixed point after boot, not a fixed
+delay after onroad. Ruled out on the device: the card (online ~9.6 s), udev permissions
+(`/dev/snd` `root:audio 0660` from 9.3 s), PulseAudio/PipeWire (none), `sound_init.sh`, and
+process groups. Boot t0 can be recovered from the wall clock the kernel prints in wlan lines.
+
+**Diagnostics (`0018`):** each failed open also logs `micd/soundd audio open diagnostics` with
+uptime, recent deduplicated audio dmesg, `/proc/asound` state, a raw open of the control and own-direction
+PCM node, `snd_pcm_open` of `default` and `hw:0,0`, PortAudio's device count and default, and which
+of our processes hold `/dev/snd/pcm*`. The first entry that isn't `ok` names the layer that refuses.
+Pull it with `grep "audio open diagnostics" /data/log/swaglog.*`.
+
 ## The reboot/recovery lesson
 
 During the final recovery, the UI process had crashed and the installed manager did not
