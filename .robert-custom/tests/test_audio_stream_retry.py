@@ -6,11 +6,16 @@
 On the first drive after a boot both crashed with `get_stream failed after retry` (10 x 3s) and
 selfdrived blocked engagement for the whole drive. See runbook symptom 17. Each failed open also logs
 a snapshot of every audio layer (0018), because PortAudio's own error doesn't say which one refused.
+That showed /dev/snd stays root-only until udev gets past AGNOS's slow 99-gpio.rules (~40-50s), so
+launch_chffrplus.sh now sets the sound nodes' group itself, like it already does for the GPU (0019).
 """
 import ast
 import importlib.util
 import os
+import re
+import subprocess
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -173,6 +178,45 @@ class TestSounddUsesSharedWindow(unittest.TestCase):
   def test_diagnostics_probe_playback(self):
     diag = next(c for c in ast.walk(self.fn) if isinstance(c, ast.Call) and ast.unparse(c.func) == "micd.audio_open_diagnostics")
     self.assertEqual({k.arg: ast.unparse(k.value) for k in diag.keywords}, {"capture": "False"})
+
+
+class TestLaunchFixesSndPermissions(unittest.TestCase):
+  """Runs the real agnos_init lines against a temp dir, with sudo and sleep stubbed."""
+  def setUp(self):
+    self.launch = (ROOT.parent / "launch_chffrplus.sh").read_text()
+    m = re.search(r"\n( *# Same for sound:.*?-exec chmod 660 \{\} \+)\n", self.launch, re.DOTALL)
+    self.assertIsNotNone(m, "sound permission block missing from launch_chffrplus.sh")
+    self.block = m.group(1)
+
+  def run_block(self, with_card):
+    with tempfile.TemporaryDirectory() as d:
+      snd = Path(d, "snd")
+      snd.mkdir()
+      if with_card:
+        (snd / "controlC0").touch()
+      log = Path(d, "log")
+      script = (f'sleep() {{ echo sleep >> "{log}"; }}\n'
+                f'sudo() {{ echo "sudo $*" >> "{log}"; }}\n' + self.block.replace("/dev/snd", str(snd)))
+      subprocess.run(["bash", "-c", script], check=True)
+      return [l.replace(str(snd), "/dev/snd") for l in log.read_text().splitlines()] if log.exists() else []
+
+  def test_inside_agnos_init_after_gpu_fix(self):
+    body = self.launch[self.launch.index("function agnos_init"):self.launch.index("# Check if AGNOS update is required")]
+    self.assertIn(self.block, body)
+    self.assertLess(body.index("chgrp gpu"), body.index("# Same for sound:"))
+
+  def test_sets_group_and_mode_on_char_nodes_only(self):
+    # by-path is a directory; 660 on it would make it untraversable.
+    self.assertEqual(self.run_block(with_card=True),
+                     ["sudo find /dev/snd -maxdepth 1 -type c -exec chgrp audio {} + -exec chmod 660 {} +"])
+
+  def test_waits_at_most_ten_seconds_for_the_card(self):
+    log = self.run_block(with_card=False)
+    self.assertEqual(log.count("sleep"), 100)
+    self.assertEqual(log[-1][:9], "sudo find")
+
+  def test_script_parses(self):
+    subprocess.run(["bash", "-n", str(ROOT.parent / "launch_chffrplus.sh")], check=True)
 
 
 if __name__ == "__main__":
