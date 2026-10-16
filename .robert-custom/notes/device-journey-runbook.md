@@ -675,6 +675,25 @@ PCM node, `snd_pcm_open` of `default` and `hw:0,0`, PortAudio's device count and
 of our processes hold `/dev/snd/pcm*`. The first entry that isn't `ok` names the layer that refuses.
 Pull it with `grep "audio open diagnostics" /data/log/swaglog.*`.
 
+**Root cause (from `0018`, 2026-10-16):** until ~52 s after boot every `/dev/snd` node was
+`root:root 0600`, so user `comma` got `Permission denied` from the raw node up through ALSA and
+PortAudio. At 52.7 s they became `root:audio 0660`, every layer opened, and audio started. The earlier
+"udev permissions ruled out" was wrong: `USEC_INITIALIZED` does not mean the permissions were applied.
+udev is backed up by AGNOS's `/etc/udev/rules.d/99-gpio.rules`. For every gpio event it synchronously runs
+`find -L /sys/class/gpio/ -maxdepth 2 -exec chown root:gpio {} \; -exec chmod 770 {} \;`. That is 323 files and
+~650 forks, ~2.2 s per event on an idle device, for 32 gpiochips plus the gpios openpilot exports. `/dev` node
+ctimes show udev touching only gpiochips from ~9 s to ~39 s, then everything else at once. It runs longer when
+the car goes onroad and loads the CPU. The rule is unchanged since 2022 and still in the AGNOS release branches;
+agnos-builder `master` has removed these udev rules (#592). Measure it with
+`find /dev -xdev -printf "%C@ %p\n" | sort -n`. The boot wall clock starts at 15:04:41.99.
+
+**Fix (`0019`):** `agnos_init` in `launch_chffrplus.sh` already chgrps the GPU nodes because "udev does
+this, but sometimes we startup faster". It now does the same for sound: wait up to 10 s for
+`/dev/snd/controlC0` (ALSA registers it after the PCM nodes), then `chgrp audio` + `chmod 660` the char
+nodes. Verified on the device: forcing the nodes back to `root:root 0600` reproduced PortAudio's 0 devices and
+default `-1`, and the new lines restored 32 devices and default 31 in 0.07 s. `0017`'s retry and `0018`'s
+diagnostics stay as a safety net.
+
 ## The reboot/recovery lesson
 
 During the final recovery, the UI process had crashed and the installed manager did not
