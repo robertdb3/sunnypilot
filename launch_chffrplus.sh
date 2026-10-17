@@ -17,6 +17,15 @@ function agnos_init {
   sudo chgrp gpu /dev/adsprpc-smd /dev/ion /dev/kgsl-3d0
   sudo chmod 660 /dev/adsprpc-smd /dev/ion /dev/kgsl-3d0
 
+  # Same for sound: 99-gpio.rules backs udev up for ~40-50s after boot, and until it reaches
+  # the sound card micd/soundd can't open /dev/snd. Nothing orders us after sound.service, so
+  # wait briefly for the card. ALSA registers controlC0 after the card's PCM nodes.
+  for _ in {1..100}; do
+    [ -e /dev/snd/controlC0 ] && break
+    sleep 0.1
+  done
+  sudo find /dev/snd -maxdepth 1 -type c -exec chgrp audio {} + -exec chmod 660 {} +
+
   # Check if AGNOS update is required
   if [ "$(< /VERSION)" != "$AGNOS_VERSION" ]; then
     AGNOS_PY="$DIR/openpilot/common/hardware/comma/agnos.py"
