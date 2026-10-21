@@ -41,7 +41,7 @@ done
 # layer supplies metadata only for our five keys and preserves strict rejection of all others.
 apply_one "$ASSETS/ports/staging-30a9cdc/0001-prebuilt-custom-params-compat.patch"
 
-for number in 0008 0009 0010 0011 0015 0016 0017 0018 0019; do
+for number in 0008 0009 0010 0011 0015 0016 0017 0018 0019 0020; do
   patch=$(find "$ASSETS/patches" -maxdepth 1 -type f -name "$number-*.patch" -print)
   if [ "$(printf '%s\n' "$patch" | grep -c .)" -ne 1 ]; then
     echo "error: expected exactly one $number patch" >&2
@@ -49,6 +49,12 @@ for number in 0008 0009 0010 0011 0015 0016 0017 0018 0019; do
   fi
   apply_one "$patch"
 done
+
+# Panda safety code is compiled into the panda, so a patch that changes it only takes effect in
+# rebuilt firmware. build_panda_firmware.sh first proves it reproduces upstream's firmware exactly.
+if ! git -C "$CANDIDATE" diff --quiet HEAD -- opendbc_repo/opendbc/safety ':(exclude)opendbc_repo/opendbc/safety/tests'; then
+  bash "$ASSETS/automation/build_panda_firmware.sh" install "$CANDIDATE" "$(git -C "$CANDIDATE" rev-parse HEAD)"
+fi
 
 git -C "$CANDIDATE" diff --check
 "$PYTHON_BIN" "$ASSETS/automation/prepare_candidate.py" "$CANDIDATE" "$ASSETS"

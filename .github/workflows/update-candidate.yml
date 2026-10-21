@@ -29,7 +29,11 @@ jobs:
           fetch-depth: 0
 
       - name: Install test dependencies
-        run: python3 -m pip install --disable-pip-version-check numpy pycapnp raylib
+        # cffi, gcovr and cppcheck (comma's MISRA build, as opendbc pins it) run opendbc's panda safety
+        # obligations when a patch changes safety code
+        run: >-
+          python3 -m pip install --disable-pip-version-check numpy pycapnp raylib cffi gcovr
+          "cppcheck @ git+https://github.com/commaai/dependencies.git@release-cppcheck#subdirectory=cppcheck"
 
       - name: Fetch installable sunnypilot staging
         run: |
@@ -91,7 +95,9 @@ jobs:
         run: |
           git config user.name "robertdb3 update bot"
           git config user.email "robertdb3@users.noreply.github.com"
-          git diff --name-only -z | xargs -0 -r git add --
+          # -u, not a path list: the rebuilt panda firmware is tracked inside panda/board/obj, which
+          # upstream gitignores, and naming ignored paths makes git add exit 1 even as it stages them
+          git add -u
           git ls-files --others --exclude-standard -z | xargs -0 -r git add --
           upstream_sha=$(python3 -c 'import json; print(json.load(open("CUSTOM_FORK_MANIFEST.json"))["upstream"]["commit"])')
           stable_sha=$(git rev-parse --verify origin/custompilot-stable)

@@ -30,6 +30,15 @@ trap 'unlink "$link" 2>/dev/null || true' EXIT
 
 "$PYTHON_BIN" -m unittest discover -s "$ASSETS/tests" -p 'test_*.py' -v
 
+# Changed panda safety code carries opendbc's obligations (full suite, 100% line coverage, MISRA),
+# and has to ship as the panda firmware built from exactly that code.
+if ! git -C "$CANDIDATE" diff --quiet "$BASE" -- opendbc_repo/opendbc/safety; then
+  PYTHON_BIN="$PYTHON_BIN" bash "$ASSETS/automation/check_safety.sh" "$CANDIDATE"
+fi
+if ! git -C "$CANDIDATE" diff --quiet "$BASE" -- opendbc_repo/opendbc/safety ':(exclude)opendbc_repo/opendbc/safety/tests' panda; then
+  PYTHON_BIN="$PYTHON_BIN" bash "$ASSETS/automation/build_panda_firmware.sh" check "$CANDIDATE" "$BASE"
+fi
+
 python_files=()
 while IFS= read -r file; do
   python_files+=("$CANDIDATE/$file")

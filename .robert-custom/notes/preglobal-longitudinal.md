@@ -264,7 +264,7 @@ Against that: the work is *bounded and well-understood*. The global implementati
 template, the message surface is identical, and the failure modes are the ones opendbc's limits
 framework was built to constrain.
 
-No recommendation is recorded here on purpose.
+No recommendation is recorded here on purpose. (The decision, when it came, is §9.)
 
 ## 7. Prior art, and why it is still undone
 
@@ -307,6 +307,51 @@ maintenance-repo only and is not part of the installed tree.
 
 It prints measured ranges beside the global constants, the real brake-pressure→deceleration mapping,
 and a bus-2-versus-bus-0 consistency check. Those numbers turn §5 from a blank into a decision.
+
+## 9. Decision and implementation (2026-10-21): blended, not replaced
+
+The owner chose to build it, in a form that sidesteps §6's worst tradeoff. openpilot does not replace
+EyeSight; it **blends** with it. Each EyeSight message is rebuilt as it arrives, and openpilot may only
+add braking (`max(EyeSight, openpilot)`) or remove throttle (`min(EyeSight, openpilot)`). `Cruise_RPM`
+passes through. EyeSight's ACC, and its AEB, stay underneath as a floor. With cruise off, or openpilot
+disengaged, the car receives EyeSight's bytes exactly. Patch `0020`; runbook entry 18.
+
+**Measured before building (41 min of the 2026-10-18 drives, grade removed using `orientationNED`):**
+`Brake_Pressure` explains deceleration with r = 0.83 at a 0.25 s lag. Beyond coasting it is near linear,
+about −0.0055 m/s² per count (§5's −0.00519 fit agrees). `Cruise_Throttle` has r = 0.74 at 0.4 s and
+depends on speed; `Cruise_RPM` has r = 0.22. EyeSight's flags follow fixed rules: `Cruise_Brake_Active` and
+`ES_Status.Brake` equal `Brake_Pressure > 0` in every sample. Its brake lights lag its braking by about
+1.3 s, so braking that openpilot adds turns them on at ≥70 and off below 20. Checksums use byte 7, except
+`ES_Status`, which uses byte 4. All 64,856 logged camera messages decode and re-encode byte-exact.
+Scripts and data: branch `research/preglobal-long`.
+
+**Safety (`subaru_preglobal.h`, param bit 2).** `ES_Brake` and `ES_Status` are intercepted (`check_relay`),
+and the three camera messages are rx-checked at 20 Hz on bus 2. Each transmitted value must fall within
+EyeSight's last three requests (150 ms, covering the rebuild delay). There are two exceptions:
+`get_longitudinal_allowed()` lets braking rise to `SUBARU_PG_MAX_BRAKE` (600), and lets throttle fall to
+808. EyeSight braking beyond 600 passes through. Without the bit, nothing changes. Obligations met: the
+full suite (8,646 tests), 100% line coverage, and MISRA, each verified against a deliberately broken
+control. Twenty-one hand-made mutations of the new safety logic are all caught by the tests.
+
+**Firmware.** The shipped panda image is signed with the public debug key, and the car's bootstub
+accepts it. Rebuilding it from upstream's sources with upstream's pinned toolchain reproduces it byte for
+byte. `build_panda_firmware.sh` requires that reproduction before it builds ours, so our image differs
+from upstream's only by our source change.
+
+**Residual risks, stated plainly:**
+- If `card` dies while `pandad` lives, the relay keeps blocking the camera's `ES_Brake`, so the car stops
+  receiving EyeSight's braking messages until `pandad` stops heartbeating (about 5 s, then SILENT and the
+  relay opens). This is the same exposure the stock preglobal port already has for `ES_Distance` and
+  `ES_LKAS`, and that upstream global longitudinal has for `ES_Brake`.
+- Whether EyeSight cancels cruise when openpilot slows the car with no lead ahead is unmeasured. No
+  logged drive had cruise engaged below 11 mph without a lead.
+- How the ECUs react to commanded rather than observed values is unproven until the car drives it.
+
+**Why not the openpilot simulator:** it emulates a 2022 Civic on Honda CAN, so none of this code would
+run. The tests replay the car's own logs through the real `CarInterface` and the compiled safety code:
+toggle off is byte-identical to the previous code for 47,814 cycles, and pass-through is byte-exact for
+every camera message. Engaged, with openpilot's logged plan as the request, there are 0 rule violations
+and 0 panda rejections.
 
 ## Related
 

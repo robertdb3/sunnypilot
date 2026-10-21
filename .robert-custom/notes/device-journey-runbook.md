@@ -99,6 +99,9 @@ This distinction explains the cruise labels:
 That last rule is safety-critical. Feeding the general planner target to ICBM caused the stock set
 speed to climb toward its unset 90 mph ceiling.
 
+Since `0020` there is an opt-in alternative, blended longitudinal (entry 18). It is off by default, and
+everything in this section describes the car with it off.
+
 ### The installed branch is prebuilt and is not identical to the source clone
 
 The device shipped with `prebuilt` and without the normal build graph (`SConstruct` files were
@@ -693,6 +696,37 @@ this, but sometimes we startup faster". It now does the same for sound: wait up 
 nodes. Verified on the device: forcing the nodes back to `root:root 0600` reproduced PortAudio's 0 devices and
 default `-1`, and the new lines restored 32 devices and default 31 in 0.07 s. `0017`'s retry and `0018`'s
 diagnostics stay as a safety net.
+
+### 18. Blended longitudinal (`0020`), off by default
+
+**What it is:** with Developer → *sunnypilot Longitudinal Control (Alpha)* on, openpilot rebuilds
+EyeSight's three longitudinal messages (`ES_Brake` 0x160, `ES_Distance` 0x161, `ES_Status` 0x162) as each
+arrives, and may only add braking or remove throttle relative to EyeSight. EyeSight's ACC and AEB stay
+underneath as a floor; with cruise off, or openpilot not engaged, every message passes through byte for
+byte. Engagement still follows stock cruise (`pcmCruise`). Design and evidence:
+[`preglobal-longitudinal.md`](preglobal-longitudinal.md) §9.
+
+**It changes panda safety code, deliberately.** `subaru_preglobal.h` gains a long mode (safety param bit 2)
+that bounds every rebuilt message by EyeSight's last three requests, and openpilot's added braking by
+`SUBARU_PG_MAX_BRAKE` (600, about −3.3 m/s² beyond coasting). The pipeline rebuilds the panda firmware
+(`automation/build_panda_firmware.sh`), but only after reproducing upstream's shipped firmware byte for
+byte. The candidate must pass opendbc's full safety suite, 100% line coverage and MISRA
+(`automation/check_safety.sh`). With the toggle off, the safety mode and every CAN message are unchanged.
+The flashed firmware is still a different binary, because the new code is compiled in.
+
+**Turning it on:** ICBM is disabled, and sunnypilot deletes its `IntelligentCruiseButtonManagement`
+param, so re-enable ICBM if you turn blending off again. SCC-V/SCC-M and Speed Limit Assist start acting
+through the planner. They can only slow below the stock set speed, which stays the maximum. After a stop
+with no car ahead, resume with RES or the gas, as with stock EyeSight.
+
+**Not yet tested in the car:** how EyeSight and the brake and engine ECUs react to being overridden.
+First, in an empty lot at walking speed: whether EyeSight cancels cruise when openpilot slows the car
+with no lead (openpilot then disengages with an alert, and braking returns to EyeSight's). Then:
+ECU fault lights, brake-light behaviour, the standstill hold, and pulling away.
+
+**Rollback:** turn the toggle off (takes effect on the next drive). For a full rollback, including the
+panda firmware, switch the branch to `custompilot-stable`; pandad reflashes the firmware that ships with
+whatever build is installed.
 
 ## The reboot/recovery lesson
 

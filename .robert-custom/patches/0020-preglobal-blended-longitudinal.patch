@@ -1,0 +1,797 @@
+diff --git a/opendbc_repo/opendbc/car/subaru/carcontroller.py b/opendbc_repo/opendbc/car/subaru/carcontroller.py
+index 887fafe..8f384df 100644
+--- a/opendbc_repo/opendbc/car/subaru/carcontroller.py
++++ b/opendbc_repo/opendbc/car/subaru/carcontroller.py
+@@ -4,6 +4,7 @@ from opendbc.car import Bus, make_tester_present_msg
+ from opendbc.car.lateral import apply_driver_steer_torque_limits, common_fault_avoidance
+ from opendbc.car.interfaces import CarControllerBase
+ from opendbc.car.subaru import subarucan
++from opendbc.car.subaru.preglobal_long import PreglobalBlend
+ from opendbc.car.subaru.values import DBC, GLOBAL_ES_ADDR, CanBus, CarControllerParams, SubaruFlags
+ 
+ from opendbc.sunnypilot.car.subaru.icbm import IntelligentCruiseButtonManagementInterface
+@@ -25,6 +26,7 @@ class CarController(CarControllerBase, SnGCarController, IntelligentCruiseButton
+ 
+     self.cruise_button_prev = 0
+     self.main_cruise = PreglobalMainCruise()
++    self.preglobal_blend = PreglobalBlend()
+     self.steer_rate_counter = 0
+ 
+     self.p = CarControllerParams(CP)
+@@ -85,46 +87,24 @@ class CarController(CarControllerBase, SnGCarController, IntelligentCruiseButton
+       driver_main_pressed = CS.cruise_button == 1
+       self.main_cruise.update(self.frame, CS.out.cruiseState.available, driver_main_pressed)
+ 
+-      if self.frame % 5 == 0:
+-        mocked_main_press = False
+-        # 1 = main, 2 = set shallow, 3 = set deep, 4 = resume shallow, 5 = resume deep
+-        #
+-        # ES_Distance carries exactly one button, so everything that wants to press something
+-        # shares this slot. Priority, highest first: cancel, restoring main, ICBM set-speed
+-        # nudges, then relaying the driver's own press untouched.
+-        #
+-        # button_for() records the press as a side effect, so it is only called once the higher
+-        # priorities have declined — otherwise ICBM burns its press slot without sending anything.
+-        # disengage ACC when OP is disengaged
+-        # A physical main press takes priority. Its OFF transition also makes pcm_cancel_cmd
+-        # true, but treating that as our own cancellation would immediately restore main and
+-        # defeat the driver's lateral toggle.
+-        if driver_main_pressed:
+-          cruise_button = CS.cruise_button
+-        elif pcm_cancel_cmd:
+-          cruise_button = 1
+-          mocked_main_press = True
+-        # turn main on if off and past start-up state, unless the driver turned main off:
+-        # ACC main is the only MADS lateral toggle on this platform, so restoring it here
+-        # would blip lateral off and straight back on instead of latching it off
+-        elif self.main_cruise.should_restore(CS.out.cruiseState.available, CS.ready):
+-          cruise_button = 1
+-          mocked_main_press = True
+-        # match the stock ACC set speed to the speed limit by tapping SET / RES
+-        elif icbm_button := IntelligentCruiseButtonManagementInterface.button_for(self, CC_SP, CS, self.frame):
+-          cruise_button = icbm_button
+-        else:
+-          cruise_button = CS.cruise_button
+-
+-        # unstick previous mocked button press
+-        if mocked_main_press and cruise_button == 1 and self.cruise_button_prev == 1:
+-          cruise_button = 0
+-          mocked_main_press = False
+-        self.cruise_button_prev = cruise_button
+-
+-        if mocked_main_press:
+-          self.main_cruise.mocked_press(self.frame)
++      if self.CP.openpilotLongitudinalControl:
++        # Blended longitudinal: rebuild each EyeSight message as it arrives, so the car keeps seeing
++        # EyeSight's cadence and counters. openpilot may only add braking or remove throttle.
++        self.preglobal_blend.update(CC, CS.out.vEgo)
++
++        for es_brake_msg in CS.es_brake_msgs:
++          can_sends.append(subarucan.create_preglobal_es_brake(self.packer, self.preglobal_blend.es_brake(es_brake_msg)))
++
++        for es_distance_msg in CS.es_distance_msgs:
++          cruise_button = self.preglobal_cruise_button(CC_SP, CS, pcm_cancel_cmd, int(es_distance_msg["Cruise_Button"]))
++          can_sends.append(subarucan.create_preglobal_es_distance(self.packer, cruise_button,
++                                                                  self.preglobal_blend.es_distance(es_distance_msg)))
+ 
++        for es_status_msg in CS.es_status_msgs:
++          can_sends.append(subarucan.create_preglobal_es_status(self.packer, self.preglobal_blend.es_status(es_status_msg)))
++
++      elif self.frame % 5 == 0:
++        cruise_button = self.preglobal_cruise_button(CC_SP, CS, pcm_cancel_cmd, CS.cruise_button)
+         can_sends.append(subarucan.create_preglobal_es_distance(self.packer, cruise_button, CS.es_distance_msg))
+ 
+     else:
+@@ -178,3 +158,47 @@ class CarController(CarControllerBase, SnGCarController, IntelligentCruiseButton
+ 
+     self.frame += 1
+     return new_actuators, can_sends
++
++  def preglobal_cruise_button(self, CC_SP, CS, pcm_cancel_cmd, driver_button):
++    """The button for one ES_Distance. Called once per message sent, with the driver's own press."""
++    driver_main_pressed = driver_button == 1
++    mocked_main_press = False
++    # 1 = main, 2 = set shallow, 3 = set deep, 4 = resume shallow, 5 = resume deep
++    #
++    # ES_Distance carries exactly one button, so everything that wants to press something
++    # shares this slot. Priority, highest first: cancel, restoring main, ICBM set-speed
++    # nudges, then relaying the driver's own press untouched.
++    #
++    # button_for() records the press as a side effect, so it is only called once the higher
++    # priorities have declined — otherwise ICBM burns its press slot without sending anything.
++    # disengage ACC when OP is disengaged
++    # A physical main press takes priority. Its OFF transition also makes pcm_cancel_cmd
++    # true, but treating that as our own cancellation would immediately restore main and
++    # defeat the driver's lateral toggle.
++    if driver_main_pressed:
++      cruise_button = driver_button
++    elif pcm_cancel_cmd:
++      cruise_button = 1
++      mocked_main_press = True
++    # turn main on if off and past start-up state, unless the driver turned main off:
++    # ACC main is the only MADS lateral toggle on this platform, so restoring it here
++    # would blip lateral off and straight back on instead of latching it off
++    elif self.main_cruise.should_restore(CS.out.cruiseState.available, CS.ready):
++      cruise_button = 1
++      mocked_main_press = True
++    # match the stock ACC set speed to the speed limit by tapping SET / RES
++    elif icbm_button := IntelligentCruiseButtonManagementInterface.button_for(self, CC_SP, CS, self.frame):
++      cruise_button = icbm_button
++    else:
++      cruise_button = driver_button
++
++    # unstick previous mocked button press
++    if mocked_main_press and cruise_button == 1 and self.cruise_button_prev == 1:
++      cruise_button = 0
++      mocked_main_press = False
++    self.cruise_button_prev = cruise_button
++
++    if mocked_main_press:
++      self.main_cruise.mocked_press(self.frame)
++
++    return cruise_button
+diff --git a/opendbc_repo/opendbc/car/subaru/carstate.py b/opendbc_repo/opendbc/car/subaru/carstate.py
+index 78a614a..22df483 100644
+--- a/opendbc_repo/opendbc/car/subaru/carstate.py
++++ b/opendbc_repo/opendbc/car/subaru/carstate.py
+@@ -20,6 +20,10 @@ class CarState(CarStateBase, MadsCarState, SnGCarState):
+ 
+     self.angle_rate_calulator = CanSignalRateCalculator(50)
+ 
++    self.es_brake_msgs: list[dict[str, float]] = []
++    self.es_distance_msgs: list[dict[str, float]] = []
++    self.es_status_msgs: list[dict[str, float]] = []
++
+   def update(self, can_parsers) -> tuple[structs.CarState, structs.CarStateSP]:
+     cp = can_parsers[Bus.pt]
+     cp_cam = can_parsers[Bus.cam]
+@@ -39,8 +43,9 @@ class CarState(CarStateBase, MadsCarState, SnGCarState):
+     if not (self.CP.flags & SubaruFlags.HYBRID):
+       eyesight_fault = bool(cp_es_distance.vl["ES_Distance"]["Cruise_Fault"])
+ 
+-      # if openpilot is controlling long, an eyesight fault is a non-critical fault. otherwise it's an ACC fault
+-      if self.CP.openpilotLongitudinalControl:
++      # if openpilot is controlling long, an eyesight fault is a non-critical fault. otherwise it's an ACC fault.
++      # Preglobal blended longitudinal still drives through EyeSight's ACC, so there it stays an ACC fault
++      if self.CP.openpilotLongitudinalControl and not (self.CP.flags & SubaruFlags.PREGLOBAL):
+         ret.carFaultedNonCritical = eyesight_fault
+       else:
+         ret.accFaulted = eyesight_fault
+@@ -117,6 +122,13 @@ class CarState(CarStateBase, MadsCarState, SnGCarState):
+     if self.CP.flags & SubaruFlags.PREGLOBAL:
+       self.cruise_button = cp_cam.vl["ES_Distance"]["Cruise_Button"]
+       self.ready = not cp_cam.vl["ES_DashStatus"]["Not_Ready_Startup"]
++
++      if self.CP.openpilotLongitudinalControl:
++        # every EyeSight longitudinal message received this cycle, oldest first, so the controller can
++        # rebuild each one and the car keeps seeing EyeSight's own cadence and counters
++        self.es_brake_msgs = self.all_msgs(cp_cam, "ES_Brake")
++        self.es_distance_msgs = self.all_msgs(cp_cam, "ES_Distance")
++        self.es_status_msgs = self.all_msgs(cp_cam, "ES_Status")
+     else:
+       ret.steerFaultTemporary = cp.vl["Steering_Torque"]["Steer_Warning"] == 1
+       ret.cruiseState.nonAdaptive = cp_cam.vl["ES_DashStatus"]["Conventional_Cruise"] == 1
+@@ -148,6 +160,13 @@ class CarState(CarStateBase, MadsCarState, SnGCarState):
+ 
+     return ret, ret_sp
+ 
++  @staticmethod
++  def all_msgs(cp: CANParser, name: str) -> list[dict[str, float]]:
++    cp.vl[name]  # registers the message with the parser on first use
++    signals = cp.vl_all[name]
++    count = len(signals["COUNTER"]) if "COUNTER" in signals else 0
++    return [{sig: vals[i] for sig, vals in signals.items()} for i in range(count)]
++
+   @staticmethod
+   def get_can_parsers(CP, CP_SP):
+     return {
+diff --git a/opendbc_repo/opendbc/car/subaru/interface.py b/opendbc_repo/opendbc/car/subaru/interface.py
+index df69299..bf97860 100644
+--- a/opendbc_repo/opendbc/car/subaru/interface.py
++++ b/opendbc_repo/opendbc/car/subaru/interface.py
+@@ -92,8 +92,17 @@ class CarInterface(CarInterfaceBase):
+     # TODO: the longitudinal limits need to be speed-dependent, so alpha long is disabled for now
+     # revert this in the PR that re-enables Subaru longitudinal: https://github.com/commaai/opendbc/pull/3689
+     ret.alphaLongitudinalAvailable = False
++
++    # Blended longitudinal (custompilot): EyeSight keeps driving, and openpilot may only add braking or
++    # remove throttle relative to it (see preglobal_long.py). Measured on, and limited to, this car.
++    if candidate == CAR.SUBARU_OUTBACK_PREGLOBAL_2018:
++      ret.alphaLongitudinalAvailable = True
++
+     ret.openpilotLongitudinalControl = alpha_long and ret.alphaLongitudinalAvailable
+ 
++    if ret.openpilotLongitudinalControl and ret.flags & SubaruFlags.PREGLOBAL:
++      ret.longitudinalActuatorDelay = 0.3  # measured: ~0.25 s for EyeSight's brake requests, ~0.4 s for throttle
++
+     if ret.flags & SubaruFlags.GLOBAL_GEN2 and ret.openpilotLongitudinalControl:
+       ret.flags |= SubaruFlags.DISABLE_EYESIGHT.value
+ 
+diff --git a/opendbc_repo/opendbc/car/subaru/preglobal_long.py b/opendbc_repo/opendbc/car/subaru/preglobal_long.py
+new file mode 100644
+index 0000000..a8e476e
+--- /dev/null
++++ b/opendbc_repo/opendbc/car/subaru/preglobal_long.py
+@@ -0,0 +1,112 @@
++"""Blended longitudinal for the preglobal Outback.
++
++EyeSight keeps driving. openpilot rebuilds each of EyeSight's longitudinal messages as it arrives and
++may only add braking or remove throttle, never the reverse. The panda enforces the same bounds
++(opendbc/safety/modes/subaru_preglobal.h), so EyeSight's ACC and AEB stay underneath as a floor.
++
++The tables are fit to 41 minutes of EyeSight cruise on this car (the 2026-10-18 drives): the
++acceleration that EyeSight's own requests produced, with road grade removed.
++"""
++import math
++
++import numpy as np
++
++from opendbc.car import ACCELERATION_DUE_TO_GRAVITY, DT_CTRL, structs
++from opendbc.car.common.filter_simple import FirstOrderFilter
++
++BRAKE_MAX = 600              # most braking openpilot may request; SUBARU_PG_MAX_BRAKE in panda safety
++THROTTLE_ENGINE_BRAKE = 808  # EyeSight's own throttle while it brakes; SUBARU_PG_THROTTLE_ENGINE_BRAKE
++THROTTLE_NO_LIMIT = 4095     # Cruise_Throttle is 12 bits, so this never lowers EyeSight's request
++
++# brake lights for braking openpilot adds: EyeSight's own lights lag its braking by about a second,
++# so turn them on promptly above this pressure (global Subaru's rule), and off once braking has faded
++BRAKE_LIGHTS_ON = 70
++BRAKE_LIGHTS_OFF = 20
++
++# acceleration (m/s^2, grade removed) from a steady Cruise_Throttle with no braking, by speed (m/s).
++# The first column, EyeSight's engine-braking throttle, is coasting.
++SPEED_BP = [5., 15., 25., 35.]
++THROTTLE_BP = [808, 1750, 2250, 2750, 3250, 3750]
++THROTTLE_ACCEL = [
++  [-0.26, -0.12, 0.29, 0.74, 1.06, 1.35],
++  [-0.34, -0.20, 0.03, 0.27, 0.59, 0.90],
++  [-0.48, -0.33, -0.16, 0.04, 0.26, 0.60],
++  [-0.58, -0.42, -0.25, -0.08, 0.10, 0.33],
++]
++
++# deceleration beyond coasting (m/s^2) from Brake_Pressure. Pressures under ~25 do almost nothing.
++BRAKE_DECEL_BP = [-3.51, -2.79, -2.48, -1.83, -1.34, -0.95, -0.65, -0.34, -0.13, -0.05]
++BRAKE_PRESSURE = [761, 575, 449, 335, 246, 176, 126, 71, 36, 0]
++
++
++def accel_to_commands(accel: float, v_ego: float) -> tuple[int, int]:
++  """Brake_Pressure, and the Cruise_Throttle ceiling, for a grade-corrected acceleration request."""
++  throttle_accel = [float(np.interp(v_ego, SPEED_BP, column)) for column in zip(*THROTTLE_ACCEL, strict=True)]
++  coast = throttle_accel[0]
++
++  if accel >= coast:
++    if accel >= throttle_accel[-1]:
++      return 0, THROTTLE_NO_LIMIT
++    return 0, int(round(np.interp(accel, throttle_accel, THROTTLE_BP)))
++
++  brake = int(round(np.interp(accel - coast, BRAKE_DECEL_BP, BRAKE_PRESSURE)))
++  return min(brake, BRAKE_MAX), THROTTLE_ENGINE_BRAKE
++
++
++class PreglobalBlend:
++  def __init__(self):
++    self.pitch = FirstOrderFilter(0., 0.5, DT_CTRL)
++    self.active = False
++    self.brake = 0
++    self.throttle = THROTTLE_NO_LIMIT
++    self.brake_lights = False
++
++  def update(self, CC: structs.CarControl, v_ego: float) -> None:
++    """openpilot's request for this frame. Call once per control frame, before rebuilding messages."""
++    if len(CC.orientationNED) == 3:
++      self.pitch.update(CC.orientationNED[1])
++
++    self.active = CC.longActive
++    if self.active:
++      # the tables have grade removed, so add back what the slope will do to the car
++      accel = CC.actuators.accel + ACCELERATION_DUE_TO_GRAVITY * math.sin(self.pitch.x)
++      self.brake, self.throttle = accel_to_commands(accel, v_ego)
++    else:
++      self.brake, self.throttle = 0, THROTTLE_NO_LIMIT
++      self.brake_lights = False
++
++  def es_brake(self, msg: dict[str, float]) -> dict[str, float]:
++    values = dict(msg)
++    if not self.active:
++      return values
++
++    eyesight_brake = int(msg["Brake_Pressure"])
++    brake = max(eyesight_brake, self.brake)
++    if self.brake > eyesight_brake and brake >= BRAKE_LIGHTS_ON:
++      self.brake_lights = True
++    elif brake < BRAKE_LIGHTS_OFF:
++      self.brake_lights = False
++
++    values["Brake_Pressure"] = brake
++    # EyeSight sets this exactly when Brake_Pressure is non-zero
++    values["Cruise_Brake_Active"] = int(brake > 0)
++    values["Cruise_Brake_Lights"] = int(bool(msg["Cruise_Brake_Lights"]) or self.brake_lights)
++    return values
++
++  def es_distance(self, msg: dict[str, float]) -> dict[str, float]:
++    values = dict(msg)
++    if not self.active:
++      return values
++
++    values["Cruise_Throttle"] = min(int(msg["Cruise_Throttle"]), self.throttle)
++    values["Cruise_Brake_Active"] = int(bool(msg["Cruise_Brake_Active"]) or self.brake > 0)
++    return values
++
++  def es_status(self, msg: dict[str, float]) -> dict[str, float]:
++    values = dict(msg)
++    if not self.active:
++      return values
++
++    # EyeSight sets this exactly when ES_Brake's Brake_Pressure is non-zero. Cruise_RPM passes through.
++    values["Brake"] = int(bool(msg["Brake"]) or self.brake > 0)
++    return values
+diff --git a/opendbc_repo/opendbc/car/subaru/subarucan.py b/opendbc_repo/opendbc/car/subaru/subarucan.py
+index 8f824a5..29fb45a 100644
+--- a/opendbc_repo/opendbc/car/subaru/subarucan.py
++++ b/opendbc_repo/opendbc/car/subaru/subarucan.py
+@@ -326,6 +326,35 @@ def create_preglobal_es_distance(packer, cruise_button, es_distance_msg):
+   return packer.make_can_msg("ES_Distance", CanBus.main, values)
+ 
+ 
++def create_preglobal_es_brake(packer, es_brake_msg):
++  values = {s: es_brake_msg[s] for s in [
++    "Brake_Pressure",
++    "Cruise_Brake_Lights",
++    "Cruise_Fault",
++    "Cruise_Brake_Active",
++    "Cruise_Activated",
++    "SET_1",
++    "COUNTER",
++  ]}
++
++  values["Checksum"] = subaru_preglobal_checksum(packer, values, "ES_Brake")
++
++  return packer.make_can_msg("ES_Brake", CanBus.main, values)
++
++
++def create_preglobal_es_status(packer, es_status_msg):
++  values = {s: es_status_msg[s] for s in [
++    "Brake",
++    "Cruise_Activated",
++    "Cruise_RPM",
++    "COUNTER",
++  ]}
++
++  values["Checksum"] = subaru_preglobal_checksum(packer, values, "ES_Status", checksum_byte=4)
++
++  return packer.make_can_msg("ES_Status", CanBus.main, values)
++
++
+ def subaru_checksum(address: int, sig, d: bytearray) -> int:
+   s = 0
+   addr = address
+diff --git a/opendbc_repo/opendbc/safety/modes/subaru_preglobal.h b/opendbc_repo/opendbc/safety/modes/subaru_preglobal.h
+index 28d945b..212c5bc 100644
+--- a/opendbc_repo/opendbc/safety/modes/subaru_preglobal.h
++++ b/opendbc_repo/opendbc/safety/modes/subaru_preglobal.h
+@@ -4,7 +4,9 @@
+ #include "opendbc/safety/modes/subaru_common.h"
+ 
+ // Preglobal platform
++// 0x160 is ES_Brake
+ // 0x161 is ES_CruiseThrottle
++// 0x162 is ES_Status
+ // 0x164 is ES_LKAS
+ 
+ #define MSG_SUBARU_PG_CruiseControl         0x144U
+@@ -12,7 +14,9 @@
+ #define MSG_SUBARU_PG_Wheel_Speeds          0xD4U
+ #define MSG_SUBARU_PG_Brake_Pedal           0xD1U
+ #define MSG_SUBARU_PG_ES_LKAS               0x164U
++#define MSG_SUBARU_PG_ES_Brake              0x160U
+ #define MSG_SUBARU_PG_ES_Distance           0x161U
++#define MSG_SUBARU_PG_ES_Status             0x162U
+ #define MSG_SUBARU_PG_Steering_Torque       0x371U
+ 
+ #define SUBARU_PG_MAIN_BUS 0U
+@@ -26,7 +30,65 @@
+   {MSG_SUBARU_PG_Throttle,    SUBARU_PG_CAM_BUS,  8, .check_relay = false}, \
+   {MSG_SUBARU_PG_Brake_Pedal, SUBARU_PG_CAM_BUS,  4, .check_relay = false}, \
+ 
++// Blended longitudinal: openpilot rebuilds EyeSight's brake and RPM messages, as it already does
++// ES_Distance, which carries the throttle. It may only add braking or remove throttle relative to
++// what EyeSight itself requested, so EyeSight's ACC and AEB stay underneath as a floor.
++#define SUBARU_PG_LONG_TX_MSGS \
++  {MSG_SUBARU_PG_ES_Brake,    SUBARU_PG_MAIN_BUS, 8, .check_relay = true}, \
++  {MSG_SUBARU_PG_ES_Status,   SUBARU_PG_MAIN_BUS, 8, .check_relay = true}, \
++
++// TODO: do checksum and counter checks after adding the signals to the outback dbc file
++#define SUBARU_PG_RX_CHECKS \
++  {.msg = {{MSG_SUBARU_PG_Throttle,       SUBARU_PG_MAIN_BUS, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}}, \
++  {.msg = {{MSG_SUBARU_PG_Steering_Torque, SUBARU_PG_MAIN_BUS, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}}, \
++  {.msg = {{MSG_SUBARU_PG_CruiseControl,   SUBARU_PG_MAIN_BUS, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}}, \
++  {.msg = {{MSG_SUBARU_PG_Wheel_Speeds,    SUBARU_PG_MAIN_BUS, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}}, \
++  {.msg = {{MSG_SUBARU_PG_Brake_Pedal,     SUBARU_PG_MAIN_BUS, 4, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}}, \
++
++// EyeSight's own requests, as the camera sends them
++#define SUBARU_PG_LONG_RX_CHECKS \
++  {.msg = {{MSG_SUBARU_PG_ES_Brake,       SUBARU_PG_CAM_BUS,  8, 20U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}}, \
++  {.msg = {{MSG_SUBARU_PG_ES_Distance,    SUBARU_PG_CAM_BUS,  8, 20U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}}, \
++  {.msg = {{MSG_SUBARU_PG_ES_Status,      SUBARU_PG_CAM_BUS,  8, 20U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}}, \
++
++#define SUBARU_PG_MAX_BRAKE              600U  // the most braking openpilot may request, about -3.3 m/s^2 beyond coasting
++#define SUBARU_PG_THROTTLE_ENGINE_BRAKE  808U  // EyeSight's own throttle value while it brakes
++// openpilot rebuilds each camera message as it arrives (20 Hz). Accept any value from the last few
++// camera messages, to cover the time between the panda receiving one and openpilot sending its rebuild.
++#define SUBARU_PG_CAM_HISTORY            3U
++
+ static bool subaru_pg_reversed_driver_torque = false;
++static bool subaru_pg_longitudinal = false;
++static uint32_t subaru_pg_cam_brake[SUBARU_PG_CAM_HISTORY];
++static uint32_t subaru_pg_cam_throttle[SUBARU_PG_CAM_HISTORY];
++static uint32_t subaru_pg_cam_rpm[SUBARU_PG_CAM_HISTORY];
++
++static void subaru_pg_cam_record(uint32_t history[], uint32_t value) {
++  for (uint32_t i = SUBARU_PG_CAM_HISTORY - 1U; i > 0U; i--) {
++    history[i] = history[i - 1U];
++  }
++  history[0] = value;
++}
++
++static uint32_t subaru_pg_cam_min(const uint32_t history[]) {
++  uint32_t ret = history[0];
++  for (uint32_t i = 1U; i < SUBARU_PG_CAM_HISTORY; i++) {
++    if (history[i] < ret) {
++      ret = history[i];
++    }
++  }
++  return ret;
++}
++
++static uint32_t subaru_pg_cam_max(const uint32_t history[]) {
++  uint32_t ret = history[0];
++  for (uint32_t i = 1U; i < SUBARU_PG_CAM_HISTORY; i++) {
++    if (history[i] > ret) {
++      ret = history[i];
++    }
++  }
++  return ret;
++}
+ 
+ static void subaru_preglobal_rx_hook(const CANPacket_t *msg) {
+   if (msg_matches(msg, MSG_SUBARU_PG_Steering_Torque, SUBARU_PG_MAIN_BUS)) {
+@@ -56,6 +118,20 @@ static void subaru_preglobal_rx_hook(const CANPacket_t *msg) {
+   if (msg_matches(msg, MSG_SUBARU_PG_Throttle, SUBARU_PG_MAIN_BUS)) {
+     gas_pressed = msg->data[0] != 0U;
+   }
++
++  // EyeSight's requests bound what openpilot may send in their place. These are only rx checked,
++  // and so only reach this hook, with blended longitudinal enabled.
++  if (msg_matches(msg, MSG_SUBARU_PG_ES_Brake, SUBARU_PG_CAM_BUS)) {
++    subaru_pg_cam_record(subaru_pg_cam_brake, GET_BYTES_LE(msg, 0, 2));  // Brake_Pressure
++  }
++
++  if (msg_matches(msg, MSG_SUBARU_PG_ES_Distance, SUBARU_PG_CAM_BUS)) {
++    subaru_pg_cam_record(subaru_pg_cam_throttle, GET_BYTES_LE(msg, 0, 2) & 0xFFFU);  // Cruise_Throttle
++  }
++
++  if (msg_matches(msg, MSG_SUBARU_PG_ES_Status, SUBARU_PG_CAM_BUS)) {
++    subaru_pg_cam_record(subaru_pg_cam_rpm, GET_BYTES_LE(msg, 2, 2));  // Cruise_RPM
++  }
+ }
+ 
+ static bool subaru_preglobal_tx_hook(const CANPacket_t *msg) {
+@@ -83,6 +159,43 @@ static bool subaru_preglobal_tx_hook(const CANPacket_t *msg) {
+     }
+   }
+ 
++  if (subaru_pg_longitudinal) {
++    const bool long_allowed = get_longitudinal_allowed();
++
++    // brake: at least what EyeSight requests. openpilot may add braking up to SUBARU_PG_MAX_BRAKE,
++    // and anything EyeSight requests beyond that (AEB) passes through
++    if (msg->addr == MSG_SUBARU_PG_ES_Brake) {
++      uint32_t brake = GET_BYTES_LE(msg, 0, 2);
++      uint32_t max_brake = subaru_pg_cam_max(subaru_pg_cam_brake);
++      if (long_allowed && (max_brake < SUBARU_PG_MAX_BRAKE)) {
++        max_brake = SUBARU_PG_MAX_BRAKE;
++      }
++      if ((brake < subaru_pg_cam_min(subaru_pg_cam_brake)) || (brake > max_brake)) {
++        tx = false;
++      }
++    }
++
++    // throttle: never more than EyeSight requests. openpilot may reduce it as far as engine braking
++    if (msg->addr == MSG_SUBARU_PG_ES_Distance) {
++      uint32_t throttle = GET_BYTES_LE(msg, 0, 2) & 0xFFFU;
++      uint32_t min_throttle = subaru_pg_cam_min(subaru_pg_cam_throttle);
++      if (long_allowed && (min_throttle > SUBARU_PG_THROTTLE_ENGINE_BRAKE)) {
++        min_throttle = SUBARU_PG_THROTTLE_ENGINE_BRAKE;
++      }
++      if ((throttle < min_throttle) || (throttle > subaru_pg_cam_max(subaru_pg_cam_throttle))) {
++        tx = false;
++      }
++    }
++
++    // RPM: EyeSight's request, passed through
++    if (msg->addr == MSG_SUBARU_PG_ES_Status) {
++      uint32_t rpm = GET_BYTES_LE(msg, 2, 2);
++      if ((rpm < subaru_pg_cam_min(subaru_pg_cam_rpm)) || (rpm > subaru_pg_cam_max(subaru_pg_cam_rpm))) {
++        tx = false;
++      }
++    }
++  }
++
+   return tx;
+ }
+ 
+@@ -96,23 +209,46 @@ static safety_config subaru_preglobal_init(uint16_t param) {
+     SUBARU_PG_STOP_AND_GO_TX_MSGS
+   };
+ 
+-  // TODO: do checksum and counter checks after adding the signals to the outback dbc file
+-  static RxCheck subaru_preglobal_rx_checks[] = {
+-    {.msg = {{MSG_SUBARU_PG_Throttle,       SUBARU_PG_MAIN_BUS, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+-    {.msg = {{MSG_SUBARU_PG_Steering_Torque, SUBARU_PG_MAIN_BUS, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+-    {.msg = {{MSG_SUBARU_PG_CruiseControl,   SUBARU_PG_MAIN_BUS, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+-    {.msg = {{MSG_SUBARU_PG_Wheel_Speeds,    SUBARU_PG_MAIN_BUS, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+-    {.msg = {{MSG_SUBARU_PG_Brake_Pedal,     SUBARU_PG_MAIN_BUS, 4, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
++  static const CanMsg subaru_pg_long_tx_msgs[] = {
++    SUBARU_PG_COMMON_TX_MSGS
++    SUBARU_PG_LONG_TX_MSGS
++  };
++
++  static const CanMsg subaru_pg_long_stop_and_go_tx_msgs[] = {
++    SUBARU_PG_COMMON_TX_MSGS
++    SUBARU_PG_STOP_AND_GO_TX_MSGS
++    SUBARU_PG_LONG_TX_MSGS
+   };
+ 
+   subaru_common_init();
+ 
++  const uint16_t SUBARU_PG_PARAM_LONGITUDINAL = 2;
+   const uint16_t SUBARU_PG_PARAM_REVERSED_DRIVER_TORQUE = 4;
+ 
+   subaru_pg_reversed_driver_torque = GET_FLAG(param, SUBARU_PG_PARAM_REVERSED_DRIVER_TORQUE);
++  subaru_pg_longitudinal = GET_FLAG(param, SUBARU_PG_PARAM_LONGITUDINAL);
++
++  for (uint32_t i = 0U; i < SUBARU_PG_CAM_HISTORY; i++) {
++    subaru_pg_cam_brake[i] = 0U;
++    subaru_pg_cam_throttle[i] = 0U;
++    subaru_pg_cam_rpm[i] = 0U;
++  }
+ 
+-  safety_config ret = subaru_stop_and_go ? BUILD_SAFETY_CFG(subaru_preglobal_rx_checks, subaru_pg_stop_and_go_tx_msgs) : \
+-                                           BUILD_SAFETY_CFG(subaru_preglobal_rx_checks, SUBARU_PG_TX_MSGS);
++  safety_config ret;
++  if (subaru_pg_longitudinal) {
++    static RxCheck subaru_preglobal_long_rx_checks[] = {
++      SUBARU_PG_RX_CHECKS
++      SUBARU_PG_LONG_RX_CHECKS
++    };
++    ret = subaru_stop_and_go ? BUILD_SAFETY_CFG(subaru_preglobal_long_rx_checks, subaru_pg_long_stop_and_go_tx_msgs) : \
++                               BUILD_SAFETY_CFG(subaru_preglobal_long_rx_checks, subaru_pg_long_tx_msgs);
++  } else {
++    static RxCheck subaru_preglobal_rx_checks[] = {
++      SUBARU_PG_RX_CHECKS
++    };
++    ret = subaru_stop_and_go ? BUILD_SAFETY_CFG(subaru_preglobal_rx_checks, subaru_pg_stop_and_go_tx_msgs) : \
++                               BUILD_SAFETY_CFG(subaru_preglobal_rx_checks, SUBARU_PG_TX_MSGS);
++  }
+   return ret;
+ }
+ 
+diff --git a/opendbc_repo/opendbc/safety/tests/common.py b/opendbc_repo/opendbc/safety/tests/common.py
+index d94bdf2..dc09983 100644
+--- a/opendbc_repo/opendbc/safety/tests/common.py
++++ b/opendbc_repo/opendbc/safety/tests/common.py
+@@ -1008,6 +1008,11 @@ class SafetyTest(SafetyTestBase):
+             if attr == 'TestVolkswagenMqbLongSafety' and current_test.startswith('TestSubaru'):
+               tx = list(filter(lambda m: m[0] not in [0x122, ], tx))
+ 
++            # Rivian longitudinal and Subaru preglobal blended longitudinal (ES_Brake) actuating messages overlap.
++            # An all-zero ES_Brake matches EyeSight requesting no braking, which preglobal passes through
++            if attr == 'TestRivianLongitudinalSafety' and current_test.startswith('TestSubaruPreglobalLongitudinal'):
++              tx = list(filter(lambda m: m[0] not in [0x160, ], tx))
++
+             # Volkswagen MQB and Honda Nidec ACC HUD messages overlap
+             if attr == 'TestVolkswagenMqbLongSafety' and current_test.startswith('TestHondaNidec'):
+               tx = list(filter(lambda m: m[0] not in [0x30c, ], tx))
+diff --git a/opendbc_repo/opendbc/safety/tests/test_subaru_preglobal.py b/opendbc_repo/opendbc/safety/tests/test_subaru_preglobal.py
+index 5585437..163ade9 100755
+--- a/opendbc_repo/opendbc/safety/tests/test_subaru_preglobal.py
++++ b/opendbc_repo/opendbc/safety/tests/test_subaru_preglobal.py
+@@ -49,9 +49,198 @@ class TestSubaruPreglobalSafety(common.CarSafetyTest, common.DriverTorqueSteerin
+   def _pcm_status_msg(self, enable):
+     values = {"Cruise_Activated": enable}
+     return self.packer.make_can_msg_safety("CruiseControl", 0, values)
++
++  def test_stock_longitudinal_unchanged(self):
++    # without the longitudinal flag, EyeSight's brake and RPM messages stay untouched,
++    # and ES_Distance is not bounded by EyeSight's request
++    if self.SAFETY_PARAM & SubaruSafetyFlags.LONG:
++      raise unittest.SkipTest("longitudinal")
++    for controls_allowed in (False, True):
++      self.safety.set_controls_allowed(controls_allowed)
++      self.assertFalse(self._tx(self.packer.make_can_msg_safety("ES_Brake", 0, {"Brake_Pressure": 0})))
++      self.assertFalse(self._tx(self.packer.make_can_msg_safety("ES_Status", 0, {"Cruise_RPM": 0})))
++      self.assertTrue(self._rx(self.packer.make_can_msg_safety("ES_Distance", 2, {"Cruise_Throttle": 1000})))
++      for throttle in (0, 1000, 4095):
++        self.assertTrue(self._tx(self.packer.make_can_msg_safety("ES_Distance", 0, {"Cruise_Throttle": throttle})))
++
++
+ class TestSubaruPreglobalReversedDriverTorqueSafety(TestSubaruPreglobalSafety):
+   SAFETY_PARAM = SubaruSafetyFlags.PREGLOBAL_REVERSED_DRIVER_TORQUE
+ 
+   DBC = "subaru_outback_2019_generated"
++
++
++class TestSubaruPreglobalLongitudinalSafety(TestSubaruPreglobalReversedDriverTorqueSafety):
++  """Blended longitudinal: openpilot may only add braking or remove throttle relative to EyeSight."""
++  SAFETY_PARAM = SubaruSafetyFlags.PREGLOBAL_REVERSED_DRIVER_TORQUE | SubaruSafetyFlags.LONG
++
++  TX_MSGS = [[0x160, 0], [0x161, 0], [0x162, 0], [0x164, 0]]
++  RELAY_MALFUNCTION_ADDRS = {0: (0x160, 0x161, 0x162, 0x164)}
++  FWD_BLACKLISTED_ADDRS = {2: [0x160, 0x161, 0x162, 0x164]}
++
++  MAX_BRAKE = 600
++  THROTTLE_ENGINE_BRAKE = 808
++
++  def _cam(self, brake=None, throttle=None, rpm=None):
++    if brake is not None:
++      self.assertTrue(self._rx(self.packer.make_can_msg_safety("ES_Brake", 2, {"Brake_Pressure": brake})))
++    if throttle is not None:
++      self.assertTrue(self._rx(self.packer.make_can_msg_safety("ES_Distance", 2, {"Cruise_Throttle": throttle})))
++    if rpm is not None:
++      self.assertTrue(self._rx(self.packer.make_can_msg_safety("ES_Status", 2, {"Cruise_RPM": rpm})))
++
++  def _brake_cmd(self, brake):
++    return self._tx(self.packer.make_can_msg_safety("ES_Brake", 0, {"Brake_Pressure": brake}))
++
++  def _throttle_cmd(self, throttle):
++    return self._tx(self.packer.make_can_msg_safety("ES_Distance", 0, {"Cruise_Throttle": throttle}))
++
++  def _rpm_cmd(self, rpm):
++    return self._tx(self.packer.make_can_msg_safety("ES_Status", 0, {"Cruise_RPM": rpm}))
++
++  def test_passthrough_when_not_allowed(self):
++    self.safety.set_controls_allowed(False)
++    for _ in range(3):
++      self._cam(brake=150, throttle=2500, rpm=1200)
++    self.assertTrue(self._brake_cmd(150))
++    self.assertFalse(self._brake_cmd(149))
++    self.assertFalse(self._brake_cmd(151))
++    self.assertTrue(self._throttle_cmd(2500))
++    self.assertFalse(self._throttle_cmd(2499))
++    self.assertFalse(self._throttle_cmd(2501))
++    self.assertTrue(self._rpm_cmd(1200))
++    self.assertFalse(self._rpm_cmd(1199))
++    self.assertFalse(self._rpm_cmd(1201))
++
++  def test_camera_history_window(self):
++    # openpilot rebuilds a camera message after the panda has seen it, so any of the last three are
++    # accepted, and nothing older
++    self.safety.set_controls_allowed(False)
++    for brake, throttle, rpm in ((50, 1000, 900), (100, 2000, 1000), (150, 3000, 1100), (200, 2500, 1050)):
++      self._cam(brake=brake, throttle=throttle, rpm=rpm)
++    for brake in (100, 150, 200):
++      self.assertTrue(self._brake_cmd(brake))
++    self.assertFalse(self._brake_cmd(50))
++    self.assertFalse(self._brake_cmd(99))
++    self.assertFalse(self._brake_cmd(201))
++    for throttle in (2000, 2500, 3000):
++      self.assertTrue(self._throttle_cmd(throttle))
++    self.assertFalse(self._throttle_cmd(1000))
++    self.assertFalse(self._throttle_cmd(3001))
++    for rpm in (1000, 1050, 1100):
++      self.assertTrue(self._rpm_cmd(rpm))
++    self.assertFalse(self._rpm_cmd(900))
++    self.assertFalse(self._rpm_cmd(1101))
++
++  def test_added_braking(self):
++    for _ in range(3):
++      self._cam(brake=0, throttle=2500, rpm=1200)
++    for controls_allowed in (False, True):
++      self.safety.set_controls_allowed(controls_allowed)
++      self.assertTrue(self._brake_cmd(0))
++      for brake in (1, 300, self.MAX_BRAKE):
++        self.assertEqual(controls_allowed, self._brake_cmd(brake))
++      self.assertFalse(self._brake_cmd(self.MAX_BRAKE + 1))
++
++  def test_eyesight_braking_is_a_floor(self):
++    # openpilot can never brake less than EyeSight, and EyeSight braking beyond the openpilot
++    # limit (AEB) passes through
++    for controls_allowed in (False, True):
++      self.safety.set_controls_allowed(controls_allowed)
++      for _ in range(3):
++        self._cam(brake=900)
++      self.assertTrue(self._brake_cmd(900))
++      self.assertFalse(self._brake_cmd(899))
++      self.assertFalse(self._brake_cmd(self.MAX_BRAKE))
++      self.assertFalse(self._brake_cmd(901))
++
++  def test_no_added_braking_on_gas_press(self):
++    self.safety.set_controls_allowed(True)
++    for _ in range(3):
++      self._cam(brake=0)
++    self.assertTrue(self._brake_cmd(300))
++    self._rx(self._user_gas_msg(1))
++    self.assertFalse(self._brake_cmd(300))
++    self.assertTrue(self._brake_cmd(0))
++    self._rx(self._user_gas_msg(0))
++    self._rx(self._user_gas_msg(0))
++    self.assertTrue(self._brake_cmd(300))
++
++  def test_no_added_braking_on_brake_press(self):
++    self.safety.set_controls_allowed(True)
++    for _ in range(3):
++      self._cam(brake=0)
++    self.assertTrue(self._brake_cmd(300))
++    self._rx(self._user_brake_msg(1))
++    self.assertFalse(self._brake_cmd(300))
++    self.assertTrue(self._brake_cmd(0))
++
++  def test_throttle_reduction(self):
++    for _ in range(3):
++      self._cam(throttle=2500)
++    for controls_allowed in (False, True):
++      self.safety.set_controls_allowed(controls_allowed)
++      self.assertTrue(self._throttle_cmd(2500))
++      self.assertFalse(self._throttle_cmd(2501))
++      self.assertFalse(self._throttle_cmd(4095))
++      for throttle in (self.THROTTLE_ENGINE_BRAKE, 1500, 2499):
++        self.assertEqual(controls_allowed, self._throttle_cmd(throttle))
++      self.assertFalse(self._throttle_cmd(self.THROTTLE_ENGINE_BRAKE - 1))
++      self.assertFalse(self._throttle_cmd(0))
++
++  def test_throttle_ignores_neighbouring_signals(self):
++    # Cruise_Throttle shares its bytes with Signal1, which EyeSight sets while driving
++    self.safety.set_controls_allowed(False)
++    for _ in range(3):
++      self.assertTrue(self._rx(self.packer.make_can_msg_safety("ES_Distance", 2, {"Cruise_Throttle": 2500, "Signal1": 2})))
++    self.assertTrue(self._tx(self.packer.make_can_msg_safety("ES_Distance", 0, {"Cruise_Throttle": 2500, "Signal1": 2})))
++    self.assertTrue(self._tx(self.packer.make_can_msg_safety("ES_Distance", 0, {"Cruise_Throttle": 2500, "Signal1": 15})))
++    self.assertFalse(self._tx(self.packer.make_can_msg_safety("ES_Distance", 0, {"Cruise_Throttle": 2501, "Signal1": 2})))
++
++  def test_throttle_below_engine_brake_passes_through(self):
++    # EyeSight occasionally requests less than its engine braking value; that stays allowed
++    self.safety.set_controls_allowed(True)
++    for _ in range(3):
++      self._cam(throttle=500)
++    self.assertTrue(self._throttle_cmd(500))
++    self.assertFalse(self._throttle_cmd(499))
++    self.assertFalse(self._throttle_cmd(501))
++
++  def test_no_eyesight_request_seen(self):
++    # before the camera has sent anything, openpilot may only send zeros, plus added braking when engaged
++    self.safety.set_controls_allowed(False)
++    self.assertTrue(self._brake_cmd(0))
++    self.assertFalse(self._brake_cmd(1))
++    self.assertTrue(self._throttle_cmd(0))
++    self.assertFalse(self._throttle_cmd(1))
++    self.assertTrue(self._rpm_cmd(0))
++    self.assertFalse(self._rpm_cmd(1))
++    self.safety.set_controls_allowed(True)
++    self.assertTrue(self._brake_cmd(self.MAX_BRAKE))
++    self.assertFalse(self._throttle_cmd(1))
++
++  def test_history_resets_on_init(self):
++    self.safety.set_controls_allowed(False)
++    for _ in range(3):
++      self._cam(brake=150, throttle=2500, rpm=1200)
++    self._reset_safety_hooks()
++    self.assertFalse(self._brake_cmd(150))
++    self.assertFalse(self._throttle_cmd(2500))
++    self.assertFalse(self._rpm_cmd(1200))
++
++  def test_stop_and_go_with_longitudinal(self):
++    self.safety.set_current_safety_param_sp(1)
++    self._reset_safety_hooks()
++    self.safety.set_controls_allowed(True)
++    for _ in range(3):
++      self._cam(brake=0, throttle=2500, rpm=1200)
++    self.assertTrue(self._brake_cmd(300))
++    self.assertTrue(self._throttle_cmd(self.THROTTLE_ENGINE_BRAKE))
++    self.assertTrue(self._rpm_cmd(1200))
++    self.assertTrue(self._tx(self.packer.make_can_msg_safety("Throttle", 2, {"Throttle_Pedal": 5})))
++    self.assertTrue(self._tx(self.packer.make_can_msg_safety("Brake_Pedal", 2, {"Speed": 1})))
++    self.safety.set_current_safety_param_sp(0)
++
++
+ if __name__ == "__main__":
+   unittest.main()
