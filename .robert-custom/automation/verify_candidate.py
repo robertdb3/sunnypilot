@@ -23,6 +23,21 @@ PROTECTED_EXACT = {
   "system/hardware/tici/agnos.json",
   "system/hardware/tici/agnos.py",
 }
+# The one deliberate exception: blended longitudinal (patch 0020, notes/preglobal-longitudinal.md §9)
+# changes the preglobal safety mode and its tests, and ships the panda firmware built from them by
+# build_panda_firmware.sh. validate_candidate.sh holds these to opendbc's safety obligations and rebuilds
+# the firmware to prove it matches. Every other protected path stays closed.
+SAFETY_SOURCE_ALLOWED = {
+  "opendbc_repo/opendbc/safety/modes/subaru_preglobal.h",
+}
+PROTECTED_ALLOWED = SAFETY_SOURCE_ALLOWED | {
+  "opendbc_repo/opendbc/safety/tests/common.py",
+  "opendbc_repo/opendbc/safety/tests/test_subaru_preglobal.py",
+  "panda/board/obj/panda_h7.bin.signed",
+  "panda/board/obj/panda_h7/main.bin",
+  "panda/board/obj/panda_h7/main.elf",
+}
+PANDA_FIRMWARE = "panda/board/obj/panda_h7.bin.signed"
 
 
 def git(checkout: Path, *args: str) -> str:
@@ -59,8 +74,13 @@ def main() -> int:
     path for path in changed
     if path in PROTECTED_EXACT or any(path.startswith(prefix) for prefix in PROTECTED_PREFIXES)
   )
-  if protected:
-    fail("protected safety/OS paths changed:\n  " + "\n  ".join(protected))
+  unexpected = [path for path in protected if path not in PROTECTED_ALLOWED]
+  if unexpected:
+    fail("protected safety/OS paths changed:\n  " + "\n  ".join(unexpected))
+
+  # safety source and the firmware it compiles into change together, or not at all
+  if bool(changed & SAFETY_SOURCE_ALLOWED) != (PANDA_FIRMWARE in changed):
+    fail("panda safety source and panda firmware must change together")
 
   forbidden_schema = sorted(
     path for path in changed

@@ -33,12 +33,17 @@ as current so the daily updater does not create provenance-only churn.
 1. Fetches `sunnypilot/sunnypilot:staging`.
 2. Requires the upstream `prebuilt` marker used by installable comma 3X snapshots.
 3. Applies patches `0001` through `0006`, the narrow prebuilt Params compatibility port, then
-   patches `0008` through `0010`. (`0007` was retired once upstream fixed the same defect; see
-   symptom 12 in the runbook.)
+   patches `0008` through `0020`, in the order `apply_candidate.sh` lists. (`0007` was retired once
+   upstream fixed the same defect; see symptom 12 in the runbook.)
 4. Rejects patch conflicts and whitespace errors.
 5. Rejects changes to driver monitoring, excessive-actuation checks, `opendbc/safety/`, panda,
-   AGNOS, upstream license files, or stock cereal schemas.
-6. Runs the focused regression suite and compiles every changed Python file.
+   AGNOS, upstream license files, or stock cereal schemas. The one exception is blended
+   longitudinal (`0020`). It may change the preglobal safety mode, its tests, and the panda firmware
+   built from them, and nothing else under those paths. `build_panda_firmware.sh` rebuilds that
+   firmware only after reproducing upstream's shipped firmware byte for byte.
+6. Runs the focused regression suite and compiles every changed Python file. When safety code
+   changed, it also runs opendbc's full safety suite with 100% line coverage and MISRA
+   (`check_safety.sh`), and rebuilds the firmware to prove it matches the safety code.
 7. Records the exact upstream commit and customization digest in `CUSTOM_FORK_MANIFEST.json`.
 8. Commits the validated candidate tree on top of the current stable tip; the manifest still
    records the exact upstream base used for construction and validation.

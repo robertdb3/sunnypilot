@@ -19,6 +19,8 @@ TESTS="$OPENDBC/opendbc/safety/tests"
 export PYTHONPATH="$OPENDBC"
 
 cd "$TESTS"
+# coverage builds leave .gcno/.gcda beside libsafety; never let them reach a committed candidate
+trap 'rm -f "$TESTS"/libsafety/*.gcda "$TESTS"/libsafety/*.gcno' EXIT
 SAFETY_COVERAGE=0 "$PYTHON_BIN" -m unittest discover -s . -q
 
 rm -f libsafety/*.gcda libsafety/*.gcno
