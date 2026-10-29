@@ -326,6 +326,35 @@ def create_preglobal_es_distance(packer, cruise_button, es_distance_msg):
   return packer.make_can_msg("ES_Distance", CanBus.main, values)
 
 
+def create_preglobal_es_brake(packer, es_brake_msg):
+  values = {s: es_brake_msg[s] for s in [
+    "Brake_Pressure",
+    "Cruise_Brake_Lights",
+    "Cruise_Fault",
+    "Cruise_Brake_Active",
+    "Cruise_Activated",
+    "SET_1",
+    "COUNTER",
+  ]}
+
+  values["Checksum"] = subaru_preglobal_checksum(packer, values, "ES_Brake")
+
+  return packer.make_can_msg("ES_Brake", CanBus.main, values)
+
+
+def create_preglobal_es_status(packer, es_status_msg):
+  values = {s: es_status_msg[s] for s in [
+    "Brake",
+    "Cruise_Activated",
+    "Cruise_RPM",
+    "COUNTER",
+  ]}
+
+  values["Checksum"] = subaru_preglobal_checksum(packer, values, "ES_Status", checksum_byte=4)
+
+  return packer.make_can_msg("ES_Status", CanBus.main, values)
+
+
 def subaru_checksum(address: int, sig, d: bytearray) -> int:
   s = 0
   addr = address
