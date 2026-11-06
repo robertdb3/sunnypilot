@@ -20,6 +20,10 @@ class CarState(CarStateBase, MadsCarState, SnGCarState):
 
     self.angle_rate_calulator = CanSignalRateCalculator(50)
 
+    self.es_brake_msgs: list[dict[str, float]] = []
+    self.es_distance_msgs: list[dict[str, float]] = []
+    self.es_status_msgs: list[dict[str, float]] = []
+
   def update(self, can_parsers) -> tuple[structs.CarState, structs.CarStateSP]:
     cp = can_parsers[Bus.pt]
     cp_cam = can_parsers[Bus.cam]
@@ -39,8 +43,9 @@ class CarState(CarStateBase, MadsCarState, SnGCarState):
     if not (self.CP.flags & SubaruFlags.HYBRID):
       eyesight_fault = bool(cp_es_distance.vl["ES_Distance"]["Cruise_Fault"])
 
-      # if openpilot is controlling long, an eyesight fault is a non-critical fault. otherwise it's an ACC fault
-      if self.CP.openpilotLongitudinalControl:
+      # if openpilot is controlling long, an eyesight fault is a non-critical fault. otherwise it's an ACC fault.
+      # Preglobal blended longitudinal still drives through EyeSight's ACC, so there it stays an ACC fault
+      if self.CP.openpilotLongitudinalControl and not (self.CP.flags & SubaruFlags.PREGLOBAL):
         ret.carFaultedNonCritical = eyesight_fault
       else:
         ret.accFaulted = eyesight_fault
@@ -58,7 +63,7 @@ class CarState(CarStateBase, MadsCarState, SnGCarState):
     ret.leftBlinker, ret.rightBlinker = self.update_blinker_from_lamp(50, cp.vl["Dashlights"]["LEFT_BLINKER"],
                                                                       cp.vl["Dashlights"]["RIGHT_BLINKER"])
 
-    if self.CP.enableBsm:
+    if self.CP.flags & SubaruFlags.HAS_BSM:
       ret.leftBlindspot = (cp.vl["BSD_RCTA"]["L_ADJACENT"] == 1) or (cp.vl["BSD_RCTA"]["L_APPROACHING"] == 1)
       ret.rightBlindspot = (cp.vl["BSD_RCTA"]["R_ADJACENT"] == 1) or (cp.vl["BSD_RCTA"]["R_APPROACHING"] == 1)
 
@@ -117,6 +122,13 @@ class CarState(CarStateBase, MadsCarState, SnGCarState):
     if self.CP.flags & SubaruFlags.PREGLOBAL:
       self.cruise_button = cp_cam.vl["ES_Distance"]["Cruise_Button"]
       self.ready = not cp_cam.vl["ES_DashStatus"]["Not_Ready_Startup"]
+
+      if self.CP.openpilotLongitudinalControl:
+        # every EyeSight longitudinal message received this cycle, oldest first, so the controller can
+        # rebuild each one and the car keeps seeing EyeSight's own cadence and counters
+        self.es_brake_msgs = self.all_msgs(cp_cam, "ES_Brake")
+        self.es_distance_msgs = self.all_msgs(cp_cam, "ES_Distance")
+        self.es_status_msgs = self.all_msgs(cp_cam, "ES_Status")
     else:
       ret.steerFaultTemporary = cp.vl["Steering_Torque"]["Steer_Warning"] == 1
       ret.cruiseState.nonAdaptive = cp_cam.vl["ES_DashStatus"]["Conventional_Cruise"] == 1
@@ -147,6 +159,13 @@ class CarState(CarStateBase, MadsCarState, SnGCarState):
     SnGCarState.update(self, ret, can_parsers)
 
     return ret, ret_sp
+
+  @staticmethod
+  def all_msgs(cp: CANParser, name: str) -> list[dict[str, float]]:
+    cp.vl[name]  # registers the message with the parser on first use
+    signals = cp.vl_all[name]
+    count = len(signals["COUNTER"]) if "COUNTER" in signals else 0
+    return [{sig: vals[i] for sig, vals in signals.items()} for i in range(count)]
 
   @staticmethod
   def get_can_parsers(CP, CP_SP):

@@ -4,7 +4,9 @@
 #include "opendbc/safety/modes/subaru_common.h"
 
 // Preglobal platform
+// 0x160 is ES_Brake
 // 0x161 is ES_CruiseThrottle
+// 0x162 is ES_Status
 // 0x164 is ES_LKAS
 
 #define MSG_SUBARU_PG_CruiseControl         0x144U
@@ -12,7 +14,9 @@
 #define MSG_SUBARU_PG_Wheel_Speeds          0xD4U
 #define MSG_SUBARU_PG_Brake_Pedal           0xD1U
 #define MSG_SUBARU_PG_ES_LKAS               0x164U
+#define MSG_SUBARU_PG_ES_Brake              0x160U
 #define MSG_SUBARU_PG_ES_Distance           0x161U
+#define MSG_SUBARU_PG_ES_Status             0x162U
 #define MSG_SUBARU_PG_Steering_Torque       0x371U
 
 #define SUBARU_PG_MAIN_BUS 0U
@@ -26,37 +30,107 @@
   {MSG_SUBARU_PG_Throttle,    SUBARU_PG_CAM_BUS,  8, .check_relay = false}, \
   {MSG_SUBARU_PG_Brake_Pedal, SUBARU_PG_CAM_BUS,  4, .check_relay = false}, \
 
+// Blended longitudinal: openpilot rebuilds EyeSight's brake and RPM messages, as it already does
+// ES_Distance, which carries the throttle. It may only add braking or remove throttle relative to
+// what EyeSight itself requested, so EyeSight's ACC and AEB stay underneath as a floor.
+#define SUBARU_PG_LONG_TX_MSGS \
+  {MSG_SUBARU_PG_ES_Brake,    SUBARU_PG_MAIN_BUS, 8, .check_relay = true}, \
+  {MSG_SUBARU_PG_ES_Status,   SUBARU_PG_MAIN_BUS, 8, .check_relay = true}, \
+
+// TODO: do checksum and counter checks after adding the signals to the outback dbc file
+#define SUBARU_PG_RX_CHECKS \
+  {.msg = {{MSG_SUBARU_PG_Throttle,       SUBARU_PG_MAIN_BUS, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}}, \
+  {.msg = {{MSG_SUBARU_PG_Steering_Torque, SUBARU_PG_MAIN_BUS, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}}, \
+  {.msg = {{MSG_SUBARU_PG_CruiseControl,   SUBARU_PG_MAIN_BUS, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}}, \
+  {.msg = {{MSG_SUBARU_PG_Wheel_Speeds,    SUBARU_PG_MAIN_BUS, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}}, \
+  {.msg = {{MSG_SUBARU_PG_Brake_Pedal,     SUBARU_PG_MAIN_BUS, 4, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}}, \
+
+// EyeSight's own requests, as the camera sends them
+#define SUBARU_PG_LONG_RX_CHECKS \
+  {.msg = {{MSG_SUBARU_PG_ES_Brake,       SUBARU_PG_CAM_BUS,  8, 20U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}}, \
+  {.msg = {{MSG_SUBARU_PG_ES_Distance,    SUBARU_PG_CAM_BUS,  8, 20U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}}, \
+  {.msg = {{MSG_SUBARU_PG_ES_Status,      SUBARU_PG_CAM_BUS,  8, 20U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}}, \
+
+#define SUBARU_PG_MAX_BRAKE              600U  // the most braking openpilot may request, about -3.3 m/s^2 beyond coasting
+#define SUBARU_PG_THROTTLE_ENGINE_BRAKE  808U  // EyeSight's own throttle value while it brakes
+// openpilot rebuilds each camera message as it arrives (20 Hz). Accept any value from the last few
+// camera messages, to cover the time between the panda receiving one and openpilot sending its rebuild.
+#define SUBARU_PG_CAM_HISTORY            3U
+
 static bool subaru_pg_reversed_driver_torque = false;
+static bool subaru_pg_longitudinal = false;
+static uint32_t subaru_pg_cam_brake[SUBARU_PG_CAM_HISTORY];
+static uint32_t subaru_pg_cam_throttle[SUBARU_PG_CAM_HISTORY];
+static uint32_t subaru_pg_cam_rpm[SUBARU_PG_CAM_HISTORY];
+
+static void subaru_pg_cam_record(uint32_t history[], uint32_t value) {
+  for (uint32_t i = SUBARU_PG_CAM_HISTORY - 1U; i > 0U; i--) {
+    history[i] = history[i - 1U];
+  }
+  history[0] = value;
+}
+
+static uint32_t subaru_pg_cam_min(const uint32_t history[]) {
+  uint32_t ret = history[0];
+  for (uint32_t i = 1U; i < SUBARU_PG_CAM_HISTORY; i++) {
+    if (history[i] < ret) {
+      ret = history[i];
+    }
+  }
+  return ret;
+}
+
+static uint32_t subaru_pg_cam_max(const uint32_t history[]) {
+  uint32_t ret = history[0];
+  for (uint32_t i = 1U; i < SUBARU_PG_CAM_HISTORY; i++) {
+    if (history[i] > ret) {
+      ret = history[i];
+    }
+  }
+  return ret;
+}
 
 static void subaru_preglobal_rx_hook(const CANPacket_t *msg) {
-  if (msg->bus == SUBARU_PG_MAIN_BUS) {
-    if (msg->addr == MSG_SUBARU_PG_Steering_Torque) {
-      int torque_driver_new;
-      torque_driver_new = (msg->data[3] >> 5) + (msg->data[4] << 3);
-      torque_driver_new = to_signed(torque_driver_new, 11);
-      torque_driver_new = subaru_pg_reversed_driver_torque ? -torque_driver_new : torque_driver_new;
-      update_sample(&torque_driver, torque_driver_new);
-    }
+  if (msg_matches(msg, MSG_SUBARU_PG_Steering_Torque, SUBARU_PG_MAIN_BUS)) {
+    int torque_driver_new;
+    torque_driver_new = (msg->data[3] >> 5) + (msg->data[4] << 3);
+    torque_driver_new = to_signed(torque_driver_new, 11);
+    torque_driver_new = subaru_pg_reversed_driver_torque ? -torque_driver_new : torque_driver_new;
+    update_sample(&torque_driver, torque_driver_new);
+  }
 
-    // enter controls on rising edge of ACC, exit controls on ACC off
-    if (msg->addr == MSG_SUBARU_PG_CruiseControl) {
-      bool cruise_engaged = (msg->data[6] >> 1) & 1U;
-      pcm_cruise_check(cruise_engaged);
-      acc_main_on = GET_BIT(msg, 48U);
-    }
+  // enter controls on rising edge of ACC, exit controls on ACC off
+  if (msg_matches(msg, MSG_SUBARU_PG_CruiseControl, SUBARU_PG_MAIN_BUS)) {
+    bool cruise_engaged = (msg->data[6] >> 1) & 1U;
+    pcm_cruise_check(cruise_engaged);
+    acc_main_on = GET_BIT(msg, 48U);
+  }
 
-    // update vehicle moving with any non-zero wheel speed
-    if (msg->addr == MSG_SUBARU_PG_Wheel_Speeds) {
-      vehicle_moving = ((GET_BYTES(msg, 0, 4) >> 12) != 0U) || (GET_BYTES(msg, 4, 4) != 0U);
-    }
+  // update vehicle moving with any non-zero wheel speed
+  if (msg_matches(msg, MSG_SUBARU_PG_Wheel_Speeds, SUBARU_PG_MAIN_BUS)) {
+    vehicle_moving = ((GET_BYTES_LE(msg, 0, 4) >> 12) | GET_BYTES_LE(msg, 4, 4)) != 0U;
+  }
 
-    if (msg->addr == MSG_SUBARU_PG_Brake_Pedal) {
-      brake_pressed = ((GET_BYTES(msg, 0, 4) >> 16) & 0xFFU) > 0U;
-    }
+  if (msg_matches(msg, MSG_SUBARU_PG_Brake_Pedal, SUBARU_PG_MAIN_BUS)) {
+    brake_pressed = ((GET_BYTES_LE(msg, 0, 4) >> 16) & 0xFFU) > 0U;
+  }
 
-    if (msg->addr == MSG_SUBARU_PG_Throttle) {
-      gas_pressed = msg->data[0] != 0U;
-    }
+  if (msg_matches(msg, MSG_SUBARU_PG_Throttle, SUBARU_PG_MAIN_BUS)) {
+    gas_pressed = msg->data[0] != 0U;
+  }
+
+  // EyeSight's requests bound what openpilot may send in their place. These are only rx checked,
+  // and so only reach this hook, with blended longitudinal enabled.
+  if (msg_matches(msg, MSG_SUBARU_PG_ES_Brake, SUBARU_PG_CAM_BUS)) {
+    subaru_pg_cam_record(subaru_pg_cam_brake, GET_BYTES_LE(msg, 0, 2));  // Brake_Pressure
+  }
+
+  if (msg_matches(msg, MSG_SUBARU_PG_ES_Distance, SUBARU_PG_CAM_BUS)) {
+    subaru_pg_cam_record(subaru_pg_cam_throttle, GET_BYTES_LE(msg, 0, 2) & 0xFFFU);  // Cruise_Throttle
+  }
+
+  if (msg_matches(msg, MSG_SUBARU_PG_ES_Status, SUBARU_PG_CAM_BUS)) {
+    subaru_pg_cam_record(subaru_pg_cam_rpm, GET_BYTES_LE(msg, 2, 2));  // Cruise_RPM
   }
 }
 
@@ -75,7 +149,7 @@ static bool subaru_preglobal_tx_hook(const CANPacket_t *msg) {
 
   // steer cmd checks
   if (msg->addr == MSG_SUBARU_PG_ES_LKAS) {
-    int desired_torque = ((GET_BYTES(msg, 0, 4) >> 8) & 0x1FFFU);
+    int desired_torque = ((GET_BYTES_LE(msg, 0, 4) >> 8) & 0x1FFFU);
     desired_torque = -1 * to_signed(desired_torque, 13);
 
     bool steer_req = (msg->data[3] >> 0) & 1U;
@@ -84,6 +158,44 @@ static bool subaru_preglobal_tx_hook(const CANPacket_t *msg) {
       tx = false;
     }
   }
+
+  if (subaru_pg_longitudinal) {
+    const bool long_allowed = get_longitudinal_allowed();
+
+    // brake: at least what EyeSight requests. openpilot may add braking up to SUBARU_PG_MAX_BRAKE,
+    // and anything EyeSight requests beyond that (AEB) passes through
+    if (msg->addr == MSG_SUBARU_PG_ES_Brake) {
+      uint32_t brake = GET_BYTES_LE(msg, 0, 2);
+      uint32_t max_brake = subaru_pg_cam_max(subaru_pg_cam_brake);
+      if (long_allowed && (max_brake < SUBARU_PG_MAX_BRAKE)) {
+        max_brake = SUBARU_PG_MAX_BRAKE;
+      }
+      if ((brake < subaru_pg_cam_min(subaru_pg_cam_brake)) || (brake > max_brake)) {
+        tx = false;
+      }
+    }
+
+    // throttle: never more than EyeSight requests. openpilot may reduce it as far as engine braking
+    if (msg->addr == MSG_SUBARU_PG_ES_Distance) {
+      uint32_t throttle = GET_BYTES_LE(msg, 0, 2) & 0xFFFU;
+      uint32_t min_throttle = subaru_pg_cam_min(subaru_pg_cam_throttle);
+      if (long_allowed && (min_throttle > SUBARU_PG_THROTTLE_ENGINE_BRAKE)) {
+        min_throttle = SUBARU_PG_THROTTLE_ENGINE_BRAKE;
+      }
+      if ((throttle < min_throttle) || (throttle > subaru_pg_cam_max(subaru_pg_cam_throttle))) {
+        tx = false;
+      }
+    }
+
+    // RPM: EyeSight's request, passed through
+    if (msg->addr == MSG_SUBARU_PG_ES_Status) {
+      uint32_t rpm = GET_BYTES_LE(msg, 2, 2);
+      if ((rpm < subaru_pg_cam_min(subaru_pg_cam_rpm)) || (rpm > subaru_pg_cam_max(subaru_pg_cam_rpm))) {
+        tx = false;
+      }
+    }
+  }
+
   return tx;
 }
 
@@ -97,23 +209,46 @@ static safety_config subaru_preglobal_init(uint16_t param) {
     SUBARU_PG_STOP_AND_GO_TX_MSGS
   };
 
-  // TODO: do checksum and counter checks after adding the signals to the outback dbc file
-  static RxCheck subaru_preglobal_rx_checks[] = {
-    {.msg = {{MSG_SUBARU_PG_Throttle,        SUBARU_PG_MAIN_BUS, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-    {.msg = {{MSG_SUBARU_PG_Steering_Torque, SUBARU_PG_MAIN_BUS, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-    {.msg = {{MSG_SUBARU_PG_CruiseControl,   SUBARU_PG_MAIN_BUS, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-    {.msg = {{MSG_SUBARU_PG_Wheel_Speeds,    SUBARU_PG_MAIN_BUS, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-    {.msg = {{MSG_SUBARU_PG_Brake_Pedal,     SUBARU_PG_MAIN_BUS, 4, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+  static const CanMsg subaru_pg_long_tx_msgs[] = {
+    SUBARU_PG_COMMON_TX_MSGS
+    SUBARU_PG_LONG_TX_MSGS
+  };
+
+  static const CanMsg subaru_pg_long_stop_and_go_tx_msgs[] = {
+    SUBARU_PG_COMMON_TX_MSGS
+    SUBARU_PG_STOP_AND_GO_TX_MSGS
+    SUBARU_PG_LONG_TX_MSGS
   };
 
   subaru_common_init();
 
+  const uint16_t SUBARU_PG_PARAM_LONGITUDINAL = 2;
   const uint16_t SUBARU_PG_PARAM_REVERSED_DRIVER_TORQUE = 4;
 
   subaru_pg_reversed_driver_torque = GET_FLAG(param, SUBARU_PG_PARAM_REVERSED_DRIVER_TORQUE);
+  subaru_pg_longitudinal = GET_FLAG(param, SUBARU_PG_PARAM_LONGITUDINAL);
 
-  safety_config ret = subaru_stop_and_go ? BUILD_SAFETY_CFG(subaru_preglobal_rx_checks, subaru_pg_stop_and_go_tx_msgs) : \
-                                           BUILD_SAFETY_CFG(subaru_preglobal_rx_checks, SUBARU_PG_TX_MSGS);
+  for (uint32_t i = 0U; i < SUBARU_PG_CAM_HISTORY; i++) {
+    subaru_pg_cam_brake[i] = 0U;
+    subaru_pg_cam_throttle[i] = 0U;
+    subaru_pg_cam_rpm[i] = 0U;
+  }
+
+  safety_config ret;
+  if (subaru_pg_longitudinal) {
+    static RxCheck subaru_preglobal_long_rx_checks[] = {
+      SUBARU_PG_RX_CHECKS
+      SUBARU_PG_LONG_RX_CHECKS
+    };
+    ret = subaru_stop_and_go ? BUILD_SAFETY_CFG(subaru_preglobal_long_rx_checks, subaru_pg_long_stop_and_go_tx_msgs) : \
+                               BUILD_SAFETY_CFG(subaru_preglobal_long_rx_checks, subaru_pg_long_tx_msgs);
+  } else {
+    static RxCheck subaru_preglobal_rx_checks[] = {
+      SUBARU_PG_RX_CHECKS
+    };
+    ret = subaru_stop_and_go ? BUILD_SAFETY_CFG(subaru_preglobal_rx_checks, subaru_pg_stop_and_go_tx_msgs) : \
+                               BUILD_SAFETY_CFG(subaru_preglobal_rx_checks, SUBARU_PG_TX_MSGS);
+  }
   return ret;
 }
 

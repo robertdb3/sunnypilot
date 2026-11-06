@@ -26,10 +26,12 @@ class CarInterface(CarInterfaceBase):
       ret.flags |= SubaruFlags.SEND_INFOTAINMENT.value
 
     if ret.flags & SubaruFlags.PREGLOBAL:
-      ret.enableBsm = 0x25c in fingerprint[0]
+      if 0x25c in fingerprint[0]:
+        ret.flags |= SubaruFlags.HAS_BSM.value
       ret.safetyConfigs = [get_safety_config(structs.CarParams.SafetyModel.subaruPreglobal)]
     else:
-      ret.enableBsm = 0x228 in fingerprint[0]
+      if 0x228 in fingerprint[0]:
+        ret.flags |= SubaruFlags.HAS_BSM.value
       ret.safetyConfigs = [get_safety_config(structs.CarParams.SafetyModel.subaru)]
       if ret.flags & SubaruFlags.GLOBAL_GEN2:
         ret.safetyConfigs[0].safetyParam |= SubaruSafetyFlags.GEN2.value
@@ -90,7 +92,16 @@ class CarInterface(CarInterfaceBase):
     # TODO: the longitudinal limits need to be speed-dependent, so alpha long is disabled for now
     # revert this in the PR that re-enables Subaru longitudinal: https://github.com/commaai/opendbc/pull/3689
     ret.alphaLongitudinalAvailable = False
+
+    # Blended longitudinal (custompilot): EyeSight keeps driving, and openpilot may only add braking or
+    # remove throttle relative to it (see preglobal_long.py). Measured on, and limited to, this car.
+    if candidate == CAR.SUBARU_OUTBACK_PREGLOBAL_2018:
+      ret.alphaLongitudinalAvailable = True
+
     ret.openpilotLongitudinalControl = alpha_long and ret.alphaLongitudinalAvailable
+
+    if ret.openpilotLongitudinalControl and ret.flags & SubaruFlags.PREGLOBAL:
+      ret.longitudinalActuatorDelay = 0.3  # measured: ~0.25 s for EyeSight's brake requests, ~0.4 s for throttle
 
     if ret.flags & SubaruFlags.GLOBAL_GEN2 and ret.openpilotLongitudinalControl:
       ret.flags |= SubaruFlags.DISABLE_EYESIGHT.value
