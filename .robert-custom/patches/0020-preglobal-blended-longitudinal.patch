@@ -577,10 +577,10 @@ index 28d945b..212c5bc 100644
  }
  
 diff --git a/opendbc_repo/opendbc/safety/tests/common.py b/opendbc_repo/opendbc/safety/tests/common.py
-index d94bdf2..dc09983 100644
+index d94bdf2..4ea8fd3 100644
 --- a/opendbc_repo/opendbc/safety/tests/common.py
 +++ b/opendbc_repo/opendbc/safety/tests/common.py
-@@ -1008,6 +1008,11 @@ class SafetyTest(SafetyTestBase):
+@@ -1008,6 +1008,16 @@ class SafetyTest(SafetyTestBase):
              if attr == 'TestVolkswagenMqbLongSafety' and current_test.startswith('TestSubaru'):
                tx = list(filter(lambda m: m[0] not in [0x122, ], tx))
  
@@ -588,6 +588,11 @@ index d94bdf2..dc09983 100644
 +            # An all-zero ES_Brake matches EyeSight requesting no braking, which preglobal passes through
 +            if attr == 'TestRivianLongitudinalSafety' and current_test.startswith('TestSubaruPreglobalLongitudinal'):
 +              tx = list(filter(lambda m: m[0] not in [0x160, ], tx))
++
++            # Hyundai CAN-FD CCNC and Subaru preglobal blended longitudinal (ES_Status) actuating messages overlap.
++            # An all-zero ES_Status matches EyeSight requesting no Cruise_RPM, which preglobal passes through
++            if attr.startswith('TestHyundaiCanfdLFASteeringCCNC') and current_test.startswith('TestSubaruPreglobalLongitudinal'):
++              tx = list(filter(lambda m: m[0] not in [0x162, ], tx))
 +
              # Volkswagen MQB and Honda Nidec ACC HUD messages overlap
              if attr == 'TestVolkswagenMqbLongSafety' and current_test.startswith('TestHondaNidec'):
