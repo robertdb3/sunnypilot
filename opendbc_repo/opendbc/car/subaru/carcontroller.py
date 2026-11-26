@@ -4,6 +4,7 @@ from opendbc.car import Bus, make_tester_present_msg
 from opendbc.car.lateral import apply_driver_steer_torque_limits, common_fault_avoidance
 from opendbc.car.interfaces import CarControllerBase
 from opendbc.car.subaru import subarucan
+from opendbc.car.subaru.preglobal_long import PreglobalBlend
 from opendbc.car.subaru.values import DBC, GLOBAL_ES_ADDR, CanBus, CarControllerParams, SubaruFlags
 
 from opendbc.sunnypilot.car.subaru.icbm import IntelligentCruiseButtonManagementInterface
@@ -25,6 +26,7 @@ class CarController(CarControllerBase, SnGCarController, IntelligentCruiseButton
 
     self.cruise_button_prev = 0
     self.main_cruise = PreglobalMainCruise()
+    self.preglobal_blend = PreglobalBlend()
     self.steer_rate_counter = 0
 
     self.p = CarControllerParams(CP)
@@ -85,46 +87,24 @@ class CarController(CarControllerBase, SnGCarController, IntelligentCruiseButton
       driver_main_pressed = CS.cruise_button == 1
       self.main_cruise.update(self.frame, CS.out.cruiseState.available, driver_main_pressed)
 
-      if self.frame % 5 == 0:
-        mocked_main_press = False
-        # 1 = main, 2 = set shallow, 3 = set deep, 4 = resume shallow, 5 = resume deep
-        #
-        # ES_Distance carries exactly one button, so everything that wants to press something
-        # shares this slot. Priority, highest first: cancel, restoring main, ICBM set-speed
-        # nudges, then relaying the driver's own press untouched.
-        #
-        # button_for() records the press as a side effect, so it is only called once the higher
-        # priorities have declined — otherwise ICBM burns its press slot without sending anything.
-        # disengage ACC when OP is disengaged
-        # A physical main press takes priority. Its OFF transition also makes pcm_cancel_cmd
-        # true, but treating that as our own cancellation would immediately restore main and
-        # defeat the driver's lateral toggle.
-        if driver_main_pressed:
-          cruise_button = CS.cruise_button
-        elif pcm_cancel_cmd:
-          cruise_button = 1
-          mocked_main_press = True
-        # turn main on if off and past start-up state, unless the driver turned main off:
-        # ACC main is the only MADS lateral toggle on this platform, so restoring it here
-        # would blip lateral off and straight back on instead of latching it off
-        elif self.main_cruise.should_restore(CS.out.cruiseState.available, CS.ready):
-          cruise_button = 1
-          mocked_main_press = True
-        # match the stock ACC set speed to the speed limit by tapping SET / RES
-        elif icbm_button := IntelligentCruiseButtonManagementInterface.button_for(self, CC_SP, CS, self.frame):
-          cruise_button = icbm_button
-        else:
-          cruise_button = CS.cruise_button
+      if self.CP.openpilotLongitudinalControl:
+        # Blended longitudinal: rebuild each EyeSight message as it arrives, so the car keeps seeing
+        # EyeSight's cadence and counters. openpilot may only add braking or remove throttle.
+        self.preglobal_blend.update(CC, CS.out.vEgo)
 
-        # unstick previous mocked button press
-        if mocked_main_press and cruise_button == 1 and self.cruise_button_prev == 1:
-          cruise_button = 0
-          mocked_main_press = False
-        self.cruise_button_prev = cruise_button
+        for es_brake_msg in CS.es_brake_msgs:
+          can_sends.append(subarucan.create_preglobal_es_brake(self.packer, self.preglobal_blend.es_brake(es_brake_msg)))
 
-        if mocked_main_press:
-          self.main_cruise.mocked_press(self.frame)
+        for es_distance_msg in CS.es_distance_msgs:
+          cruise_button = self.preglobal_cruise_button(CC_SP, CS, pcm_cancel_cmd, int(es_distance_msg["Cruise_Button"]))
+          can_sends.append(subarucan.create_preglobal_es_distance(self.packer, cruise_button,
+                                                                  self.preglobal_blend.es_distance(es_distance_msg)))
 
+        for es_status_msg in CS.es_status_msgs:
+          can_sends.append(subarucan.create_preglobal_es_status(self.packer, self.preglobal_blend.es_status(es_status_msg)))
+
+      elif self.frame % 5 == 0:
+        cruise_button = self.preglobal_cruise_button(CC_SP, CS, pcm_cancel_cmd, CS.cruise_button)
         can_sends.append(subarucan.create_preglobal_es_distance(self.packer, cruise_button, CS.es_distance_msg))
 
     else:
@@ -178,3 +158,47 @@ class CarController(CarControllerBase, SnGCarController, IntelligentCruiseButton
 
     self.frame += 1
     return new_actuators, can_sends
+
+  def preglobal_cruise_button(self, CC_SP, CS, pcm_cancel_cmd, driver_button):
+    """The button for one ES_Distance. Called once per message sent, with the driver's own press."""
+    driver_main_pressed = driver_button == 1
+    mocked_main_press = False
+    # 1 = main, 2 = set shallow, 3 = set deep, 4 = resume shallow, 5 = resume deep
+    #
+    # ES_Distance carries exactly one button, so everything that wants to press something
+    # shares this slot. Priority, highest first: cancel, restoring main, ICBM set-speed
+    # nudges, then relaying the driver's own press untouched.
+    #
+    # button_for() records the press as a side effect, so it is only called once the higher
+    # priorities have declined — otherwise ICBM burns its press slot without sending anything.
+    # disengage ACC when OP is disengaged
+    # A physical main press takes priority. Its OFF transition also makes pcm_cancel_cmd
+    # true, but treating that as our own cancellation would immediately restore main and
+    # defeat the driver's lateral toggle.
+    if driver_main_pressed:
+      cruise_button = driver_button
+    elif pcm_cancel_cmd:
+      cruise_button = 1
+      mocked_main_press = True
+    # turn main on if off and past start-up state, unless the driver turned main off:
+    # ACC main is the only MADS lateral toggle on this platform, so restoring it here
+    # would blip lateral off and straight back on instead of latching it off
+    elif self.main_cruise.should_restore(CS.out.cruiseState.available, CS.ready):
+      cruise_button = 1
+      mocked_main_press = True
+    # match the stock ACC set speed to the speed limit by tapping SET / RES
+    elif icbm_button := IntelligentCruiseButtonManagementInterface.button_for(self, CC_SP, CS, self.frame):
+      cruise_button = icbm_button
+    else:
+      cruise_button = driver_button
+
+    # unstick previous mocked button press
+    if mocked_main_press and cruise_button == 1 and self.cruise_button_prev == 1:
+      cruise_button = 0
+      mocked_main_press = False
+    self.cruise_button_prev = cruise_button
+
+    if mocked_main_press:
+      self.main_cruise.mocked_press(self.frame)
+
+    return cruise_button

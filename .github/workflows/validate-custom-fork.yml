@@ -32,7 +32,11 @@ jobs:
           git fetch --no-tags --depth=1 https://github.com/sunnypilot/sunnypilot.git "$upstream_sha"
 
       - name: Install test dependencies
-        run: python3 -m pip install --disable-pip-version-check numpy pycapnp raylib
+        # cffi, gcovr and cppcheck (comma's MISRA build, as opendbc pins it) run opendbc's panda safety
+        # obligations when a patch changes safety code
+        run: >-
+          python3 -m pip install --disable-pip-version-check numpy pycapnp raylib cffi gcovr
+          "cppcheck @ git+https://github.com/commaai/dependencies.git@release-cppcheck#subdirectory=cppcheck"
 
       - name: Validate candidate
         run: bash controller/.robert-custom/automation/validate_candidate.sh candidate controller/.robert-custom

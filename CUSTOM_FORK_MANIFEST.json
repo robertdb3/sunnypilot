@@ -1,11 +1,11 @@
 {
-  "customization_sha256": "863f927c7e1b08612f5cabc337391fab2f877607604a0f90bfc8c17f2f7ec990",
-  "generated_at": "2026-10-16T00:38:59+00:00",
+  "customization_sha256": "3b50ac8324f9a0d2c78bfcc58fcdb0f2c84e1189222308ff83bbede0dee64a51",
+  "generated_at": "2026-11-26T19:38:53+00:00",
   "release_policy": "manual promotion from custompilot-staging to custompilot-stable",
   "schema": 1,
   "upstream": {
     "branch": "staging",
-    "commit": "65feb2b6d8f4bc4463c3c84582bcf6ccdf75d534",
+    "commit": "1a9c1c435adf4bc684f867254cd1374d7258bff4",
     "repository": "https://github.com/sunnypilot/sunnypilot"
   }
 }
